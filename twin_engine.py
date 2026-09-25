@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "4.2.0"
+ENGINE_VERSION = "4.3.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -4124,7 +4124,8 @@ def stress_factor_regression(ct: pd.DataFrame, window_frac: float = 0.5, n_boot:
         res.append({"Factor": c, "Estimate": float(est), "90% CI low": float(lo), "90% CI high": float(hi)})
     pred = X.to_numpy() @ beta
     r2 = 1 - np.sum((y - pred) ** 2) / np.sum((y - y.mean()) ** 2) if len(y) > 2 else float("nan")
-    out.update({"available": True, "coefficients": pd.DataFrame(res).set_index("Factor"), "r2": float(r2),
+    out.update({"available": True, "beta": beta, "columns": list(X.columns), "boot": B, "T_ref_K": Tref,
+                "coefficients": pd.DataFrame(res).set_index("Factor"), "r2": float(r2),
                 "n_cells": len(tab)})
     return out
 
@@ -4636,3 +4637,181 @@ def train_soh_estimator(ct: pd.DataFrame, imp: Optional[pd.DataFrame], model_nam
     return EstimationResult(model_name, params, split, feats, preds[["Cell_ID", "n", "SOH", "SOH_pred", "set"]],
                             metrics, importance.reset_index(drop=True), fit_s,
                             sorted(tr["Cell_ID"].unique()), sorted(te_["Cell_ID"].unique()))
+
+
+# =============================================================================
+# 20. FLEET MONITORING, ALERTS AND SCENARIO PLANNING (operations centre)
+# =============================================================================
+RISK_LEVELS = ("Healthy", "Watch", "Warning", "Critical")
+
+
+@dataclass
+class FleetThresholds:
+    watch_soh_margin: float = 0.10       # within 10 SOH points of EOL -> watch
+    warn_rul_cycles: int = 50            # quick RUL below this -> warning
+    crit_rul_cycles: int = 15            # quick RUL below this (or past EOL) -> critical
+    fast_fade_per_100: float = 5.0       # recent fade faster than 5 SOH points / 100 cycles -> warning
+    r_growth_warn_pct: float = 50.0      # load-step resistance growth above 50 % -> watch
+    recent_window: int = 20
+
+
+def fleet_status(ct: pd.DataFrame, eol_ah: float = DEFAULT_EOL_AH, limits: Optional[SafetyLimits] = None,
+                 th: Optional[FleetThresholds] = None) -> pd.DataFrame:
+    """One row per battery for the operations centre: current SOH, recent fade rate, quick RUL,
+    resistance growth, thermal and safety exposure, knee status and an overall risk level.
+
+    Quick RUL = cycles until the recent linear trend (last ``recent_window`` valid cycles,
+    robust Theil-Sen slope) crosses the cell's EOL threshold. It is a screening number for
+    triage; the Models view gives the full probabilistic RUL."""
+    from scipy.stats import theilslopes
+
+    th = th or FleetThresholds()
+    sx = stress_exposure(ct, limits)
+    meta = cell_meta(ct)
+    rows = []
+    for cid, d in sx[~sx["outlier"]].sort_values("n").groupby("Cell_ID"):
+        if len(d) < 5:
+            continue
+        soh_eol = soh_eol_for(float(d["C_bol_Ah"].iloc[0]), eol_ah)
+        tail = d.tail(th.recent_window)
+        slope = float(theilslopes(tail["SOH"], tail["n"])[0]) if len(tail) >= 5 else float("nan")
+        soh_now = float(tail["SOH"].tail(5).median())
+        if soh_now <= soh_eol:
+            rul = 0.0
+        elif np.isfinite(slope) and slope < -1e-6:
+            rul = (soh_now - soh_eol) / -slope
+        else:
+            rul = float("inf")
+        r = d["R_dc_ohm"].astype(float).rolling(5, center=True, min_periods=1).median()
+        r0 = float(r.head(3).median())
+        r_growth = 100 * (float(r.tail(3).median()) / r0 - 1) if r0 > 0 else float("nan")
+        k = detect_knee(d["n"].to_numpy(), d["SOH"].to_numpy())
+        fade100 = -100 * slope * 100 if np.isfinite(slope) else float("nan")
+        alerts = []
+        level = 0
+        if soh_now <= soh_eol:
+            alerts.append("past end of life")
+            level = 3
+        elif rul < th.crit_rul_cycles:
+            alerts.append(f"RUL < {th.crit_rul_cycles} cycles")
+            level = 3
+        elif rul < th.warn_rul_cycles:
+            alerts.append(f"RUL < {th.warn_rul_cycles} cycles")
+            level = max(level, 2)
+        if np.isfinite(fade100) and fade100 > th.fast_fade_per_100:
+            alerts.append("fast fade")
+            level = max(level, 2)
+        if k["found"]:
+            alerts.append(f"knee at n = {k['knee_n']}")
+            level = max(level, 2)
+        if soh_eol < soh_now and soh_now - soh_eol < th.watch_soh_margin:
+            alerts.append("near end of life")
+            level = max(level, 1)
+        if np.isfinite(r_growth) and r_growth > th.r_growth_warn_pct:
+            alerts.append("resistance growth")
+            level = max(level, 1)
+        if d["critical_T"].any():
+            alerts.append("over-temperature")
+            level = max(level, 2)
+        elif d["hot"].any():
+            alerts.append("hot operation")
+            level = max(level, 1)
+        if d["plating"].any():
+            alerts.append("cold charging (plating risk)")
+            level = max(level, 1)
+        if d["deep"].mean() > 0.5:
+            alerts.append("deep discharge")
+            level = max(level, 1)
+        if bool(d.get("baseline_suspect", pd.Series([False])).iloc[0]):
+            alerts.append("baseline repaired")
+        rows.append({"Cell_ID": cid, "Ambient_C": float(meta.loc[cid, "Ambient_C"]),
+                     "I_dis_A": float(meta.loc[cid, "I_dis_A"]), "V_cut_V": float(meta.loc[cid, "V_cut_V"]),
+                     "Cycles": int(d["n"].max()), "SOH": soh_now, "SOH_EOL": soh_eol,
+                     "Health margin": (soh_now - soh_eol) / max(1 - soh_eol, 1e-6),
+                     "Fade per 100 cycles (%)": fade100, "Quick RUL": rul, "R growth (%)": r_growth,
+                     "Peak T (°C)": float(d["T_max_C"].max()), "Knee": bool(k["found"]),
+                     "Risk": RISK_LEVELS[level], "risk_level": level, "Alerts": ", ".join(alerts) or "—"})
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.sort_values(["risk_level", "Health margin"], ascending=[False, True]).set_index("Cell_ID")
+
+
+def fleet_events(ct: pd.DataFrame, limits: Optional[SafetyLimits] = None, max_events: int = 400) -> pd.DataFrame:
+    """Chronological event log across the fleet: knee onsets, regeneration, first over-temperature,
+    first cold charge, first deep discharge, excluded (outlier) cycles and EOL crossings."""
+    sx = stress_exposure(ct, limits)
+    ev = []
+    for cid, d in sx.sort_values("n").groupby("Cell_ID"):
+        good = d[~d["outlier"]]
+        if good.empty:
+            continue
+        soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), DEFAULT_EOL_AH)
+        for col, sev, msg in (("critical_T", "Critical", "Temperature reached the SEI-decomposition screen"),
+                              ("hot", "Watch", "First discharge above the accelerated-ageing temperature"),
+                              ("plating", "Watch", "First charge in the cold (lithium-plating risk)"),
+                              ("deep", "Info", "First discharge below the deep-discharge limit")):
+            hit = good[good[col]]
+            if len(hit):
+                ev.append((cid, int(hit["n"].iloc[0]), sev, msg))
+        for n in good.loc[good["regen"], "n"].astype(int):
+            ev.append((cid, n, "Info", "Capacity regeneration after rest"))
+        eol = first_crossing(good["n"].to_numpy(), good["SOH"].to_numpy(), soh_eol, smooth=5)
+        if eol is not None:
+            ev.append((cid, int(eol), "Critical", "Crossed the end-of-life threshold"))
+        k = detect_knee(good["n"].to_numpy(), good["SOH"].to_numpy())
+        if k["found"]:
+            ev.append((cid, int(k["knee_n"]), "Warning", f"Knee point: fade accelerated {k['ratio']:.1f}×"))
+        n_out = int(d["outlier"].sum())
+        if n_out:
+            ev.append((cid, int(d.loc[d["outlier"], "n"].iloc[0]), "Info", f"{n_out} cycle(s) excluded as invalid"))
+    out = pd.DataFrame(ev, columns=["Cell_ID", "n", "Severity", "Event"])
+    order = {"Critical": 0, "Warning": 1, "Watch": 2, "Info": 3}
+    out["_s"] = out["Severity"].map(order)
+    return out.sort_values(["_s", "Cell_ID", "n"]).drop(columns="_s").head(max_events).reset_index(drop=True)
+
+
+def scenario_projection(sf: Dict[str, Any], scenarios: Sequence[Dict[str, float]], n_cycles: int = 500,
+                        c_bol: float = 2.0, soh_eol: float = 0.7, level: float = 0.9) -> pd.DataFrame:
+    """What-if planner: project SOH for operating scenarios (ambient T, discharge current,
+    cut-off voltage) with the cohort stress-factor regression (``stress_factor_regression``).
+    The fitted law gives the fade per Ah; throughput per cycle is 2 C_bol SOH; the band comes
+    from the cell-level bootstrap of the regression. Linear-in-Ah early-life kinetics: treat
+    projections far beyond the observed fade range as indicative."""
+    if not sf.get("available"):
+        raise ValueError("The stress-factor regression is not available for this cohort.")
+    cols, beta, B = sf["columns"], np.asarray(sf["beta"]), np.asarray(sf["boot"])
+    Tref = sf["T_ref_K"]
+    rows = []
+    for sc in scenarios:
+        T_K = float(sc["T_C"]) + 273.15 + float(sc.get("self_heat_K", 5.0))
+        x = {"intercept": 1.0, "Ea (kJ/mol)": -(1 / T_K - 1 / Tref) / R_GAS / 1e-3,
+             "current exponent": math.log(max(float(sc["I_A"]), 0.1) / 2.0),
+             "cut-off voltage (per V)": float(sc.get("V_cut", 2.7)) - 2.7,
+             "cold regime (×)": float(sc["T_C"] < 15)}
+        xv = np.array([x[c] for c in cols])
+        logs = np.concatenate([[xv @ beta], B @ xv]) if len(B) else np.array([xv @ beta])
+        logs = logs[np.isfinite(logs)]
+        # degenerate bootstrap replicates (resampled cells at a single temperature) can explode:
+        # keep physically plausible fade rates only (1e-7 .. 0.05 SOH per Ah)
+        logs = np.concatenate([logs[:1], logs[1:][(logs[1:] > math.log(1e-7)) & (logs[1:] < math.log(0.05))]])
+        rates = np.exp(np.clip(logs, math.log(1e-7), math.log(0.05)))    # fade per Ah: point + bootstrap
+        n = np.arange(0, n_cycles + 1)
+        paths = np.empty((len(rates), len(n)))
+        for j, r in enumerate(rates):
+            soh = np.empty(len(n))
+            soh[0] = 1.0
+            for i in range(1, len(n)):
+                soh[i] = max(soh[i - 1] - r * 2 * c_bol * soh[i - 1], 0.0)
+            paths[j] = soh
+        qa, qb = (1 - level) / 2, 1 - (1 - level) / 2
+        ref = paths[1:] if len(paths) > 1 else paths
+        lo, hi = np.quantile(ref, qa, axis=0), np.quantile(ref, qb, axis=0)
+        lo, hi = np.minimum(lo, paths[0]), np.maximum(hi, paths[0])
+        eol = np.argmax(paths[0] < soh_eol) if (paths[0] < soh_eol).any() else None
+        for i in range(len(n)):
+            rows.append({"scenario": sc.get("name", f"{sc['T_C']:.0f} °C · {sc['I_A']:.1f} A"), "n": int(n[i]),
+                         "SOH": float(paths[0, i]), "lo": float(lo[i]), "hi": float(hi[i]),
+                         "life_to_EOL": int(eol) if eol is not None else None,
+                         "rate_per_Ah": float(rates[0])})
+    return pd.DataFrame(rows)

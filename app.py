@@ -25,6 +25,7 @@ from __future__ import annotations
 import html
 import json
 import math
+import time
 import os
 import re
 import traceback
@@ -57,8 +58,8 @@ DATA_DIR = APP_DIR / "data"
 RESULTS_DIR = APP_DIR / "results"
 MASTER_NAME, IMP_NAME = "battery_master_data.parquet", "impedance_ground_truth.parquet"
 POLICIES = ["Twin-Aware", "Fixed 1 A", "Fixed 2 A", "Fixed 4 A"]
-VIEWS = [":material/monitoring: Data & diagnostics", ":material/psychology: Models & forecasting",
-         ":material/tune: Operations & control"]
+VIEWS = [":material/dashboard: Operations centre", ":material/monitoring: Data & diagnostics",
+         ":material/psychology: Models & forecasting", ":material/tune: Operations & control"]
 SANS = "Inter, 'Source Sans Pro', 'Helvetica Neue', Arial, sans-serif"
 SERIF = "'STIX Two Text', 'Times New Roman', Times, serif"
 
@@ -301,6 +302,31 @@ div[data-baseweb="tab-highlight"] {{background: var(--bt-grad-warm) !important; 
 .stButton > button[kind="primary"]:hover {{filter: brightness(1.08); box-shadow: 0 6px 18px rgba(0,114,178,0.45);}}
 div[data-testid="stDataFrame"], div[data-testid="stTable"] {{border-radius: 12px; overflow: hidden;}}
 section[data-testid="stSidebar"] {{border-right: 1px solid var(--bt-border);}}
+/* ---------- animated hero gradient ---------- */
+.bt-hero {{background-size: 220% 220%; animation: bt-flow 18s ease-in-out infinite;}}
+@keyframes bt-flow {{0% {{background-position: 0% 50%;}} 50% {{background-position: 100% 50%;}} 100% {{background-position: 0% 50%;}}}}
+/* ---------- industrial status bar ---------- */
+.bt-statusbar {{
+  display: flex; flex-wrap: wrap; align-items: center; gap: 18px; margin: 4px 0 14px 0; padding: 9px 16px;
+  border-radius: 12px; font-family: "JetBrains Mono", "SFMono-Regular", Consolas, monospace; font-size: 0.78rem;
+  letter-spacing: 0.06em; background: #0E1726; color: #9FB3C8; border: 1px solid #1F2E45;
+  box-shadow: inset 0 0 0 1px rgba(86,180,233,0.08);
+}}
+.bt-statusbar b {{color: #E6EEF7; font-weight: 700;}}
+.bt-statusbar .bt-clock {{margin-left: auto; color: #6B819A;}}
+.bt-live {{display: inline-flex; align-items: center; gap: 8px; color: #3DDC97; font-weight: 800;}}
+.bt-dot {{width: 9px; height: 9px; border-radius: 50%; background: #3DDC97; box-shadow: 0 0 0 0 rgba(61,220,151,0.7);
+  animation: bt-pulse 1.8s infinite;}}
+@keyframes bt-pulse {{0% {{box-shadow: 0 0 0 0 rgba(61,220,151,0.65);}} 70% {{box-shadow: 0 0 0 9px rgba(61,220,151,0);}}
+  100% {{box-shadow: 0 0 0 0 rgba(61,220,151,0);}}}}
+.bt-sev {{padding: 2px 9px; border-radius: 6px; font-weight: 800;}}
+.bt-sev-crit {{background: rgba(213,94,0,0.18); color: #FF8A4C; border: 1px solid rgba(213,94,0,0.45);}}
+.bt-sev-warn {{background: rgba(230,159,0,0.16); color: #F5C04A; border: 1px solid rgba(230,159,0,0.40);}}
+/* ---------- alert banner ---------- */
+.bt-alert {{display: flex; gap: 12px; align-items: flex-start; padding: 12px 16px; border-radius: 12px; margin: 6px 0 12px 0;
+  border: 1px solid var(--bt-border); background: var(--bt-surface); box-shadow: var(--bt-shadow);}}
+.bt-alert .bt-badge {{flex: none; padding: 3px 10px; border-radius: 8px; color: #fff; font-weight: 800; font-size: 0.8rem;}}
+.bt-alert .bt-msg {{font-size: 0.93rem; line-height: 1.5; color: inherit;}}
 </style>"""
     st.markdown(css, unsafe_allow_html=True)
 
@@ -1387,6 +1413,156 @@ def fig_om_tradeoff(study: pd.DataFrame, P: Palette) -> go.Figure:
 
 
 # =============================================================================
+# Figures: operations centre (fleet monitoring)
+# =============================================================================
+RISK_COLORS = {"Healthy": "#009E73", "Watch": "#E6B800", "Warning": "#E69F00", "Critical": "#D55E00"}
+RISK_ICON = {"Healthy": "🟢", "Watch": "🟡", "Warning": "🟠", "Critical": "🔴"}
+
+
+def fig_gauges(row: pd.Series, P: Palette, limits: te.SafetyLimits) -> go.Figure:
+    """Instrument cluster for one battery: SOH, quick RUL, resistance growth, peak temperature."""
+    fig = go.Figure()
+    eol = float(row["SOH_EOL"])
+    common = dict(bgcolor=rgba(P.muted, 0.08), borderwidth=0)
+    fig.add_trace(go.Indicator(
+        mode="gauge+number", value=100 * float(row["SOH"]), number=dict(suffix=" %", font=dict(size=34, color=P.text)),
+        title=dict(text="State of health", font=dict(size=14, color=P.muted)), domain=dict(x=[0.0, 0.22], y=[0, 1]),
+        gauge=dict(axis=dict(range=[50, 105], tickcolor=P.muted, tickfont=dict(color=P.muted)),
+                   bar=dict(color=P.accent, thickness=0.28),
+                   steps=[dict(range=[50, 100 * eol], color=rgba("#D55E00", 0.35)),
+                          dict(range=[100 * eol, 100 * eol + 10], color=rgba("#E69F00", 0.30)),
+                          dict(range=[100 * eol + 10, 105], color=rgba("#009E73", 0.25))],
+                   threshold=dict(line=dict(color=P.eol, width=4), thickness=0.85, value=100 * eol), **common)))
+    rul = float(row["Quick RUL"])
+    fig.add_trace(go.Indicator(
+        mode="number", value=rul if np.isfinite(rul) else 999,
+        number=dict(suffix=" cyc" if np.isfinite(rul) else "+ cyc", font=dict(size=40, color=RISK_COLORS[row["Risk"]]),
+                    valueformat=".0f"),
+        title=dict(text=f"Quick RUL<br><span style='font-size:12px'>{RISK_ICON[row['Risk']]} {row['Risk']}</span>",
+                   font=dict(size=14, color=P.muted)), domain=dict(x=[0.27, 0.47], y=[0.1, 0.9])))
+    rg = float(row["R growth (%)"]) if np.isfinite(row["R growth (%)"]) else 0.0
+    fig.add_trace(go.Indicator(
+        mode="gauge+number", value=rg, number=dict(suffix=" %", font=dict(size=30, color=P.text), valueformat="+.0f"),
+        title=dict(text="Resistance growth", font=dict(size=14, color=P.muted)), domain=dict(x=[0.52, 0.74], y=[0, 1]),
+        gauge=dict(axis=dict(range=[min(-20, rg), max(150, rg)], tickcolor=P.muted, tickfont=dict(color=P.muted)),
+                   bar=dict(color=P.r_ct, thickness=0.28),
+                   steps=[dict(range=[min(-20, rg), 50], color=rgba("#009E73", 0.22)),
+                          dict(range=[50, 100], color=rgba("#E69F00", 0.28)),
+                          dict(range=[100, max(150, rg)], color=rgba("#D55E00", 0.30))], **common)))
+    fig.add_trace(go.Indicator(
+        mode="gauge+number", value=float(row["Peak T (°C)"]),
+        number=dict(suffix=" °C", font=dict(size=30, color=P.text), valueformat=".1f"),
+        title=dict(text="Peak cell temperature", font=dict(size=14, color=P.muted)), domain=dict(x=[0.79, 1.0], y=[0, 1]),
+        gauge=dict(axis=dict(range=[0, 80], tickcolor=P.muted, tickfont=dict(color=P.muted)),
+                   bar=dict(color=P.eis, thickness=0.28),
+                   steps=[dict(range=[0, limits.T_warn_C], color=rgba("#009E73", 0.22)),
+                          dict(range=[limits.T_warn_C, limits.T_crit_C], color=rgba("#E69F00", 0.30)),
+                          dict(range=[limits.T_crit_C, 80], color=rgba("#D55E00", 0.32))],
+                   threshold=dict(line=dict(color=P.eol, width=3), thickness=0.8, value=limits.T_crit_C), **common)))
+    fig.update_layout(height=260, margin=dict(l=30, r=30, t=40, b=10), paper_bgcolor="rgba(0,0,0,0)",
+                      font=dict(color=P.text))
+    return fig
+
+
+def fig_fleet_map(fs: pd.DataFrame, P: Palette) -> go.Figure:
+    """Treemap: fleet → ambient group → battery. Tile area = cycles run, colour = health margin
+    (1 = new, 0 = at end of life, < 0 = past it)."""
+    d = fs.reset_index()
+    d["group"] = d["Ambient_C"].round(0).map(lambda t: f"{t:.0f} °C")
+    ids, labels, parents, values, colors, text = ["fleet"], ["Fleet"], [""], [0], [float(d["Health margin"].mean())], [""]
+    for g, gg in d.groupby("group"):
+        ids.append(f"g/{g}"); labels.append(f"Ambient {g}"); parents.append("fleet"); values.append(0)
+        colors.append(float(gg["Health margin"].mean())); text.append(f"{len(gg)} cells")
+        for _, r in gg.iterrows():
+            ids.append(f"c/{r['Cell_ID']}"); labels.append(r["Cell_ID"]); parents.append(f"g/{g}")
+            values.append(max(int(r["Cycles"]), 1)); colors.append(float(r["Health margin"]))
+            text.append(f"SOH {100 * r['SOH']:.1f}%<br>{RISK_ICON[r['Risk']]} {r['Risk']}")
+    fig = go.Figure(go.Treemap(
+        ids=ids, labels=labels, parents=parents, values=values, text=text, branchvalues="remainder",
+        texttemplate="<b>%{label}</b><br>%{text}", textfont=dict(size=14),
+        marker=dict(colors=colors, colorscale=[[0, "#D55E00"], [0.35, "#E69F00"], [0.6, "#F0E442"], [1, "#009E73"]],
+                    cmin=0, cmax=1, line=dict(color=P.plot_bg, width=2),
+                    colorbar=dict(title=dict(text="Health margin", font=dict(color=P.text)), tickformat=".0%",
+                                  tickfont=dict(color=P.muted), thickness=12)),
+        hovertemplate="<b>%{label}</b><br>%{text}<br>health margin %{color:.0%}<extra></extra>",
+        pathbar=dict(visible=True)))
+    fig.update_layout(height=460, margin=dict(l=10, r=10, t=50, b=10), paper_bgcolor="rgba(0,0,0,0)",
+                      font=dict(color=P.text),
+                      title=dict(text="Fleet health map (area = cycles run, colour = remaining health margin)",
+                                 font=dict(size=16, color=P.text), x=0.01))
+    return fig
+
+
+def fig_risk_matrix(fs: pd.DataFrame, P: Palette, cell_id: str) -> go.Figure:
+    """Risk matrix: remaining life (x) against degradation speed (y)."""
+    d = fs.reset_index()
+    cap = float(np.nanmax(d["Quick RUL"].replace(np.inf, np.nan))) if np.isfinite(d["Quick RUL"].replace(np.inf, np.nan)).any() else 300
+    cap = max(cap * 1.2, 50)
+    x = d["Quick RUL"].replace(np.inf, cap).clip(lower=1)
+    fig = go.Figure()
+    fig.add_vrect(x0=1, x1=15, fillcolor=rgba("#D55E00", 0.10), line_width=0)
+    fig.add_vrect(x0=15, x1=50, fillcolor=rgba("#E69F00", 0.08), line_width=0)
+    for risk in te.RISK_LEVELS:
+        m = d["Risk"] == risk
+        if not m.any():
+            continue
+        fig.add_trace(go.Scatter(
+            x=x[m], y=d.loc[m, "Fade per 100 cycles (%)"], mode="markers+text", name=f"{RISK_ICON[risk]} {risk}",
+            text=d.loc[m, "Cell_ID"], textposition="top center", textfont=dict(size=11, color=P.text),
+            marker=dict(size=10 + 16 * np.sqrt(d.loc[m, "Cycles"] / d["Cycles"].max()), color=RISK_COLORS[risk],
+                        opacity=0.85, line=dict(width=[3 if c == cell_id else 1 for c in d.loc[m, "Cell_ID"]],
+                                                color=P.text)),
+            customdata=np.column_stack([d.loc[m, "SOH"], d.loc[m, "Alerts"]]),
+            hovertemplate="<b>%{text}</b><br>quick RUL %{x:.0f} cycles<br>fade %{y:.2f} %/100 cycles<br>"
+                          "SOH %{customdata[0]:.3f}<br>%{customdata[1]}<extra></extra>"))
+    fig.update_xaxes(title_text="Quick RUL (cycles, log scale; right edge = not declining)", type="log")
+    fig.update_yaxes(title_text="Recent fade (SOH % per 100 cycles)")
+    return style_fig(fig, P, 520, "Risk matrix: remaining life versus degradation speed (size = cycles run)",
+                     hovermode="closest")
+
+
+def fig_scenarios(sp: pd.DataFrame, soh_eol: float, P: Palette) -> go.Figure:
+    fig = go.Figure()
+    for i, (name, d) in enumerate(sp.groupby("scenario", sort=False)):
+        col = CELL_COLORS[i % len(CELL_COLORS)]
+        add_band(fig, d["n"].to_numpy(), d["lo"].to_numpy(), d["hi"].to_numpy(), col, f"{name} band", group=name,
+                 alpha=0.13)
+        life = d["life_to_EOL"].iloc[0]
+        fig.add_trace(go.Scatter(x=d["n"], y=d["SOH"], mode="lines", name=f"{name} · EOL at {life if life else '>'} cycles",
+                                 legendgroup=name, line=dict(color=col, width=3, dash=DASHES[i % len(DASHES)]),
+                                 hovertemplate="%{y:.3f}<extra>" + html.escape(name) + "</extra>"))
+    fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, annotation_text="End of life",
+                  annotation_font=dict(color=P.eol))
+    fig.update_xaxes(title_text="Cycle n")
+    fig.update_yaxes(title_text="Projected SOH (–)")
+    return style_fig(fig, P, 520, "What-if: projected fade for each operating scenario (cohort stress-factor law)")
+
+
+def build_report_html(title: str, sections: List[Tuple[str, Any]]) -> str:
+    """Self-contained HTML report: each section is (heading, plotly figure | DataFrame | text)."""
+    parts, first = [], True
+    for head, obj in sections:
+        parts.append(f"<h2>{html.escape(head)}</h2>")
+        if isinstance(obj, go.Figure):
+            parts.append(obj.to_html(full_html=False, include_plotlyjs="cdn" if first else False))
+            first = False
+        elif isinstance(obj, pd.DataFrame):
+            parts.append(obj.to_html(classes="tbl", float_format=lambda v: f"{v:.4g}", border=0, na_rep="—"))
+        else:
+            parts.append(f"<p>{html.escape(str(obj))}</p>")
+    css = ("body{font-family:Inter,Segoe UI,Arial,sans-serif;max-width:1180px;margin:32px auto;color:#1f2933;}"
+           "header{background:linear-gradient(120deg,#0B3D91,#0072B2 40%,#009E73);color:#fff;padding:26px 32px;"
+           "border-radius:16px}h1{margin:0;font-size:26px}h2{margin-top:34px;border-bottom:2px solid #0072B2;"
+           "padding-bottom:6px;font-size:19px}table.tbl{border-collapse:collapse;font-size:13px;width:100%}"
+           ".tbl th{background:#eef4fa;text-align:left}.tbl td,.tbl th{padding:6px 10px;border-bottom:1px solid #dde3ea}")
+    stamp = time.strftime("%Y-%m-%d %H:%M")
+    return (f"<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title>"
+            f"<style>{css}</style></head><body><header><h1>{html.escape(title)}</h1>"
+            f"<div>Battery digital twin · engine {te.ENGINE_VERSION} · generated {stamp}</div></header>"
+            + "".join(parts) + "</body></html>")
+
+
+# =============================================================================
 # Cached data access & computation
 # =============================================================================
 @st.cache_resource(show_spinner=False)
@@ -1460,6 +1636,12 @@ def est_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, model:
 @st.cache_data(show_spinner=False, max_entries=8)
 def pooled_ea_cached(_ct: pd.DataFrame, key: str, min_ambient: float) -> Dict[str, Any]:
     return te.estimate_pooled_arrhenius(_ct, min_ambient_C=min_ambient)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def fleet_cached(_ct: pd.DataFrame, key: str, eol_ah: float, limits: Dict[str, float]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    L = te.SafetyLimits(**limits)
+    return te.fleet_status(_ct, eol_ah, L), te.fleet_events(_ct, L)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -1685,6 +1867,19 @@ with st.container(border=True):
             unsafe_allow_html=True,
         )
 
+_fs_bar, _ = fleet_cached(ct, DATA_KEY, float(eol_ah), asdict(te.SafetyLimits()))
+_n_crit = int((_fs_bar["Risk"] == "Critical").sum()) if len(_fs_bar) else 0
+_n_warn = int((_fs_bar["Risk"] == "Warning").sum()) if len(_fs_bar) else 0
+st.markdown(
+    '<div class="bt-statusbar">'
+    '<span class="bt-live"><span class="bt-dot"></span>TWIN ONLINE</span>'
+    f'<span>ENGINE <b>v{te.ENGINE_VERSION}</b></span>'
+    f'<span>SOURCE <b>{"SYNTHETIC DEMO" if st.session_state.get("demo") else "TELEMETRY"}</b></span>'
+    f'<span>FLEET <b>{len(meta)}</b> CELLS · <b>{int(ct["n"].count())}</b> CYCLES</span>'
+    f'<span class="bt-sev bt-sev-crit">{_n_crit} CRITICAL</span>'
+    f'<span class="bt-sev bt-sev-warn">{_n_warn} WARNING</span>'
+    f'<span class="bt-clock">{time.strftime("%Y-%m-%d %H:%M")} UTC</span>'
+    '</div>', unsafe_allow_html=True)
 view = nav(VIEWS, key="view")
 st.session_state["_sec_n"] = 0
 
@@ -1912,6 +2107,110 @@ def condition_effects_section() -> None:
     st.caption("Eₐ > 0: hotter cells fade faster per Ah (Arrhenius SEI growth). Current exponent > 0: rate-driven "
                "damage. Cold regime (×) > 1: the 4 °C cells age faster than Arrhenius predicts (lithium plating). "
                "Wide intervals mean the cohort cannot separate the factor from cell-to-cell variation.")
+
+
+def risk_banner(row: pd.Series, cell_id: str) -> None:
+    col = RISK_COLORS[row["Risk"]]
+    st.markdown(f'<div class="bt-alert"><span class="bt-badge" style="background:{col}">{html.escape(row["Risk"].upper())}'
+                f'</span><span class="bt-msg"><b>{html.escape(cell_id)}</b>: {html.escape(row["Alerts"])}</span></div>',
+                unsafe_allow_html=True)
+
+
+def view_overview() -> None:
+    lim = asdict(te.SafetyLimits())
+    fs, ev = fleet_cached(ct, DATA_KEY, float(eol_ah), lim)
+    if fs.empty:
+        st.info("Not enough valid cycles to build the fleet overview.")
+        return
+    section("Fleet at a glance")
+    k = st.columns(6)
+    k[0].metric("Batteries", len(fs))
+    k[1].metric("Mean SOH", fmt(100 * fs["SOH"].mean(), ".1f", "%"))
+    k[2].metric("Past end of life", int((fs["SOH"] <= fs["SOH_EOL"]).sum()))
+    k[3].metric("Critical / warning", f"{int((fs['Risk'] == 'Critical').sum())} / {int((fs['Risk'] == 'Warning').sum())}")
+    k[4].metric("Knees detected", int(fs["Knee"].sum()))
+    k[5].metric("Fleet cycles logged", f"{int(fs['Cycles'].sum()):,}")
+
+    section(f"Instrument cluster · {cell}")
+    if cell in fs.index:
+        row = fs.loc[cell]
+        risk_banner(row, cell)
+        show(fig_gauges(row, P, te.SafetyLimits(**lim)), key="gauges", export=False)
+        st.caption("Quick RUL is a robust linear trend of the last 20 cycles, for triage. The Models view gives the "
+                   "full probabilistic RUL from the twin, PINN and particle filter.")
+
+    section("Fleet health map")
+    show(fig_fleet_map(fs, P), key="fleet_map", data=fs.reset_index())
+
+    section("Risk triage")
+    show(fig_risk_matrix(fs, P, cell), key="risk_matrix", data=fs.reset_index())
+    tbl = fs.reset_index()[["Cell_ID", "Risk", "SOH", "Health margin", "Quick RUL", "Fade per 100 cycles (%)",
+                            "R growth (%)", "Peak T (°C)", "Cycles", "Ambient_C", "I_dis_A", "Alerts"]].copy()
+    tbl["Risk"] = tbl["Risk"].map(lambda r: f"{RISK_ICON[r]} {r}")
+    tbl["Quick RUL"] = tbl["Quick RUL"].replace(np.inf, np.nan)
+    try:
+        st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(640, 38 + 35 * len(tbl)),
+                     column_config={
+                         "Cell_ID": st.column_config.TextColumn("Battery", width="small"),
+                         "SOH": st.column_config.ProgressColumn("SOH", min_value=0.0, max_value=1.05, format="%.3f"),
+                         "Health margin": st.column_config.ProgressColumn("Health margin", min_value=0.0, max_value=1.0,
+                                                                          format="%.2f"),
+                         "Quick RUL": st.column_config.NumberColumn("Quick RUL", format="%.0f cyc"),
+                         "Fade per 100 cycles (%)": st.column_config.NumberColumn("Fade /100 cyc", format="%.2f %%"),
+                         "R growth (%)": st.column_config.NumberColumn("R growth", format="%+.0f %%"),
+                         "Peak T (°C)": st.column_config.NumberColumn("Peak T", format="%.1f °C"),
+                         "Ambient_C": st.column_config.NumberColumn("Ambient", format="%.0f °C"),
+                         "I_dis_A": st.column_config.NumberColumn("Load", format="%.1f A"),
+                         "Alerts": st.column_config.TextColumn("Alerts", width="large")})
+    except Exception:
+        show_table(tbl)
+
+    section("Event log")
+    sev = st.multiselect("Severity", ["Critical", "Warning", "Watch", "Info"], default=["Critical", "Warning", "Watch"],
+                         key="ev_sev")
+    only = st.toggle("Only the selected battery", value=False, key="ev_only")
+    evf = ev[ev["Severity"].isin(sev)]
+    if only:
+        evf = evf[evf["Cell_ID"] == cell]
+    evf = evf.assign(Severity=evf["Severity"].map(lambda s_: {"Critical": "🔴", "Warning": "🟠", "Watch": "🟡",
+                                                              "Info": "🔵"}[s_] + " " + s_))
+    try:
+        st.dataframe(evf, hide_index=True, use_container_width=True, height=min(420, 38 + 35 * max(len(evf), 1)),
+                     column_config={"Cell_ID": st.column_config.TextColumn("Battery"),
+                                    "n": st.column_config.NumberColumn("Cycle", format="%d")})
+    except Exception:
+        show_table(evf)
+
+    section("Reports")
+    st.markdown("One-click, self-contained HTML report (interactive charts, opens in any browser; print to PDF "
+                "from the browser for a static copy).")
+    if st.button(f"Build report for {cell}", key="rep_go", icon=":material/description:", type="primary"):
+        with st.spinner("Assembling report…"):
+            knees = {cell: knee_cached(ct_cell, DATA_KEY, cell)}
+            secs: List[Tuple[str, Any]] = [
+                ("Summary", f"{cell_label(cell, meta)} · SOH {100 * fs.loc[cell, 'SOH']:.1f}% · risk "
+                            f"{fs.loc[cell, 'Risk']} · alerts: {fs.loc[cell, 'Alerts']}" if cell in fs.index else cell),
+                ("Instrument cluster", fig_gauges(fs.loc[cell], P, te.SafetyLimits(**lim))) if cell in fs.index
+                else ("Instrument cluster", "n/a"),
+                ("Capacity fade", fig_fade_compare(ct, meta, [cell], "SOH", soh_eol, P, knees, True, "n")),
+                ("Fleet risk matrix", fig_risk_matrix(fs, P, cell)),
+                ("Fleet status", fs.drop(columns=["risk_level"])),
+                ("Event log (this battery)", ev[ev["Cell_ID"] == cell]),
+            ]
+            for key_, title in (("ml", "ML forecasts"), ("cmp", "Physics-informed comparison")):
+                saved = st.session_state.get(key_)
+                if saved and key_ == "ml" and saved.get("res") and saved["cfg"]["cell"] == cell:
+                    secs.append((title, fig_ml(saved["res"], ct_cell, saved["cfg"]["n0"], soh_eol, P)))
+                if saved and key_ == "cmp" and saved.get("res") is not None:
+                    try:
+                        secs.append((title, fig_compare(saved["res"], P)))
+                        secs.append(("Forecast metrics", te.metrics_table(saved["res"].metrics)))
+                    except Exception:
+                        pass
+            st.session_state["report"] = (cell, build_report_html(f"Battery health report · {cell}", secs))
+    rep = st.session_state.get("report")
+    if rep and rep[0] == cell:
+        download("Download report (HTML)", rep[1], f"battery_report_{cell}.html", "text/html", key="rep_dl")
 
 
 def view_data() -> None:
@@ -2869,6 +3168,53 @@ def view_ops() -> None:
         manifest_button(mm["cfg"], "mismatch", DATA_KEY)
 
     integrated_section(econ, phys, plant, float(amb_mean), float(amb_amp), ops_cfg)
+    scenario_section()
+
+
+def scenario_section() -> None:
+    section("What-if scenario planner")
+    sf = stress_factors_cached(ct, DATA_KEY)
+    if not sf.get("available"):
+        st.info("The planner needs the cohort stress-factor regression (at least four cells with measurable fade).")
+        return
+    st.markdown("Edit the table to compare operating scenarios. Projections use the stress-factor law fitted on this "
+                f"cohort ({sf['n_cells']} cells, R² = {sf['r2']:.2f}; factors: "
+                f"{', '.join(c for c in sf['columns'] if c != 'intercept')}), with a bootstrap band. Factors that do "
+                "not vary in the data are held at their reference value.")
+    default = pd.DataFrame([{"Scenario": "Reference (24 °C, 2 A)", "Ambient (°C)": 24.0, "Discharge current (A)": 2.0,
+                             "Cut-off (V)": 2.7},
+                            {"Scenario": "Hot site (43 °C)", "Ambient (°C)": 43.0, "Discharge current (A)": 2.0,
+                             "Cut-off (V)": 2.7},
+                            {"Scenario": "Hot + high load", "Ambient (°C)": 43.0, "Discharge current (A)": 4.0,
+                             "Cut-off (V)": 2.7},
+                            {"Scenario": "Cold site (4 °C)", "Ambient (°C)": 4.0, "Discharge current (A)": 2.0,
+                             "Cut-off (V)": 2.7}])
+    try:
+        ed = st.data_editor(default, num_rows="dynamic", hide_index=True, use_container_width=True, key="scen_tbl",
+                            column_config={"Ambient (°C)": st.column_config.NumberColumn(min_value=-20.0, max_value=60.0),
+                                           "Discharge current (A)": st.column_config.NumberColumn(min_value=0.1,
+                                                                                                  max_value=10.0),
+                                           "Cut-off (V)": st.column_config.NumberColumn(min_value=2.0, max_value=3.2)})
+    except Exception:
+        ed = default
+    if not isinstance(ed, pd.DataFrame) or ed.empty:
+        ed = default
+    horizon = st.slider("Projection horizon (cycles)", 100, 1500, 500, 50, key="scen_h")
+    scen = [{"name": str(r["Scenario"]), "T_C": float(r["Ambient (°C)"]), "I_A": float(r["Discharge current (A)"]),
+             "V_cut": float(r["Cut-off (V)"])} for _, r in ed.dropna().iterrows()][:8]
+    try:
+        sp = te.scenario_projection(sf, scen, horizon, c_bol=float(meta["C_bol_Ah"].median()),
+                                    soh_eol=float(soh_eol))
+    except Exception as exc:
+        report_error("Scenario projection failed", exc, debug)
+        return
+    show(fig_scenarios(sp, soh_eol, P), key="scen_fig", data=sp)
+    life = sp.groupby("scenario", sort=False).agg(life=("life_to_EOL", "first"), rate=("rate_per_Ah", "first"))
+    ref = life["life"].iloc[0]
+    k = st.columns(min(len(life), 4))
+    for i, (name, r) in enumerate(life.head(4).iterrows()):
+        delta = (f"{100 * (r['life'] - ref) / ref:+.0f}% vs first" if (ref and r["life"] and i) else None)
+        k[i].metric(name, f"{int(r['life'])} cycles" if r["life"] else f"> {horizon} cycles", delta=delta)
 
 
 def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional[te.CellPhysics],
@@ -2960,7 +3306,8 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # =============================================================================
 # Dispatch: only the active view runs
 # =============================================================================
-_VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_data, VIEWS[1]: view_models, VIEWS[2]: view_ops}
+_VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_overview, VIEWS[1]: view_data, VIEWS[2]: view_models,
+                                           VIEWS[3]: view_ops}
 try:
     _VIEW_FN.get(view, view_data)()
 except Exception as exc:

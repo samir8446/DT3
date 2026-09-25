@@ -511,6 +511,23 @@ def test_mechanistic_pinn_gradients_and_mechanisms():
         pass
 
 
+def test_fleet_status_events_and_scenarios():
+    _, ct, _, _ = synthetic()
+    fs = te.fleet_status(ct, eol_ah=1.6)
+    assert len(fs) == 6 and set(fs["Risk"]) <= set(te.RISK_LEVELS)
+    assert fs["risk_level"].is_monotonic_decreasing                       # triage order: worst first
+    past = fs[fs["SOH"] <= fs["SOH_EOL"]]
+    assert (past["Risk"] == "Critical").all() and (past["Quick RUL"] == 0).all()
+    assert not fs["Alerts"].str.contains("past end of life, .*near end of life").any()
+    ev = te.fleet_events(ct)
+    assert {"Cell_ID", "n", "Severity", "Event"} <= set(ev.columns) and len(ev) > 0
+    sf = te.stress_factor_regression(ct)
+    sp = te.scenario_projection(sf, [{"T_C": 24, "I_A": 2.0}, {"T_C": 43, "I_A": 2.0}], 300, soh_eol=0.8)
+    life = sp.groupby("scenario")["life_to_EOL"].first()
+    assert life.iloc[1] < life.iloc[0]                                     # hotter -> shorter life
+    assert (sp["lo"] <= sp["hi"] + 1e-12).all()
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
