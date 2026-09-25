@@ -58,8 +58,9 @@ DATA_DIR = APP_DIR / "data"
 RESULTS_DIR = APP_DIR / "results"
 MASTER_NAME, IMP_NAME = "battery_master_data.parquet", "impedance_ground_truth.parquet"
 POLICIES = ["Twin-Aware", "Fixed 1 A", "Fixed 2 A", "Fixed 4 A"]
-VIEWS = [":material/dashboard: Operations centre", ":material/monitoring: Data & diagnostics",
-         ":material/psychology: Models & forecasting", ":material/tune: Operations & control"]
+VIEWS = [":material/dashboard: Operations centre", ":material/play_circle: Live twin",
+         ":material/monitoring: Data & diagnostics", ":material/psychology: Models & forecasting",
+         ":material/tune: Operations & control"]
 SANS = "Inter, 'Source Sans Pro', 'Helvetica Neue', Arial, sans-serif"
 SERIF = "'STIX Two Text', 'Times New Roman', Times, serif"
 
@@ -1563,6 +1564,147 @@ def build_report_html(title: str, sections: List[Tuple[str, Any]]) -> str:
 
 
 # =============================================================================
+# Figures: live replay, DP policy, half-cell fitting
+# =============================================================================
+def fig_replay(ct_cell: pd.DataFrame, pc: pd.DataFrame, fc: Any, n: int, soh_eol: float, P: Palette,
+               reveal: bool, n_max: int) -> go.Figure:
+    good = ct_cell[~ct_cell["outlier"]]
+    seen, future = good[good["n"] <= n], good[good["n"] > n]
+    est = pc[pc["n"] <= n]
+    fig = go.Figure()
+    add_band(fig, est["n"].to_numpy(), (est["SOH"] - 2 * est["SOH_std"]).to_numpy(),
+             (est["SOH"] + 2 * est["SOH_std"]).to_numpy(), P.ekf, "Twin estimate ±2σ", group="est", alpha=0.18)
+    if fc is not None:
+        m = fc.n_grid > n
+        add_band(fig, fc.n_grid[m], fc.lo[m], fc.hi[m], P.pinn, f"{int(100 * fc.level)}% forecast band",
+                 group="fc", alpha=0.16)
+        fig.add_trace(go.Scatter(x=fc.n_grid[m], y=fc.soh[m], mode="lines", name="Forecast (median)",
+                                 legendgroup="fc", line=dict(color=P.pinn, width=2.6, dash="dash"),
+                                 hovertemplate="%{y:.4f}<extra>forecast</extra>"))
+    if reveal and len(future):
+        fig.add_trace(go.Scatter(x=future["n"], y=future["SOH"], mode="markers", name="Future (hidden from twin)",
+                                 marker=dict(color=P.muted, size=5, opacity=0.35, symbol="circle-open"),
+                                 hovertemplate="%{y:.4f}<extra>future</extra>"))
+    fig.add_trace(go.Scatter(x=seen["n"], y=seen["SOH"], mode="markers", name="Measured so far",
+                             marker=dict(color=P.measured, size=6), hovertemplate="%{y:.4f}<extra>measured</extra>"))
+    fig.add_trace(go.Scatter(x=est["n"], y=est["SOH"], mode="lines", name="Twin estimate (causal)", legendgroup="est",
+                             line=dict(color=P.ekf, width=3), hovertemplate="%{y:.4f}<extra>twin</extra>"))
+    if len(est):
+        fig.add_trace(go.Scatter(x=[est["n"].iloc[-1]], y=[est["SOH"].iloc[-1]], mode="markers", showlegend=False,
+                                 marker=dict(size=16, color=P.ekf, line=dict(color=P.plot_bg, width=3)), hoverinfo="skip"))
+    fig.add_vline(x=n, line_color=P.ekf, line_width=1.5, line_dash="dot",
+                  annotation_text=f"now: n = {n}", annotation_font=dict(color=P.ekf, size=12))
+    fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, annotation_text="End of life",
+                  annotation_font=dict(color=P.eol))
+    lo_y = min(float(good["SOH"].min()), soh_eol) - 0.03
+    fig.update_xaxes(title_text="Discharge cycle n", range=[0, n_max])
+    fig.update_yaxes(title_text="State of health SOH (–)", range=[lo_y, 1.04])
+    return style_fig(fig, P, 520, "Live twin: assimilating one discharge at a time", hovermode="x unified")
+
+
+def fig_replay_track(track: pd.DataFrame, pc: pd.DataFrame, n: int, rul_true: Optional[int], P: Palette,
+                     n_max: int) -> go.Figure:
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
+                        subplot_titles=("Predicted end of life converging as data arrive",
+                                        "Personalised degradation rate k (self-updating parameter)"))
+    _style_subplot_titles(fig, P)
+    t = track[track["n"] <= n]
+    add_band(fig, t["n"].to_numpy(), t["eol_lo"].to_numpy(), t["eol_hi"].to_numpy(), P.pinn, "EOL 90% band",
+             group="eol", alpha=0.18, row=1, col=1)
+    fig.add_trace(go.Scatter(x=t["n"], y=t["eol_med"], mode="lines", name="Predicted EOL cycle", legendgroup="eol",
+                             line=dict(color=P.pinn, width=2.6), hovertemplate="%{y:.0f}<extra>EOL</extra>"), row=1, col=1)
+    if rul_true is not None:
+        fig.add_hline(y=rul_true, line_dash="dash", line_color=P.eol, row=1, col=1,
+                      annotation_text=f"actual EOL n = {rul_true}", annotation_font=dict(color=P.eol))
+    e = pc[pc["n"] <= n]
+    fig.add_trace(go.Scatter(x=e["n"], y=e["k_ah"] * 1e4, mode="lines", name="k (×10⁻⁴ per Ah)",
+                             line=dict(color=P.ekf, width=2.6), hovertemplate="%{y:.3f}<extra>k</extra>"), row=2, col=1)
+    ks = e["logk_std"] if "logk_std" in e else None
+    if ks is not None and len(e):
+        add_band(fig, e["n"].to_numpy(), (e["k_ah"] * np.exp(-2 * ks) * 1e4).to_numpy(),
+                 (e["k_ah"] * np.exp(2 * ks) * 1e4).to_numpy(), P.ekf, "k ±2σ", group="k", alpha=0.15, row=2, col=1)
+    fig.update_xaxes(range=[0, n_max])
+    fig.update_xaxes(title_text="Discharge cycle n (data assimilated so far)", row=2, col=1)
+    fig.update_yaxes(title_text="EOL cycle", row=1, col=1)
+    fig.update_yaxes(title_text="k ×10⁴", row=2, col=1)
+    return style_fig(fig, P, 640, None)
+
+
+def fig_dp_policy(dp: te.DPResult, P: Palette) -> go.Figure:
+    z = np.where(dp.action < 0, -1, np.array(dp.currents)[np.clip(dp.action, 0, None)])
+    labels = ["Replace"] + [f"{c:g} A" for c in dp.currents]
+    vals = [-1] + list(dp.currents)
+    palette = ["#D55E00", "#56B4E9", "#009E73", "#E69F00", "#CC79A7"][: len(vals)]
+    idx = np.vectorize(lambda v: vals.index(v))(z)
+    cs = []
+    for i, c in enumerate(palette):
+        cs += [[i / len(palette), c], [(i + 1) / len(palette), c]]
+    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.14, row_heights=[0.72, 0.28],
+                        subplot_titles=("Optimal action by state of health and season", "Ambient temperature"))
+    _style_subplot_titles(fig, P)
+    fig.add_trace(go.Heatmap(x=dp.phases, y=dp.soh_grid, z=idx, colorscale=cs, zmin=-0.5, zmax=len(palette) - 0.5,
+                             colorbar=dict(tickvals=list(range(len(labels))), ticktext=labels, thickness=14, len=0.7,
+                                           y=0.64, tickfont=dict(color=P.text)),
+                             customdata=np.array(labels)[idx],
+                             hovertemplate="season cycle %{x:.0f} · SOH %{y:.3f}<br>%{customdata}<extra></extra>"),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter(x=dp.phases, y=dp.replace_boundary, mode="lines+markers", name="Replacement boundary",
+                             line=dict(color=P.text, width=2.5, dash="dash"), marker=dict(size=6),
+                             hovertemplate="replace below SOH %{y:.3f}<extra></extra>"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=dp.phases, y=dp.T_amb, mode="lines+markers", name="Ambient", showlegend=False,
+                             line=dict(color=P.eis, width=2.5), hovertemplate="%{y:.1f} °C<extra></extra>"),
+                  row=2, col=1)
+    fig.update_yaxes(title_text="SOH (–)", row=1, col=1)
+    fig.update_yaxes(title_text="°C", row=2, col=1)
+    fig.update_xaxes(title_text="Cycle within the seasonal period", row=2, col=1)
+    return style_fig(fig, P, 700, f"Dynamic-programming policy · optimal long-run profit rate ρ* = {dp.rho:.4f} CU/h",
+                     hovermode="closest")
+
+
+def fig_half_cell_fits(fits: List[te.HalfCellFit], P: Palette) -> go.Figure:
+    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.14,
+                        subplot_titles=("Pseudo-OCV (IR-compensated) and half-cell model fit",
+                                        "Electrode potentials at beginning of life (vs Li/Li⁺)"))
+    _style_subplot_titles(fig, P)
+    cols = sample_colorscale("Viridis", list(np.linspace(*P.ica_range, max(len(fits), 2))))
+    for f, c in zip(fits, cols):
+        fig.add_trace(go.Scatter(x=f.q, y=f.v, mode="markers", name=f"n = {f.n} data", legendgroup=f"n{f.n}",
+                                 marker=dict(color=c, size=4, opacity=0.55),
+                                 hovertemplate="%{y:.3f} V<extra>data</extra>"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=f.q, y=f.v_fit, mode="lines", name=f"n = {f.n} fit ({f.rmse_mV:.1f} mV)",
+                                 legendgroup=f"n{f.n}", line=dict(color=c, width=2.4),
+                                 hovertemplate="%{y:.3f} V<extra>fit</extra>"), row=1, col=1)
+    f0 = fits[0]
+    q = f0.q
+    y = f0.params["y0"] + q / f0.params["Cp_Ah"]
+    x = f0.params["x0"] - q / f0.params["Cn_Ah"]
+    fig.add_trace(go.Scatter(x=q, y=te.ocp_lco(y), mode="lines", name="Positive: LiCoO₂",
+                             line=dict(color=P.accent, width=2.6), hovertemplate="%{y:.3f} V<extra>LCO</extra>"),
+                  row=2, col=1)
+    fig.add_trace(go.Scatter(x=q, y=te.ocp_graphite(x), mode="lines", name="Negative: graphite",
+                             line=dict(color=P.r_ct, width=2.6), hovertemplate="%{y:.3f} V<extra>graphite</extra>"),
+                  row=2, col=1)
+    fig.update_xaxes(title_text="Discharged capacity (Ah)", row=2, col=1)
+    fig.update_yaxes(title_text="Cell voltage (V)", row=1, col=1)
+    fig.update_yaxes(title_text="Potential vs Li/Li⁺ (V)", row=2, col=1)
+    return style_fig(fig, P, 760, None, hovermode="closest")
+
+
+def fig_half_cell_modes(tab: pd.DataFrame, P: Palette) -> go.Figure:
+    fig = go.Figure()
+    for i, (col, name) in enumerate((("Capacity loss (%)", "Capacity loss"), ("LLI (%)", "Loss of lithium inventory"),
+                                     ("LAM_PE (%)", "LAM positive (LiCoO₂)"), ("LAM_NE (%)", "LAM negative (graphite)"))):
+        fig.add_trace(go.Scatter(x=tab["n"], y=tab[col], mode="lines+markers", name=name,
+                                 line=dict(color=P.mode_colors[i], width=3 if i else 2, dash=DASHES[i]),
+                                 marker=dict(symbol=SYMBOLS[i], size=9),
+                                 hovertemplate="%{y:.2f}%<extra>" + name + "</extra>"))
+    fig.add_hline(y=0, line_color=P.muted, line_width=1)
+    fig.update_xaxes(title_text="Discharge cycle n")
+    fig.update_yaxes(title_text="% of beginning-of-life value")
+    return style_fig(fig, P, 500, "Quantitative degradation modes from half-cell fitting")
+
+
+# =============================================================================
 # Cached data access & computation
 # =============================================================================
 @st.cache_resource(show_spinner=False)
@@ -1636,6 +1778,36 @@ def est_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, model:
 @st.cache_data(show_spinner=False, max_entries=8)
 def pooled_ea_cached(_ct: pd.DataFrame, key: str, min_ambient: float) -> Dict[str, Any]:
     return te.estimate_pooled_arrhenius(_ct, min_ambient_C=min_ambient)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def replay_cached(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str,
+                  soh_eol: float, level: float) -> Tuple[te.EKFResult, pd.DataFrame]:
+    r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(), None)
+    n_max = int(r.per_cycle["n"].max() * 1.6)
+    rows = []
+    for n in r.per_cycle["n"].astype(int):
+        if n < 5:
+            continue
+        f = te.twin_forecast(r, int(n), n_max, soh_eol, level)
+        rs = f.rul_samples[np.isfinite(f.rul_samples)] if f.rul_samples is not None else np.array([])
+        if len(rs):
+            rows.append({"n": int(n), "eol_med": n + float(np.median(rs)), "eol_lo": n + float(np.quantile(rs, 0.05)),
+                         "eol_hi": n + float(np.quantile(rs, 0.95)), "frac_censored": 1 - len(rs) / len(f.rul_samples)})
+    return r, pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def dp_cached(econ: Dict[str, Any], phys: Dict[str, Any], maint: Dict[str, Any], amb_mean: float, amb_amp: float,
+              n_soh: int, n_phase: int) -> te.DPResult:
+    return te.solve_replacement_dp(te.Economics(**econ), te.CellPhysics(**phys), te.MaintenanceModel(**maint),
+                                   n_soh=n_soh, n_phase=n_phase, ambient_mean_C=amb_mean, ambient_amp_C=amb_amp)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def half_cell_cached(_prep: pd.DataFrame, _ct_cell: pd.DataFrame, key: str, cell: str, n_curves: int,
+                     ir: bool) -> Tuple[pd.DataFrame, List[te.HalfCellFit]]:
+    return te.half_cell_trajectory(_prep, _ct_cell, n_curves, ir)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -2213,6 +2385,140 @@ def view_overview() -> None:
         download("Download report (HTML)", rep[1], f"battery_report_{cell}.html", "text/html", key="rep_dl")
 
 
+def view_replay() -> None:
+    section(f"Live twin replay · {cell}")
+    st.markdown("The recorded life of the battery is streamed one discharge at a time. At every step the dual "
+                "time-scale EKF assimilates only the partial-window voltage and load-step resistance of the new "
+                "cycle, updates SOH, resistances and the personal degradation rate *k*, and re-forecasts the "
+                "remaining life. Nothing after the cursor is visible to the twin.")
+    level = 0.9
+    with st.spinner("Preparing the replay (runs the twin once, then animates)…"):
+        res, track = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol), level)
+    pc = res.per_cycle
+    ns = pc["n"].astype(int).tolist()
+    if len(ns) < 6:
+        st.info("This battery has too few cycles for a replay.")
+        return
+    key_n, key_p = f"rp_n_{cell}", "rp_play"
+    st.session_state.setdefault(key_n, ns[min(5, len(ns) - 1)])
+    st.session_state.setdefault(key_p, False)
+    c = st.columns([1, 1, 1, 1, 1.4, 1.4, 1.4])
+    playing = bool(st.session_state[key_p])
+    if c[0].button("Pause" if playing else "Play", key="rp_toggle", type="primary",
+                   icon=":material/pause:" if playing else ":material/play_arrow:"):
+        st.session_state[key_p] = not playing
+        if not playing and st.session_state[key_n] >= ns[-1]:
+            st.session_state[key_n] = ns[5]
+        st.rerun()
+    if c[1].button("Step", key="rp_step", icon=":material/skip_next:"):
+        st.session_state[key_n] = min(ns[-1], st.session_state[key_n] + 1)
+    if c[2].button("Back", key="rp_back", icon=":material/skip_previous:"):
+        st.session_state[key_n] = max(ns[0], st.session_state[key_n] - 1)
+    if c[3].button("Reset", key="rp_reset", icon=":material/replay:"):
+        st.session_state[key_n] = ns[min(5, len(ns) - 1)]
+        st.session_state[key_p] = False
+    speed = c[4].select_slider("Cycles per frame", [1, 2, 3, 5, 10], value=2, key="rp_speed")
+    interval = c[5].select_slider("Frame interval (s)", [0.4, 0.7, 1.0, 1.5], value=0.7, key="rp_int")
+    reveal = c[6].toggle("Reveal future data", value=False, key="rp_reveal",
+                         help="Show the cycles the twin has not seen yet, to judge the forecast.")
+    good = ct_cell[~ct_cell["outlier"]]
+    eol_true = te.first_crossing(good["n"].to_numpy(), good["SOH"].to_numpy(), soh_eol, smooth=5)
+    n_max = int(max(pc["n"].max() * 1.35, (eol_true or 0) * 1.1))
+    frag = getattr(st, "fragment", None)
+
+    def frame() -> None:
+        if st.session_state.get(key_p):
+            nxt = st.session_state[key_n] + int(speed)
+            if nxt >= ns[-1]:
+                nxt, st.session_state[key_p] = ns[-1], False
+            st.session_state[key_n] = nxt
+        n = int(st.session_state[key_n])
+        n = min(ns, key=lambda v: abs(v - n))
+        row = pc[pc["n"] == n].iloc[0]
+        fc = te.twin_forecast(res, n, n_max, soh_eol, level) if n >= 5 else None
+        rs = fc.rul_samples[np.isfinite(fc.rul_samples)] if fc is not None and fc.rul_samples is not None else []
+        meas = good[good["n"] <= n]["SOH"].tail(1)
+        k = st.columns(6)
+        k[0].metric("Cycle", f"{n} / {ns[-1]}")
+        k[1].metric("Twin SOH", f"{row['SOH']:.3f}", delta=f"±{2 * row['SOH_std']:.3f} (2σ)", delta_color="off")
+        k[2].metric("Measured SOH", f"{float(meas.iloc[0]):.3f}" if len(meas) else "—")
+        k[3].metric("Personal k / prior", f"{row['k_ah'] / res.params.get('k_prior', row['k_ah']):.2f}×")
+        k[4].metric("Predicted RUL", f"{np.median(rs):.0f} cyc" if len(rs) else "beyond horizon",
+                    delta=(f"90%: {np.quantile(rs, 0.05):.0f}–{np.quantile(rs, 0.95):.0f}" if len(rs) else None),
+                    delta_color="off")
+        k[5].metric("NIS / dof", fmt(row.get("NIS_norm", float("nan")), ".2f"),
+                    help="Normalised innovation squared: about 1 when the filter's uncertainty is consistent.")
+        st.progress(min(1.0, (n - ns[0]) / max(ns[-1] - ns[0], 1)),
+                    text=f"{'▶ streaming' if st.session_state.get(key_p) else '⏸ paused'} · "
+                         f"{len(good[good['n'] <= n])} discharges assimilated")
+        show(fig_replay(ct_cell, pc, fc, n, soh_eol, P, reveal, n_max), key="rp_main", export=False)
+        show(fig_replay_track(track, pc, n, eol_true, P, n_max), key="rp_track", export=False)
+
+    if frag is not None:
+        try:
+            frag(run_every=f"{interval}s" if st.session_state.get(key_p) else None)(frame)()
+        except TypeError:
+            frame()
+    else:
+        frame()
+    st.caption("The EOL band narrowing and the personal rate k settling are the self-updating behaviour: the twin "
+               "starts from the population prior and converges on this battery's own ageing law as evidence "
+               "accumulates. Toggle 'Reveal future data' to judge each forecast against what actually happened.")
+
+
+@fragment
+def half_cell_section() -> None:
+    st.markdown("The ICA/DVA proxies above become quantitative here. The pseudo-OCV (discharge voltage + |I|·R_dc) is "
+                "fitted with literature half-cell potentials. Four parameters describe the electrode balance: positive "
+                "and negative capacities C_p and C_n, and their stoichiometries y₀ (LiᵧCoO₂) and x₀ (LiₓC₆) at the top of "
+                "charge. A fifth, η, absorbs the residual polarisation. Their evolution separates loss of lithium "
+                "inventory from loss of active material on each electrode.")
+    with st.expander("Model equations", icon=":material/functions:"):
+        st.latex(r"V(Q) = U_\mathrm{p}\!\left(y_0 + \tfrac{Q}{C_\mathrm{p}}\right) - "
+                 r"U_\mathrm{n}\!\left(x_0 - \tfrac{Q}{C_\mathrm{n}}\right) - \eta")
+        st.latex(r"\mathrm{LAM_{PE}} = 1 - \frac{C_\mathrm{p}}{C_\mathrm{p,0}},\quad "
+                 r"\mathrm{LAM_{NE}} = 1 - \frac{C_\mathrm{n}}{C_\mathrm{n,0}},\quad "
+                 r"\mathrm{LLI} = 1 - \frac{x_0 C_\mathrm{n} + y_0 C_\mathrm{p}}{(x_0 C_\mathrm{n} + y_0 C_\mathrm{p})_0}")
+        st.caption("U_p: LiCoO₂ (Ramadass et al., J. Electrochem. Soc. 151, 2004). U_n: graphite (Doyle et al., "
+                   "J. Electrochem. Soc. 143, 1996). Global search (differential evolution) for the first curve, then "
+                   "warm-started local fits (Dubarry et al. 2012; Birkl et al. 2017). On synthetic truth the method "
+                   "recovers LLI and LAM_PE within about 1 percentage point.")
+    c1, c2 = st.columns(2)
+    n_curves = c1.slider("Curves across life", 3, 12, 6, key="hc_n")
+    ir = c2.toggle("IR-compensate", value=True, key="hc_ir")
+    if st.button("Fit half-cell model", key="hc_go", icon=":material/science:", type="primary"):
+        with st.spinner("Fitting electrode balance (global search on the first curve)…"):
+            try:
+                st.session_state["hc"] = (cell, half_cell_cached(prepared_cell(store, DATA_KEY, cell), ct_cell, DATA_KEY,
+                                                                 cell, n_curves, ir))
+            except Exception as exc:
+                report_error("Half-cell fit failed", exc, debug)
+    saved = st.session_state.get("hc")
+    if not saved or saved[0] != cell:
+        return
+    tab, fits = saved[1]
+    if not fits:
+        st.warning("No curve could be fitted for this battery.")
+        return
+    last = tab.iloc[-1]
+    k = st.columns(4)
+    k[0].metric("Loss of lithium inventory", fmt(last["LLI (%)"], ".1f", "%"))
+    k[1].metric("LAM positive (LiCoO₂)", fmt(last["LAM_PE (%)"], ".1f", "%"))
+    k[2].metric("LAM negative (graphite)", fmt(last["LAM_NE (%)"], ".1f", "%"))
+    k[3].metric("Median fit RMSE", fmt(tab["Fit RMSE (mV)"].median(), ".1f", "mV"))
+    show(fig_half_cell_modes(tab, P), key="hc_modes", data=tab)
+    show(fig_half_cell_fits([fits[0], fits[len(fits) // 2], fits[-1]] if len(fits) > 2 else fits, P), key="hc_fits",
+         export=False)
+    show_table(tab.set_index("n").style.format("{:.3f}"))
+    dom = max(("LLI (%)", "LAM_PE (%)", "LAM_NE (%)"), key=lambda c_: last[c_])
+    card("Reading", [f"Dominant mode at n = {int(last['n'])}: {dom.split(' ')[0]}. LLI points to SEI growth or "
+                     "plating; LAM_PE to cathode cracking or cobalt dissolution; LAM_NE to graphite exfoliation or "
+                     "particle isolation.",
+                     "At ~1C the pseudo-OCV still carries kinetic and diffusion overpotentials. Residuals above "
+                     "~15 mV or η drifting strongly mean the absolute split is uncertain: compare trends between cells "
+                     "rather than trusting single values."])
+
+
 def view_data() -> None:
     k = st.columns(6)
     k[0].metric("Target cell", cell)
@@ -2262,6 +2568,9 @@ def view_data() -> None:
 
     section("Degradation modes: LLI · LAM · conductivity loss")
     modes_section()
+
+    section("Quantitative mode analysis: half-cell OCV fitting")
+    half_cell_section()
 
     section("Operating stress and safety exposure")
     stress_section()
@@ -3168,7 +3477,62 @@ def view_ops() -> None:
         manifest_button(mm["cfg"], "mismatch", DATA_KEY)
 
     integrated_section(econ, phys, plant, float(amb_mean), float(amb_amp), ops_cfg)
+    dp_section(econ, phys, plant, float(amb_mean), float(amb_amp))
     scenario_section()
+
+
+def dp_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional[te.CellPhysics], amb_mean: float,
+               amb_amp: float) -> None:
+    section("Optimal operation and replacement by dynamic programming")
+    st.markdown("The twin-aware policy above is one-step (greedy). Here the full sequential problem is solved as a "
+                "semi-Markov decision process. State: (SOH, season phase). Actions: discharge current or replace. "
+                "The objective is the true long-run profit rate, including the sudden-failure hazard, energy cost "
+                "and downtime. Dinkelbach's method finds the rate ρ* at which a new cell is exactly worth its "
+                "renewal. The DP policy is then run in closed loop, with observer noise and any plant mismatch set "
+                "above, and scored exactly like the grid study.")
+    with st.expander("Bellman equation", icon=":material/functions:"):
+        st.latex(r"W_\rho(s, j) = \max\Big\{-C_\mathrm{plan} - \rho\,t_\mathrm{plan},\;\max_I\big[r_I - \rho\,t_I "
+                 r"+ h(s)\,(-C_\mathrm{unpl} - \rho\,t_\mathrm{unpl}) + (1 - h(s))\,\mathbb{E}\,W_\rho(s - \Delta s_I, j')"
+                 r"\big]\Big\},\qquad \rho^*:\ W_{\rho^*}(1, j_0) = 0")
+    saved_om = st.session_state.get("om")
+    maint = saved_om["cfg"]["maint"] if saved_om else asdict(te.MaintenanceModel(replacement_cost=econ.replacement_cost))
+    c1, c2 = st.columns(2)
+    n_soh = c1.select_slider("SOH grid points", [50, 70, 90, 120], value=90, key="dp_ns")
+    n_ph = c2.select_slider("Season bins", [8, 12, 16, 24], value=16, key="dp_nph")
+    if st.button(f"Solve DP (≈ {4 + n_soh * n_ph // 150} s)", key="dp_go", icon=":material/account_tree:", type="primary"):
+        with st.spinner("Tabulating cycle outcomes and running value iteration…"):
+            try:
+                dp = dp_cached(asdict(econ), asdict(phys), maint, amb_mean, amb_amp, int(n_soh), int(n_ph))
+                ev, life = te.evaluate_dp_policy(dp, econ, phys, te.MaintenanceModel(**maint), plant=plant,
+                                                 ambient_mean_C=amb_mean, ambient_amp_C=amb_amp)
+                st.session_state["dp"] = {"dp": dp, "eval": ev, "life": life}
+            except Exception as exc:
+                report_error("Dynamic programming failed", exc, debug)
+    saved = st.session_state.get("dp")
+    if not saved:
+        return
+    dp, ev = saved["dp"], saved["eval"]
+    k = st.columns(5)
+    k[0].metric("Model-optimal rate ρ*", fmt(dp.rho, ".4f", "CU/h"), help="Upper bound under the DP's model.")
+    k[1].metric("Closed-loop rate", fmt(ev["rate"], ".4f", "CU/h"))
+    k[2].metric("Replaced at SOH", fmt(ev["threshold"], ".3f"))
+    k[3].metric("P(sudden failure)", fmt(100 * ev["p_failure"], ".1f", "%"))
+    k[4].metric("Violations", int(ev["violations"]))
+    show(fig_dp_policy(dp, P), key="dp_fig", data=pd.DataFrame(dp.action, index=dp.soh_grid, columns=dp.phases))
+    if saved_om:
+        opt = te.integrated_optimum(saved_om["study"])
+        b = opt.get("best")
+        if b:
+            gap = 100 * (ev["rate"] - b["rate"]) / abs(b["rate"])
+            card("DP versus the best grid policy", [
+                f"Grid optimum: {b['policy']}, replace at {b['threshold']:.2f} → {b['rate']:.4f} CU/h; "
+                f"DP closed loop {ev['rate']:.4f} CU/h ({gap:+.1f}%).",
+                f"The simple policy reaches {100 * b['rate'] / dp.rho:.0f}% of the model optimum ρ*. When the gap is "
+                "small, the one-step policy plus a replacement threshold is already near-optimal for this plant. "
+                "The DP adds a certificate of that, plus a season-dependent replacement boundary."])
+    else:
+        st.caption("Run the integrated optimisation above to compare the DP with the best grid policy.")
+
 
 
 def scenario_section() -> None:
@@ -3306,8 +3670,8 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # =============================================================================
 # Dispatch: only the active view runs
 # =============================================================================
-_VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_overview, VIEWS[1]: view_data, VIEWS[2]: view_models,
-                                           VIEWS[3]: view_ops}
+_VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_overview, VIEWS[1]: view_replay, VIEWS[2]: view_data,
+                                           VIEWS[3]: view_models, VIEWS[4]: view_ops}
 try:
     _VIEW_FN.get(view, view_data)()
 except Exception as exc:

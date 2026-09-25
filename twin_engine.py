@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "4.3.0"
+ENGINE_VERSION = "4.4.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -3478,7 +3478,8 @@ def simulate_life(policy: Callable, p: CellPhysics, e: Economics, max_cycles: in
         theta_hat = theta * np.array([1.0, 1 + sigma_r_frac * rng.standard_normal(),
                                       1 + sigma_r_frac * rng.standard_normal()])
         theta_hat[0] += sigma_soh * rng.standard_normal()
-        I_sel = policy(theta_hat, T_amb, p, e)
+        I_sel = policy(theta_hat, T_amb, p, e, cycle=k) if getattr(policy, "needs_cycle", False) \
+            else policy(theta_hat, T_amb, p, e)
         out = {key: float(v[0]) for key, v in predict_cycle(theta, [I_sel], T_amb, plant).items()}
         cold_breach = (e.cold_derate_below_C is not None and T_amb < e.cold_derate_below_C
                        and I_sel > e.cold_max_current_A)
@@ -4436,7 +4437,11 @@ def renewal_evaluation(life: pd.DataFrame, threshold: float, e: Economics, mm: M
         Profit = Revenue - EnergyCost - MaintenanceCost     (project objective)
         J_op   = Revenue - EnergyCost
         J_maint = MaintenanceCost + PerformanceLoss"""
-    d = life[life["SOH"] >= threshold]
+    return renewal_from_segment(life[life["SOH"] >= threshold], threshold, e, mm)
+
+
+def renewal_from_segment(d: pd.DataFrame, threshold: float, e: Economics, mm: MaintenanceModel) -> Dict[str, float]:
+    """Renewal economics of an explicit life segment (install -> planned replacement)."""
     if d.empty:
         return {"threshold": threshold, "cycles": 0, "rate": float("nan")}
     h = mm.hazard(d["SOH"].to_numpy())
@@ -4815,3 +4820,337 @@ def scenario_projection(sf: Dict[str, Any], scenarios: Sequence[Dict[str, float]
                          "life_to_EOL": int(eol) if eol is not None else None,
                          "rate_per_Ah": float(rates[0])})
     return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 21. OPTIMAL OPERATION + REPLACEMENT BY DYNAMIC PROGRAMMING (semi-Markov, average reward)
+# =============================================================================
+@dataclass
+class DPResult:
+    rho: float                       # optimal long-run profit rate (CU/h) of the model
+    soh_grid: np.ndarray
+    phases: np.ndarray               # season-phase bin centres (cycle index within the period)
+    T_amb: np.ndarray                # ambient temperature per phase bin
+    action: np.ndarray               # [n_soh, n_phase]: index into currents, or -1 = replace
+    currents: Tuple[float, ...]
+    value: np.ndarray                # W_rho*(s, phase)
+    rho_path: List[float]
+    period: float
+    replace_boundary: np.ndarray     # per phase: highest SOH at which replacement is optimal
+
+
+class DPPolicy:
+    """Callable operating policy from a DPResult (nearest SOH node, season phase from the cycle
+    index). ``replace_now`` tells the evaluator when the DP would replace the cell."""
+    needs_cycle = True
+
+    def __init__(self, dp: DPResult):
+        self.dp = dp
+
+    def _idx(self, soh: float, cycle: int) -> Tuple[int, int]:
+        i = int(np.clip(np.searchsorted(self.dp.soh_grid, soh), 0, len(self.dp.soh_grid) - 1))
+        if i > 0 and abs(self.dp.soh_grid[i - 1] - soh) < abs(self.dp.soh_grid[i] - soh):
+            i -= 1
+        nb = len(self.dp.phases)
+        j = int((cycle % self.dp.period) / self.dp.period * nb) % nb
+        return i, j
+
+    def replace_now(self, soh: float, cycle: int) -> bool:
+        i, j = self._idx(soh, cycle)
+        return bool(self.dp.action[i, j] < 0)
+
+    def __call__(self, theta_hat: np.ndarray, T_amb: float, p: CellPhysics, e: Economics, cycle: int = 0) -> float:
+        i, j = self._idx(float(theta_hat[0]), cycle)
+        a = int(self.dp.action[i, j])
+        if a < 0:                                   # replacement due: lowest-stress current until swapped
+            a = int(np.argmin(self.dp.currents))
+        I_sel = float(self.dp.currents[a])
+        # hard safety guard on the *measured* ambient (the DP works on season bins)
+        if e.cold_derate_below_C is not None and T_amb < e.cold_derate_below_C and I_sel > e.cold_max_current_A:
+            allowed = [c for c in self.dp.currents if c <= e.cold_max_current_A]
+            I_sel = max(allowed) if allowed else min(self.dp.currents)
+        return I_sel
+
+
+def solve_replacement_dp(e: Economics, p: CellPhysics, mm: Optional[MaintenanceModel] = None,
+                         soh_min: float = 0.55, n_soh: int = 90, n_phase: int = 16, period: float = 80.0,
+                         ambient_mean_C: float = 20.0, ambient_amp_C: float = 16.0,
+                         fast_dt_s: float = 60.0, tol: float = 1e-6, progress: ProgressFn = None,
+                         thermal_margin_K: float = 3.0, install_phase: Optional[int] = 0) -> DPResult:
+    """Joint operation + maintenance policy by dynamic programming.
+
+    State (SOH, season phase); actions: discharge at one of e.currents_A, or replace.
+    Semi-Markov average-reward problem solved with Dinkelbach's method: for a candidate
+    profit rate rho, value iteration on
+        W(s, j) = max{ -C_plan - rho t_plan,                                   (replace)
+                       max_I [ r_I - rho t_I + h(s)(-C_unpl - rho t_unpl)
+                               + (1 - h(s)) E W(s - dSOH_I, j') ] }            (operate)
+    with r = revenue - energy cost, h the sudden-failure hazard and j' the next season phase.
+    The renewal-reward theorem gives the optimum at rho* where the value of a new cell
+    (installed at ``install_phase``, or season-averaged when None) is zero; rho is updated by bisection. Infeasible actions
+    (thermal limit, cold derating) are excluded. Resistances follow the plant's fade coupling
+    at the reference temperature (path-dependent cold resistance growth is neglected)."""
+    mm = mm or MaintenanceModel(replacement_cost=e.replacement_cost)
+    pf = replace(p, dt_s=float(fast_dt_s)) if fast_dt_s else p
+    S = np.linspace(soh_min, 1.0, n_soh)
+    phases = (np.arange(n_phase) + 0.5) * period / n_phase
+    Tj = np.array([ambient_profile(float(c), ambient_mean_C, ambient_amp_C, period) for c in phases])
+    # coldest / hottest ambient inside each phase bin: safety rules must hold for every cycle in the bin
+    edges = np.linspace(0, period, n_phase + 1)
+    T_lo = np.array([min(ambient_profile(float(c), ambient_mean_C, ambient_amp_C, period)
+                         for c in np.linspace(edges[j], edges[j + 1], 9)) for j in range(n_phase)])
+    I = np.array(e.currents_A, dtype=float)
+    nI = len(I)
+    R = np.full((n_soh, n_phase, nI), np.nan)          # reward (revenue - energy)
+    Tm = np.full((n_soh, n_phase, nI), np.nan)         # hours
+    D = np.full((n_soh, n_phase, nI), np.nan)          # SOH drop
+    for i, soh in enumerate(S):
+        _report(progress, 0.8 * i / n_soh, "tabulating cycle outcomes")
+        theta = np.array([soh, p.R_int0 * (1 + p.beta_int * (1 - soh)), p.R_ct0 * (1 + p.beta_ct * (1 - soh))])
+        for j, T in enumerate(Tj):
+            out = predict_cycle(theta, I, float(T), pf)
+            ok = out["T_peak"] <= e.T_max_C - thermal_margin_K        # margin for estimation / model error
+            if e.cold_derate_below_C is not None and T_lo[j] < e.cold_derate_below_C:
+                ok &= I <= e.cold_max_current_A
+            ok &= out["ah"] > 0.05
+            R[i, j] = np.where(ok, np.array(e.price_per_Ah, dtype=float) * out["ah"] - e.energy_price_per_Wh * out["e_in"], np.nan)
+            Tm[i, j] = np.where(ok, out["hours"], np.nan)
+            D[i, j] = np.where(ok, np.maximum(out["dsoh"], 1e-7), np.nan)
+    h = mm.hazard(S)[:, None, None]
+    step = n_phase / period                            # phase bins advanced per cycle
+    C_p, t_p = mm.replacement_cost, mm.planned_downtime_h
+    C_u, t_u = mm.unplanned_factor * mm.replacement_cost, mm.unplanned_downtime_h
+
+    def solve(rho: float) -> Tuple[np.ndarray, np.ndarray]:
+        W = np.zeros((n_soh, n_phase))
+        rep = -C_p - rho * t_p
+        for _ in range(4000):
+            Wn = np.empty_like(W)
+            # expected continuation over the stochastic phase advance (fractional bins)
+            W_next_phase = (1 - step) * W + step * np.roll(W, -1, axis=1)
+            q = np.full((n_soh, n_phase, nI), -np.inf)
+            for a in range(nI):
+                s_next = S[:, None] - D[:, :, a]
+                below = s_next < soh_min
+                cont = np.empty((n_soh, n_phase))
+                for j in range(n_phase):
+                    cont[:, j] = np.interp(np.clip(s_next[:, j], soh_min, 1.0), S, W_next_phase[:, j])
+                cont = np.where(below, rep, cont)             # below the floor: forced planned swap
+                val = R[:, :, a] - rho * Tm[:, :, a] + h[:, :, 0] * (-C_u - rho * t_u) + (1 - h[:, :, 0]) * cont
+                q[:, :, a] = np.where(np.isnan(val), -np.inf, val)
+            best = q.max(axis=2)
+            Wn = np.maximum(best, rep)
+            if np.max(np.abs(Wn - W)) < tol:
+                W = Wn
+                break
+            W = Wn
+        act = np.where(q.max(axis=2) >= rep, q.argmax(axis=2), -1)
+        return W, act
+
+    lo, hi = -1.0, 2.0
+    rho_path: List[float] = []
+    for it in range(40):
+        rho = 0.5 * (lo + hi)
+        W, act = solve(rho)
+        # value of a new cell: at a given install phase (0 = the simulation's start) or season-averaged
+        g = float(W[-1, install_phase]) if install_phase is not None else float(W[-1].mean())
+        rho_path.append(rho)
+        _report(progress, 0.8 + 0.2 * it / 40, f"Dinkelbach rho = {rho:.4f}")
+        if g > 0:
+            lo = rho
+        else:
+            hi = rho
+        if hi - lo < 1e-5:
+            break
+    rho = 0.5 * (lo + hi)
+    W, act = solve(rho)
+    boundary = np.array([S[act[:, j] < 0].max() if (act[:, j] < 0).any() else np.nan for j in range(n_phase)])
+    _report(progress, 1.0, "DP solved")
+    return DPResult(rho, S, phases, Tj, act, tuple(float(x) for x in I), W, rho_path, period, boundary)
+
+
+def evaluate_dp_policy(dp: DPResult, e: Economics, p: CellPhysics, mm: Optional[MaintenanceModel] = None,
+                       plant: Optional[CellPhysics] = None, seed: int = 0, fast_dt_s: float = 60.0,
+                       ambient_mean_C: float = 20.0, ambient_amp_C: float = 16.0) -> Tuple[Dict[str, float], pd.DataFrame]:
+    """Closed-loop simulation of the DP policy (observer noise, optional plant mismatch) until
+    the DP calls for replacement, scored with the same renewal economics as the grid study."""
+    mm = mm or MaintenanceModel(replacement_cost=e.replacement_cost)
+    pol = DPPolicy(dp)
+    pf = replace(p, dt_s=float(fast_dt_s))
+    plf = replace(plant, dt_s=float(fast_dt_s)) if plant is not None else None
+    life = simulate_life(pol, pf, replace(e, soh_eol=float(dp.soh_grid[0])), seed=seed,
+                         ambient_mean_C=ambient_mean_C, ambient_amp_C=ambient_amp_C, plant=plf)
+    stop = len(life)
+    for k, r in life.iterrows():
+        if pol.replace_now(float(r["SOH_hat"]), int(r["cycle"])):
+            stop = int(k)
+            break
+    seg = life.iloc[:stop]
+    out = renewal_from_segment(seg, float(seg["SOH"].iloc[-1]) if len(seg) else float("nan"), e, mm)
+    out.update({"policy": "DP optimal (operation + replacement)", "kind": "dp", "w": float("nan")})
+    return out, life.iloc[: max(stop, 1)]
+
+
+# =============================================================================
+# 22. HALF-CELL OCV FITTING: QUANTITATIVE LLI / LAM_PE / LAM_NE
+# =============================================================================
+def ocp_lco(y: np.ndarray) -> np.ndarray:
+    """LiCoO2 open-circuit potential vs Li/Li+ (Ramadass et al., J. Electrochem. Soc. 151 (2004)
+    A196), y = lithium fraction in Li_y CoO2, valid ~0.4 < y < 1."""
+    y = np.clip(np.asarray(y, dtype=float), 0.35, 0.995)
+    y2 = y * y
+    num = -4.656 + 88.669 * y2 - 401.119 * y2 ** 2 + 342.909 * y2 ** 3 - 462.471 * y2 ** 4 + 433.434 * y2 ** 5
+    den = -1.0 + 18.933 * y2 - 79.532 * y2 ** 2 + 37.311 * y2 ** 3 - 73.083 * y2 ** 4 + 95.96 * y2 ** 5
+    return num / den
+
+
+def ocp_graphite(x: np.ndarray) -> np.ndarray:
+    """Graphite (MCMB) open-circuit potential vs Li/Li+ (Doyle et al., J. Electrochem. Soc. 143
+    (1996) 1890; used by Ramadass 2004), x = lithium fraction in Li_x C6."""
+    x = np.clip(np.asarray(x, dtype=float), 0.005, 1.0)
+    return (0.7222 + 0.1387 * x + 0.029 * np.sqrt(x) - 0.0172 / x + 0.0019 / x ** 1.5
+            + 0.2808 * np.exp(0.9 - 15.0 * x) - 0.7984 * np.exp(0.4465 * x - 0.4108))
+
+
+HALF_CELL_KEYS = ("Cp_Ah", "Cn_Ah", "y0", "x0", "eta_V")
+
+
+def full_cell_ocv(q: np.ndarray, Cp: float, Cn: float, y0: float, x0: float, eta: float = 0.0) -> np.ndarray:
+    """Discharge from the top-of-charge state: positive lithiates y = y0 + Q/Cp, negative
+    delithiates x = x0 - Q/Cn;  V = U_p(y) - U_n(x) - eta (eta: residual polarisation)."""
+    return ocp_lco(y0 + q / Cp) - ocp_graphite(x0 - q / Cn) - eta
+
+
+@dataclass
+class HalfCellFit:
+    n: int
+    params: Dict[str, float]
+    rmse_mV: float
+    q: np.ndarray
+    v: np.ndarray
+    v_fit: np.ndarray
+    capacity_Ah: float
+
+    @property
+    def li_inventory_Ah(self) -> float:
+        """Cyclable lithium at top of charge: x0 Cn + y0 Cp (Ah)."""
+        return self.params["x0"] * self.params["Cn_Ah"] + self.params["y0"] * self.params["Cp_Ah"]
+
+
+def pseudo_ocv(cell_df: pd.DataFrame, cycle_index: int, r_dc: Optional[float], n_pts: int = 120
+               ) -> Tuple[np.ndarray, np.ndarray]:
+    """IR-compensated discharge curve V + |I| R_dc on a uniform capacity grid (pseudo-OCV)."""
+    d = cell_df[(cell_df["Cycle_Index"] == cycle_index) & (cell_df["Current_A"] < -0.1)]
+    if len(d) < 20:
+        return np.array([]), np.array([])
+    i = np.abs(d["Current_A"].to_numpy())
+    q = np.cumsum(i * d["dt"].to_numpy()) / 3600.0
+    v = d["Voltage_V"].to_numpy() + (i * r_dc if r_dc and np.isfinite(r_dc) else 0.0)
+    grid = np.linspace(q[0], q[-1], n_pts)
+    return grid, np.interp(grid, q, v)
+
+
+def fit_half_cell(q: np.ndarray, v: np.ndarray, x0_guess: Optional[np.ndarray] = None, n: int = 0,
+                  capacity_Ah: Optional[float] = None, fixed: Optional[Dict[str, float]] = None,
+                  dv_weight: float = 0.0, global_search: bool = True) -> HalfCellFit:
+    """Least-squares fit of (Cp, Cn, y0, x0, eta) to a pseudo-OCV curve with multi-start.
+    ``fixed`` pins parameters (e.g. electrode capacities from the beginning-of-life fit)."""
+    from scipy.optimize import least_squares
+
+    fixed = dict(fixed or {})
+    free = [k for k in HALF_CELL_KEYS if k not in fixed]
+    lo = {"Cp_Ah": 1.0, "Cn_Ah": 1.0, "y0": 0.35, "x0": 0.45, "eta_V": -0.05}
+    hi = {"Cp_Ah": 5.0, "Cn_Ah": 5.0, "y0": 0.70, "x0": 0.98, "eta_V": 0.30}
+    qmax = float(q[-1])
+
+    def unpack(z):
+        prm = dict(fixed)
+        prm.update(dict(zip(free, z)))
+        return prm
+
+    # differential-voltage target: electrode phase transitions (graphite staging) live in dV/dQ,
+    # which is what makes the negative electrode identifiable (Bloom 2005; Dubarry 2012)
+    from scipy.signal import savgol_filter
+    win = min(len(q) - (1 - len(q) % 2), 15)
+    dvdq = savgol_filter(np.gradient(v, q), win, 2) if win >= 5 else np.gradient(v, q)
+    inner = (q > 0.05 * qmax) & (q < 0.92 * qmax)          # avoid the steep ends of the curve
+    w_dv = dv_weight * float(np.std(v)) / max(float(np.std(dvdq[inner])), 1e-9)
+
+    def resid(z):
+        prm = unpack(z)
+        vf = full_cell_ocv(q, prm["Cp_Ah"], prm["Cn_Ah"], prm["y0"], prm["x0"], prm["eta_V"])
+        r = vf - v
+        rd = w_dv * (np.gradient(vf, q) - dvdq)[inner]
+        # stoichiometry must stay physical over the discharged window
+        pen_y = max(0.0, prm["y0"] + qmax / prm["Cp_Ah"] - 0.995)
+        pen_x = max(0.0, 0.01 - (prm["x0"] - qmax / prm["Cn_Ah"]))
+        return np.concatenate([r, rd / math.sqrt(max(inner.sum(), 1) / len(q)), 10.0 * np.array([pen_y, pen_x])])
+
+    starts = [x0_guess] if x0_guess is not None else []
+    if global_search:
+        from scipy.optimize import differential_evolution
+        de = differential_evolution(lambda z: float(np.sum(resid(z) ** 2)), [(lo[k], hi[k]) for k in free],
+                                    seed=0, maxiter=60, popsize=12, tol=1e-7, polish=False)
+        starts.insert(0, de.x)
+    for cp, cn, y0, x0 in ((2.6, 2.4, 0.45, 0.85), (3.0, 2.8, 0.50, 0.80), (2.3, 2.2, 0.42, 0.90),
+                           (3.5, 3.0, 0.55, 0.75)):
+        base = {"Cp_Ah": cp, "Cn_Ah": cn, "y0": y0, "x0": x0, "eta_V": 0.05}
+        starts.append(np.array([base[k] for k in free]))
+    best = None
+    for z0 in starts:
+        z0 = np.clip(np.asarray(z0, dtype=float), [lo[k] + 1e-6 for k in free], [hi[k] - 1e-6 for k in free])
+        try:
+            sol = least_squares(resid, z0, bounds=([lo[k] for k in free], [hi[k] for k in free]), max_nfev=400)
+        except Exception:
+            continue
+        if best is None or sol.cost < best.cost:
+            best = sol
+    if best is None:
+        raise ValueError("half-cell fit failed")
+    prm = unpack(best.x)
+    vf = full_cell_ocv(q, prm["Cp_Ah"], prm["Cn_Ah"], prm["y0"], prm["x0"], prm["eta_V"])
+    return HalfCellFit(n, prm, float(1e3 * np.sqrt(np.mean((vf - v) ** 2))), q, v, vf,
+                       float(capacity_Ah if capacity_Ah is not None else qmax))
+
+
+def half_cell_trajectory(cell_df: pd.DataFrame, ct_cell: pd.DataFrame, n_curves: int = 8,
+                         ir_compensate: bool = True) -> Tuple[pd.DataFrame, List[HalfCellFit]]:
+    """Degradation-mode analysis by half-cell OCV fitting (Dubarry et al. 2012; Birkl et al. 2017):
+    the beginning-of-life curve fixes the electrode balance; every later curve is refitted
+    starting from the previous solution. Modes relative to the first fit:
+        LAM_PE = 1 - Cp/Cp0,  LAM_NE = 1 - Cn/Cn0,
+        LLI    = 1 - (x0 Cn + y0 Cp) / (x0 Cn + y0 Cp)_0     (cyclable lithium lost)
+    Caveat: NASA discharges run near 1C; the IR-compensated curve is a pseudo-OCV and the
+    residual polarisation is absorbed by eta. Treat absolute values as estimates."""
+    good = ct_cell[~ct_cell["outlier"]].sort_values("n").reset_index(drop=True)
+    if len(good) < 3:
+        return pd.DataFrame(), []
+    idx = np.unique(np.linspace(0, len(good) - 1, min(n_curves, len(good))).astype(int))
+    fits: List[HalfCellFit] = []
+    prev = None
+    for i in idx:
+        r = good.loc[i]
+        rdc = float(r["R_dc_ohm"]) if ir_compensate and np.isfinite(r.get("R_dc_ohm", np.nan)) else None
+        q, v = pseudo_ocv(cell_df, int(r["Cycle_Index"]), rdc)
+        if len(q) < 20:
+            continue
+        try:
+            f = fit_half_cell(q, v, prev, int(r["n"]), float(r["Capacity_Ah"]), global_search=prev is None)
+            if prev is not None and f.rmse_mV > 2 * fits[0].rmse_mV + 5:      # lost track: global restart
+                f = fit_half_cell(q, v, prev, int(r["n"]), float(r["Capacity_Ah"]), global_search=True)
+        except ValueError:
+            continue
+        fits.append(f)
+        prev = np.array([f.params[k] for k in HALF_CELL_KEYS])
+    if not fits:
+        return pd.DataFrame(), []
+    f0 = fits[0]
+    rows = []
+    for f in fits:
+        rows.append({"n": f.n, "Capacity loss (%)": 100 * (1 - f.capacity_Ah / f0.capacity_Ah),
+                     "LLI (%)": 100 * (1 - f.li_inventory_Ah / f0.li_inventory_Ah),
+                     "LAM_PE (%)": 100 * (1 - f.params["Cp_Ah"] / f0.params["Cp_Ah"]),
+                     "LAM_NE (%)": 100 * (1 - f.params["Cn_Ah"] / f0.params["Cn_Ah"]),
+                     "Cp (Ah)": f.params["Cp_Ah"], "Cn (Ah)": f.params["Cn_Ah"], "y0": f.params["y0"],
+                     "x0": f.params["x0"], "η (mV)": 1e3 * f.params["eta_V"], "Fit RMSE (mV)": f.rmse_mV})
+    return pd.DataFrame(rows), fits

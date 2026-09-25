@@ -528,6 +528,45 @@ def test_fleet_status_events_and_scenarios():
     assert (sp["lo"] <= sp["hi"] + 1e-12).all()
 
 
+def test_half_cell_fit_recovers_degradation_modes():
+    rng = np.random.default_rng(0)
+    Cp, Cn, y0, x0 = 3.5, 2.7, 0.45, 0.85
+    q = np.linspace(0, 1.9, 150)
+    f0 = te.fit_half_cell(q, te.full_cell_ocv(q, Cp, Cn, y0, x0, 0.04) + 0.002 * rng.standard_normal(len(q)))
+    assert f0.rmse_mV < 3 and abs(f0.params["Cp_Ah"] - Cp) < 0.1 and abs(f0.params["x0"] - x0) < 0.02
+    N0 = x0 * Cn + y0 * Cp
+    Cp2, Cn2 = Cp * 0.94, Cn * 0.97                      # truth: LAM_PE 6 %, LAM_NE 3 %, LLI 8 %
+    x02 = (N0 * 0.92 - y0 * Cp2) / Cn2
+    q2 = np.linspace(0, 1.65, 150)
+    f1 = te.fit_half_cell(q2, te.full_cell_ocv(q2, Cp2, Cn2, y0, x02, 0.05) + 0.002 * rng.standard_normal(len(q2)),
+                          np.array([f0.params[k] for k in te.HALF_CELL_KEYS]), global_search=False)
+    lli = 100 * (1 - f1.li_inventory_Ah / f0.li_inventory_Ah)
+    lam_pe = 100 * (1 - f1.params["Cp_Ah"] / f0.params["Cp_Ah"])
+    assert abs(lli - 8) < 2.5 and abs(lam_pe - 6) < 2.5
+    # electrode potentials are physical
+    assert 3.8 < float(te.ocp_lco(0.9)) < 4.4 and 0.0 < float(te.ocp_graphite(0.5)) < 0.3
+
+
+def test_half_cell_trajectory_on_cycle_data():
+    store, ct, _, _ = synthetic()
+    tab, fits = te.half_cell_trajectory(te.prepare_cell(store.cell_frame("S004")), ct[ct["Cell_ID"] == "S004"], 4)
+    assert len(fits) >= 3 and {"LLI (%)", "LAM_PE (%)", "LAM_NE (%)", "Fit RMSE (mV)"} <= set(tab.columns)
+    assert tab["LLI (%)"].iloc[0] == 0 and np.isfinite(tab["Fit RMSE (mV)"]).all()
+
+
+def test_replacement_dp_is_safe_and_competitive():
+    e, p = te.Economics(), te.CellPhysics()
+    dp = te.solve_replacement_dp(e, p, n_soh=50, n_phase=8)
+    assert dp.action.shape == (50, 8) and (dp.action < 0).any() and (dp.action >= 0).any()
+    assert np.isfinite(dp.rho) and dp.rho > 0
+    assert np.all(np.nan_to_num(dp.replace_boundary, nan=1.0) < 0.95)            # never replace a new cell
+    res, life = te.evaluate_dp_policy(dp, e, p)
+    assert res["violations"] == 0 and np.isfinite(res["rate"]) and res["rate"] > 0
+    # DPPolicy honours the measured-ambient cold guard
+    pol = te.DPPolicy(dp)
+    assert pol(np.array([0.95, p.R_int0, p.R_ct0]), -5.0, p, e, cycle=0) <= e.cold_max_current_A
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -1,4 +1,4 @@
-# Battery digital twin & operando diagnostics (v4.3)
+# Battery digital twin & operando diagnostics (v4.4)
 
 ```bash
 pip install -r requirements.txt
@@ -10,7 +10,7 @@ docker build -t battery-twin . && docker run -p 8501:8501 -v twin-data:/data bat
 ```
 
 Files: `twin_engine.py` (all computation, no UI), `app.py` (Streamlit views), `benchmark.py`
-(offline sweep → results file the app can load), `tests/` (43 tests incl. gradient checks and
+(offline sweep → results file the app can load), `tests/` (46 tests incl. gradient checks and
 synthetic-truth recovery). Set `TWIN_CACHE_DIR` to persist downloads and uploads; `GIT_COMMIT`
 is recorded in run manifests.
 
@@ -21,6 +21,18 @@ gauges) for the selected battery, a fleet health treemap, a risk matrix (remaini
 speed), a triage table with risk levels and alerts, a filterable event log (knees, EOL crossings,
 over-temperature, cold charging, regeneration, excluded cycles) and a one-click HTML report.
 The Operations view adds a what-if scenario planner driven by the cohort stress-factor law.
+
+## New in v4.4
+
+- **Live twin replay** (second view): streams a battery's life one discharge at a time with play / pause /
+  step; the dual EKF assimilates each cycle, and the forecast band, predicted end of life and personal
+  degradation rate k update live (`replay` uses `run_dual_twin` + `twin_forecast`).
+- **Optimal operation + replacement by dynamic programming** (Operations): semi-Markov DP over
+  (SOH, season phase) with Dinkelbach's method on the renewal-reward rate, sudden-failure hazard, energy cost
+  and downtime (`solve_replacement_dp`, `DPPolicy`, `evaluate_dp_policy`).
+- **Half-cell OCV fitting** (Data): LiCoO₂ (Ramadass 2004) and graphite (Doyle 1996) potentials fitted to the
+  IR-compensated discharge curve for quantitative LLI, LAM_PE and LAM_NE (`fit_half_cell`,
+  `half_cell_trajectory`).
 
 ## What answers which project question
 
