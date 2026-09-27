@@ -58,9 +58,8 @@ DATA_DIR = APP_DIR / "data"
 RESULTS_DIR = APP_DIR / "results"
 MASTER_NAME, IMP_NAME = "battery_master_data.parquet", "impedance_ground_truth.parquet"
 POLICIES = ["Twin-Aware", "Fixed 1 A", "Fixed 2 A", "Fixed 4 A"]
-VIEWS = [":material/dashboard: Operations centre", ":material/play_circle: Live twin",
-         ":material/monitoring: Data & diagnostics", ":material/psychology: Models & forecasting",
-         ":material/tune: Operations & control"]
+VIEWS = [":material/monitoring: Diagnostics", ":material/play_circle: Live twin",
+         ":material/psychology: Models & forecasting", ":material/tune: Operations & control"]
 SANS = "Inter, 'Source Sans Pro', 'Helvetica Neue', Arial, sans-serif"
 SERIF = "'STIX Two Text', 'Times New Roman', Times, serif"
 
@@ -656,7 +655,7 @@ def fig_fade(ct_all: pd.DataFrame, cell_id: str, y: str, eol_line: Optional[floa
     return style_fig(fig, P, 470, f"Capacity fade trajectory, {cell_id} against cohort")
 
 
-def fig_cohort_grid(ct_all: pd.DataFrame, meta: pd.DataFrame, cell_id: str, P: Palette,
+def fig_cohort_grid(ct_all: pd.DataFrame, meta: pd.DataFrame, cell_id: Any, P: Palette,
                     normalise_x: bool = False) -> go.Figure:
     """One full-width panel per ambient temperature, stacked; every battery has its own colour and
     marker (the same as in every other chart) and its own legend entry."""
@@ -674,10 +673,10 @@ def fig_cohort_grid(ct_all: pd.DataFrame, meta: pd.DataFrame, cell_id: str, P: P
             if d.empty:
                 continue
             col, sym = cell_style(cid, cells)
-            is_t = cid == cell_id
+            is_t = cid in cell_id if isinstance(cell_id, (list, tuple, set)) else cid == cell_id
             x = d["n"] / d["n"].max() if normalise_x else d["n"]
             fig.add_trace(go.Scatter(
-                x=x, y=d["SOH"], mode="lines+markers", name=cell_label(cid, meta) + ("  ★ target" if is_t else ""),
+                x=x, y=d["SOH"], mode="lines+markers", name=cell_label(cid, meta) + ("  ★ selected" if is_t else ""),
                 legendgroup=cid, line=dict(color=col, width=3.4 if is_t else 1.8),
                 marker=dict(symbol=sym, size=7 if is_t else 5, maxdisplayed=14, line=dict(color=P.plot_bg, width=0.5)),
                 hovertemplate=f"<b>{cid}</b> n=%{{x}}: SOH %{{y:.3f}}<extra></extra>"), row=gi + 1, col=1)
@@ -1500,13 +1499,23 @@ def fig_fleet_map(fs: pd.DataFrame, P: Palette) -> go.Figure:
     return fig
 
 
-def fig_risk_matrix(fs: pd.DataFrame, P: Palette, cell_id: str) -> go.Figure:
-    """Risk matrix: remaining life (x) against degradation speed (y)."""
-    d = fs.reset_index()
-    cap = float(np.nanmax(d["Quick RUL"].replace(np.inf, np.nan))) if np.isfinite(d["Quick RUL"].replace(np.inf, np.nan)).any() else 300
+def fig_risk_matrix(fs: pd.DataFrame, P: Palette, cell_id: str, highlight: Optional[Sequence[str]] = None) -> go.Figure:
+    """Risk matrix: remaining life (x) against degradation speed (y). With ``highlight`` the selected
+    batteries are drawn in colour and the rest of the fleet as grey context."""
+    d_all = fs.reset_index()
+    d = d_all[d_all["Cell_ID"].isin(highlight)] if highlight else d_all
+    finite = d_all["Quick RUL"].replace(np.inf, np.nan)
+    cap = float(np.nanmax(finite)) if np.isfinite(finite).any() else 300
     cap = max(cap * 1.2, 50)
     x = d["Quick RUL"].replace(np.inf, cap).clip(lower=1)
     fig = go.Figure()
+    if highlight:
+        ctx = d_all[~d_all["Cell_ID"].isin(highlight)]
+        if len(ctx):
+            fig.add_trace(go.Scatter(
+                x=ctx["Quick RUL"].replace(np.inf, cap).clip(lower=1), y=ctx["Fade per 100 cycles (%)"],
+                mode="markers", name="Rest of fleet", marker=dict(size=8, color=P.cohort, opacity=0.55),
+                text=ctx["Cell_ID"], hovertemplate="%{text}<extra>fleet</extra>"))
     fig.add_vrect(x0=1, x1=15, fillcolor=rgba("#D55E00", 0.10), line_width=0)
     fig.add_vrect(x0=15, x1=50, fillcolor=rgba("#E69F00", 0.08), line_width=0)
     for risk in te.RISK_LEVELS:
@@ -1516,7 +1525,7 @@ def fig_risk_matrix(fs: pd.DataFrame, P: Palette, cell_id: str) -> go.Figure:
         fig.add_trace(go.Scatter(
             x=x[m], y=d.loc[m, "Fade per 100 cycles (%)"], mode="markers+text", name=f"{RISK_ICON[risk]} {risk}",
             text=d.loc[m, "Cell_ID"], textposition="top center", textfont=dict(size=11, color=P.text),
-            marker=dict(size=10 + 16 * np.sqrt(d.loc[m, "Cycles"] / d["Cycles"].max()), color=RISK_COLORS[risk],
+            marker=dict(size=10 + 16 * np.sqrt(d.loc[m, "Cycles"] / d_all["Cycles"].max()), color=RISK_COLORS[risk],
                         opacity=0.85, line=dict(width=[3 if c == cell_id else 1 for c in d.loc[m, "Cell_ID"]],
                                                 color=P.text)),
             customdata=np.column_stack([d.loc[m, "SOH"], d.loc[m, "Alerts"]]),
@@ -2020,19 +2029,100 @@ inject_css(P)
 # =============================================================================
 # Hero
 # =============================================================================
+HERO_CSS = """<style>
+.bt-hero {display: flex; align-items: center; gap: 28px; padding: 22px 30px 20px 30px;}
+.bt-hero-text {position: relative; flex: 1 1 auto; min-width: 0;}
+.bt-hero .bt-title {font-size: 1.85rem;}
+.bt-hero .bt-sub {max-width: 60ch; font-size: 1.02rem;}
+.bt-art {position: relative; flex: 0 0 460px; width: 460px; height: 210px;}
+.bt-art svg {position: absolute; inset: 0; overflow: visible;}
+.bt-pkt {position: absolute; left: 0; top: 0; width: 9px; height: 9px; border-radius: 50%;
+  offset-anchor: 50% 50%; offset-rotate: 0deg; animation: bt-move 2.8s linear infinite; opacity: 0;}
+.bt-pkt-up {offset-path: path('M 118 72 C 190 14, 270 14, 342 72'); background: #7FE3FF;
+  box-shadow: 0 0 10px 2px rgba(127,227,255,0.9);}
+.bt-pkt-down {offset-path: path('M 342 150 C 270 208, 190 208, 118 150'); background: #FFD166;
+  box-shadow: 0 0 10px 2px rgba(255,209,102,0.9);}
+@keyframes bt-move {0% {offset-distance: 0%; opacity: 0;} 12% {opacity: 1;} 88% {opacity: 1;}
+  100% {offset-distance: 100%; opacity: 0;}}
+.bt-level {transform-box: fill-box; transform-origin: 50% 100%; animation: bt-charge 7s ease-in-out infinite;}
+@keyframes bt-charge {0%, 100% {transform: scaleY(1);} 50% {transform: scaleY(0.3);}}
+.bt-draw {stroke-dasharray: 240; stroke-dashoffset: 240; animation: bt-draw 7s ease-in-out infinite;}
+@keyframes bt-draw {0% {stroke-dashoffset: 240;} 55%, 90% {stroke-dashoffset: 0;} 100% {stroke-dashoffset: 0; opacity: 0;}}
+.bt-ring {transform-box: fill-box; transform-origin: center; animation: bt-ring 2.2s ease-out infinite;}
+@keyframes bt-ring {0% {transform: scale(1); opacity: 0.9;} 100% {transform: scale(2.0); opacity: 0;}}
+.bt-scan {animation: bt-scan 3.5s ease-in-out infinite;}
+@keyframes bt-scan {0%, 100% {transform: translateY(0); opacity: 0.0;} 10% {opacity: 0.8;} 50% {transform: translateY(118px); opacity: 0.8;} 60% {opacity: 0;}}
+.bt-glow {animation: bt-glow 3s ease-in-out infinite;}
+@keyframes bt-glow {0%, 100% {opacity: 0.35;} 50% {opacity: 0.9;}}
+@media (max-width: 1150px) {.bt-art {display: none;}}
+@media (prefers-reduced-motion: reduce) {.bt-pkt, .bt-level, .bt-draw, .bt-ring, .bt-scan, .bt-glow {animation: none;}
+  .bt-pkt {opacity: 0;} .bt-draw {stroke-dashoffset: 0;}}
+</style>"""
+
+HERO_ART = """<div class="bt-art" aria-hidden="true">
+<svg width="460" height="210" viewBox="0 0 460 210" xmlns="http://www.w3.org/2000/svg">
+ <defs>
+  <linearGradient id="btMetal" x1="0" x2="1" y1="0" y2="0">
+   <stop offset="0" stop-color="#8FA6BE"/><stop offset="0.45" stop-color="#EEF5FB"/><stop offset="1" stop-color="#6F869F"/>
+  </linearGradient>
+  <linearGradient id="btCharge" x1="0" x2="0" y1="0" y2="1">
+   <stop offset="0" stop-color="#9BF6C9"/><stop offset="1" stop-color="#1FB57A"/>
+  </linearGradient>
+ </defs>
+ <!-- data links -->
+ <path d="M 118 72 C 190 14, 270 14, 342 72" fill="none" stroke="rgba(127,227,255,0.55)" stroke-width="1.6" stroke-dasharray="4 5"/>
+ <path d="M 342 150 C 270 208, 190 208, 118 150" fill="none" stroke="rgba(255,209,102,0.55)" stroke-width="1.6" stroke-dasharray="4 5"/>
+ <text x="230" y="22" text-anchor="middle" font-size="10.5" letter-spacing="1.5" fill="rgba(255,255,255,0.92)" font-weight="700">V · I · T TELEMETRY</text>
+ <text x="230" y="206" text-anchor="middle" font-size="10.5" letter-spacing="1.5" fill="rgba(255,255,255,0.92)" font-weight="700">SOH · RUL · CONTROL</text>
+ <!-- update engine -->
+ <circle class="bt-ring" cx="230" cy="111" r="24" fill="none" stroke="#7FE3FF" stroke-width="2"/>
+ <circle cx="230" cy="111" r="24" fill="rgba(14,23,38,0.55)" stroke="rgba(255,255,255,0.75)" stroke-width="1.4"/>
+ <text x="230" y="108" text-anchor="middle" font-size="11" font-weight="800" fill="#FFFFFF">EKF</text>
+ <text x="230" y="121" text-anchor="middle" font-size="8" fill="rgba(255,255,255,0.8)">update</text>
+ <line x1="206" y1="111" x2="150" y2="111" stroke="rgba(255,255,255,0.25)" stroke-width="1"/>
+ <line x1="254" y1="111" x2="316" y2="111" stroke="rgba(255,255,255,0.25)" stroke-width="1"/>
+ <!-- physical 18650 cell -->
+ <ellipse class="bt-glow" cx="70" cy="112" rx="58" ry="82" fill="rgba(255,209,102,0.10)"/>
+ <rect x="58" y="30" width="24" height="12" rx="3" fill="#DDE7F1" stroke="rgba(255,255,255,0.8)"/>
+ <rect x="30" y="40" width="80" height="145" rx="14" fill="url(#btMetal)" stroke="rgba(255,255,255,0.85)" stroke-width="1.5"/>
+ <rect x="42" y="56" width="56" height="113" rx="7" fill="rgba(11,61,145,0.45)"/>
+ <rect class="bt-level" x="42" y="56" width="56" height="113" rx="7" fill="url(#btCharge)"/>
+ <text x="70" y="118" text-anchor="middle" font-size="15" font-weight="900" fill="rgba(11,40,80,0.75)">+</text>
+ <text x="70" y="200" text-anchor="middle" font-size="9.5" letter-spacing="1.4" font-weight="800" fill="#FFFFFF">PHYSICAL CELL</text>
+ <!-- digital twin -->
+ <rect x="362" y="30" width="24" height="12" rx="3" fill="none" stroke="#7FE3FF" stroke-width="1.4" stroke-dasharray="3 3"/>
+ <rect x="350" y="40" width="80" height="145" rx="14" fill="rgba(127,227,255,0.10)" stroke="#7FE3FF" stroke-width="1.6" stroke-dasharray="6 4"/>
+ <g stroke="rgba(127,227,255,0.22)" stroke-width="1">
+  <line x1="360" y1="70" x2="420" y2="70"/><line x1="360" y1="100" x2="420" y2="100"/>
+  <line x1="360" y1="130" x2="420" y2="130"/><line x1="360" y1="160" x2="420" y2="160"/>
+  <line x1="375" y1="55" x2="375" y2="172"/><line x1="395" y1="55" x2="395" y2="172"/><line x1="415" y1="55" x2="415" y2="172"/>
+ </g>
+ <polyline class="bt-draw" points="360,64 372,67 384,72 396,80 405,90 412,104 417,122 421,146" fill="none" stroke="#FFFFFF" stroke-width="2.4" stroke-linecap="round"/>
+ <line x1="360" y1="140" x2="422" y2="140" stroke="#FF8A4C" stroke-width="1.4" stroke-dasharray="3 3"/>
+ <rect class="bt-scan" x="352" y="50" width="76" height="3" rx="1.5" fill="rgba(127,227,255,0.9)"/>
+ <text x="390" y="200" text-anchor="middle" font-size="9.5" letter-spacing="1.4" font-weight="800" fill="#FFFFFF">DIGITAL TWIN</text>
+</svg>
+<span class="bt-pkt bt-pkt-up" style="animation-delay:0s"></span>
+<span class="bt-pkt bt-pkt-up" style="animation-delay:0.7s"></span>
+<span class="bt-pkt bt-pkt-up" style="animation-delay:1.4s"></span>
+<span class="bt-pkt bt-pkt-up" style="animation-delay:2.1s"></span>
+<span class="bt-pkt bt-pkt-down" style="animation-delay:0.35s"></span>
+<span class="bt-pkt bt-pkt-down" style="animation-delay:1.75s"></span>
+</div>"""
+
 pills = "".join(f'<span class="bt-pill">{t}</span>' for t in
-                ("Health-indicator ranking", "LLI · LAM · CL modes", "Dual time-scale EKF twin",
-                 "Mechanistic PINN: SEI · plating · LAM", "Particle filter", "Semi-empirical law",
-                 "8-model ML workbench", "Conformal bands", "Integrated O&M optimisation"))
+                ("Self-updating EKF twin", "Mechanistic PINN", "Bayesian prognostics", "O&amp;M optimisation"))
+HERO_ART = re.sub(r"<!--.*?-->", "", HERO_ART)
+HERO_ART = " ".join(line.strip() for line in HERO_ART.splitlines())      # one line: no markdown code blocks
+HERO_CSS = " ".join(line.strip() for line in HERO_CSS.splitlines())
 st.markdown(
-    '<div class="bt-hero">'
-    '<div class="bt-kicker">Self-updating digital twin · NASA Ames Li-ion ageing data</div>'
-    '<div class="bt-title">🔋 Battery Digital Twin &amp; Operando Diagnostics</div>'
-    '<div class="bt-sub">NASA Ames 18650 LiCoO₂ / graphite ageing telemetry: incremental capacity analysis, '
-    'an 8-model ML workbench, hierarchical Bayes, particle filter, stacked ensemble, a self-updating ECM twin and a mechanism-resolved physics-informed neural '
-    'network (SEI growth, lithium plating, loss of active material, Butler–Volmer kinetics), benchmarked '
-    'across batteries and forecast origins with calibrated uncertainty.</div>'
-    f'<div>{pills}</div></div>',
+    HERO_CSS +
+    '<div class="bt-hero"><div class="bt-hero-text">'
+    '<div class="bt-kicker">Self-updating digital twin · NASA Ames Li-ion data</div>'
+    '<div class="bt-title">🔋 Battery Digital Twin</div>'
+    '<div class="bt-sub">A physical cell and its virtual copy, synchronised cycle by cycle: diagnose ageing, '
+    'forecast remaining life and decide when to act.</div>'
+    f'<div>{pills}</div></div>' + HERO_ART + '</div>',
     unsafe_allow_html=True,
 )
 
@@ -2124,9 +2214,9 @@ def fade_explorer() -> None:
     """Multi-battery fade chart linked to multi-cycle raw telemetry."""
     all_cells = list(meta.index)
     c1, c2, c3, c4 = st.columns([3, 1.3, 1.6, 1.1])
-    cells = c1.multiselect("Batteries to compare", all_cells, default=[cell], max_selections=8, key="fade_cells",
-                           format_func=lambda c: cell_label(c, meta),
-                           help="Up to 8 batteries; each keeps the same colour in every chart.") or [cell]
+    cells = list(st.session_state.get("_diag_sel") or [cell])
+    c1.markdown(f"**{len(cells)} batter{'y' if len(cells) == 1 else 'ies'}** from the selection above"
+                + ("" if len(cells) <= 8 else " (whole fleet: click legend entries to hide cells)"))
     yvar = c2.radio("Metric", ["SOH", "Capacity_Ah"], key="fade_metric",
                     format_func=lambda v: "State of health" if v == "SOH" else "Capacity (Ah)")
     x_mode = c3.radio("x-axis", ["n", "Ah", "frac"], key="fade_x",
@@ -2321,6 +2411,9 @@ def stress_section() -> None:
     a = b = st.container()  # stacked full width
     with a:
         st.markdown("**Share of cycles exposed (%) per cell**")
+        sel_ = st.session_state.get("_diag_sel")
+        if sel_:
+            summ = summ[summ.index.isin(sel_)]
         show_table(summ.style.format("{:.0f}", subset=[c for c in summ.columns if c not in ("Max PRI",)])
                    .format("{:.2f}", subset=["Max PRI"]))
     with b:
@@ -2348,40 +2441,40 @@ def risk_banner(row: pd.Series, cell_id: str) -> None:
                 unsafe_allow_html=True)
 
 
-def view_overview() -> None:
-    lim = asdict(te.SafetyLimits())
-    fs, ev = fleet_cached(ct, DATA_KEY, float(eol_ah), lim)
-    if fs.empty:
-        st.info("Not enough valid cycles to build the fleet overview.")
+DIAG_SCOPES = ("single", "selected", "fleet")
+DIAG_SCOPE_LABEL = {"single": ":material/battery_full: Single battery",
+                    "selected": ":material/stacks: Selected batteries",
+                    "fleet": ":material/grid_view: Whole fleet"}
+
+
+def _pick_critical(fs: pd.DataFrame, k: int = 6) -> None:
+    st.session_state["diag_cells"] = list(fs.index[:k])
+    st.session_state["diag_scope"] = DIAG_SCOPE_LABEL["selected"]
+
+
+def battery_status_card(cid: str, fs: pd.DataFrame, lim: Dict[str, float], key: str) -> None:
+    """Alert banner, gauge cluster and key facts for one battery."""
+    if cid not in fs.index:
+        st.info(f"{cid}: not enough valid cycles for a status card.")
         return
-    section("Fleet at a glance")
-    k = st.columns(6)
-    k[0].metric("Batteries", len(fs))
-    k[1].metric("Mean SOH", fmt(100 * fs["SOH"].mean(), ".1f", "%"))
-    k[2].metric("Past end of life", int((fs["SOH"] <= fs["SOH_EOL"]).sum()))
-    k[3].metric("Critical / warning", f"{int((fs['Risk'] == 'Critical').sum())} / {int((fs['Risk'] == 'Warning').sum())}")
-    k[4].metric("Knees detected", int(fs["Knee"].sum()))
-    k[5].metric("Fleet cycles logged", f"{int(fs['Cycles'].sum()):,}")
+    row = fs.loc[cid]
+    risk_banner(row, cell_label(cid, meta))
+    show(fig_gauges(row, P, te.SafetyLimits(**lim)), key=f"gauges_{key}", export=False)
+    k = st.columns(5)
+    k[0].metric("Valid cycles", int(meta.loc[cid, "cycles"]))
+    k[1].metric("Initial capacity", fmt(meta.loc[cid, "C_bol_Ah"], ".3f", "Ah"))
+    k[2].metric("Capacity fade", fmt(meta.loc[cid, "fade_pct"], ".1f", "%"))
+    k[3].metric("Fade per 100 cycles", fmt(row["Fade per 100 cycles (%)"], ".2f", "%"))
+    k[4].metric("Regeneration events", int(meta.loc[cid].get("regen_events", 0) or 0))
 
-    section(f"Instrument cluster · {cell}")
-    if cell in fs.index:
-        row = fs.loc[cell]
-        risk_banner(row, cell)
-        show(fig_gauges(row, P, te.SafetyLimits(**lim)), key="gauges", export=False)
-        st.caption("Quick RUL is a robust linear trend of the last 20 cycles, for triage. The Models view gives the "
-                   "full probabilistic RUL from the twin, PINN and particle filter.")
 
-    section("Fleet health map")
-    show(fig_fleet_map(fs, P), key="fleet_map", data=fs.reset_index())
-
-    section("Risk triage")
-    show(fig_risk_matrix(fs, P, cell), key="risk_matrix", data=fs.reset_index())
+def triage_table(fs: pd.DataFrame, key: str) -> None:
     tbl = fs.reset_index()[["Cell_ID", "Risk", "SOH", "Health margin", "Quick RUL", "Fade per 100 cycles (%)",
                             "R growth (%)", "Peak T (°C)", "Cycles", "Ambient_C", "I_dis_A", "Alerts"]].copy()
     tbl["Risk"] = tbl["Risk"].map(lambda r: f"{RISK_ICON[r]} {r}")
     tbl["Quick RUL"] = tbl["Quick RUL"].replace(np.inf, np.nan)
     try:
-        st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(640, 38 + 35 * len(tbl)),
+        st.dataframe(tbl, hide_index=True, use_container_width=True, height=min(640, 38 + 35 * len(tbl)), key=key,
                      column_config={
                          "Cell_ID": st.column_config.TextColumn("Battery", width="small"),
                          "SOH": st.column_config.ProgressColumn("SOH", min_value=0.0, max_value=1.05, format="%.3f"),
@@ -2397,52 +2490,89 @@ def view_overview() -> None:
     except Exception:
         show_table(tbl)
 
-    section("Event log")
-    sev = st.multiselect("Severity", ["Critical", "Warning", "Watch", "Info"], default=["Critical", "Warning", "Watch"],
-                         key="ev_sev")
-    only = st.toggle("Only the selected battery", value=False, key="ev_only")
-    evf = ev[ev["Severity"].isin(sev)]
-    if only:
-        evf = evf[evf["Cell_ID"] == cell]
+
+def event_log(ev: pd.DataFrame, cells: Sequence[str], key: str) -> None:
+    c1, c2 = st.columns([3, 1])
+    sev = c1.multiselect("Severity", ["Critical", "Warning", "Watch", "Info"], default=["Critical", "Warning", "Watch"],
+                         key=f"{key}_sev")
+    evf = ev[ev["Severity"].isin(sev) & ev["Cell_ID"].isin(cells)]
+    c2.metric("Events shown", len(evf))
     evf = evf.assign(Severity=evf["Severity"].map(lambda s_: {"Critical": "🔴", "Warning": "🟠", "Watch": "🟡",
                                                               "Info": "🔵"}[s_] + " " + s_))
+    if evf.empty:
+        st.success("No events of the chosen severity for this selection.")
+        return
     try:
-        st.dataframe(evf, hide_index=True, use_container_width=True, height=min(420, 38 + 35 * max(len(evf), 1)),
+        st.dataframe(evf, hide_index=True, use_container_width=True, height=min(420, 38 + 35 * len(evf)), key=key,
                      column_config={"Cell_ID": st.column_config.TextColumn("Battery"),
                                     "n": st.column_config.NumberColumn("Cycle", format="%d")})
     except Exception:
         show_table(evf)
 
-    section("Reports")
-    st.markdown("One-click, self-contained HTML report (interactive charts, opens in any browser; print to PDF "
-                "from the browser for a static copy).")
-    if st.button(f"Build report for {cell}", key="rep_go", icon=":material/description:", type="primary"):
+
+def selection_report(sel: Sequence[str], fs: pd.DataFrame, ev: pd.DataFrame, lim: Dict[str, float]) -> None:
+    label = sel[0] if len(sel) == 1 else f"{len(sel)} batteries"
+    if st.button(f"Build report · {label}", key="rep_go", icon=":material/description:", type="primary"):
         with st.spinner("Assembling report…"):
-            knees = {cell: knee_cached(ct_cell, DATA_KEY, cell)}
+            knees = {c: knee_cached(ct[ct["Cell_ID"] == c], DATA_KEY, c) for c in sel[:12]}
+            fs_sel = fs[fs.index.isin(sel)]
             secs: List[Tuple[str, Any]] = [
-                ("Summary", f"{cell_label(cell, meta)} · SOH {100 * fs.loc[cell, 'SOH']:.1f}% · risk "
-                            f"{fs.loc[cell, 'Risk']} · alerts: {fs.loc[cell, 'Alerts']}" if cell in fs.index else cell),
-                ("Instrument cluster", fig_gauges(fs.loc[cell], P, te.SafetyLimits(**lim))) if cell in fs.index
-                else ("Instrument cluster", "n/a"),
-                ("Capacity fade", fig_fade_compare(ct, meta, [cell], "SOH", soh_eol, P, knees, True, "n")),
-                ("Fleet risk matrix", fig_risk_matrix(fs, P, cell)),
-                ("Fleet status", fs.drop(columns=["risk_level"])),
-                ("Event log (this battery)", ev[ev["Cell_ID"] == cell]),
+                ("Selection", ", ".join(cell_label(c, meta) for c in sel)),
+                ("Status", fs_sel.drop(columns=["risk_level"])),
+                ("Capacity fade", fig_fade_compare(ct, meta, list(sel), "SOH", soh_eol if len(sel) == 1 else None, P,
+                                                   knees, len(sel) == 1, "n")),
+                ("Risk matrix (selection against the fleet)", fig_risk_matrix(fs, P, sel[0],
+                                                                              list(sel) if len(sel) < len(fs) else None)),
             ]
-            for key_, title in (("ml", "ML forecasts"), ("cmp", "Physics-informed comparison")):
-                saved = st.session_state.get(key_)
-                if saved and key_ == "ml" and saved.get("res") and saved["cfg"]["cell"] == cell:
-                    secs.append((title, fig_ml(saved["res"], ct_cell, saved["cfg"]["n0"], soh_eol, P)))
-                if saved and key_ == "cmp" and saved.get("res") is not None:
-                    try:
-                        secs.append((title, fig_compare(saved["res"], P)))
-                        secs.append(("Forecast metrics", te.metrics_table(saved["res"].metrics)))
-                    except Exception:
-                        pass
-            st.session_state["report"] = (cell, build_report_html(f"Battery health report · {cell}", secs))
+            for c in sel[:8]:
+                if c in fs.index:
+                    secs.append((f"Instrument cluster · {c}", fig_gauges(fs.loc[c], P, te.SafetyLimits(**lim))))
+                    secs.append((f"Events · {c}", ev[ev["Cell_ID"] == c]))
+            saved = st.session_state.get("cmp")
+            if saved and saved.get("res") is not None and saved["res"].cell_id in sel:
+                try:
+                    secs.append((f"Forecasts · {saved['res'].cell_id}", fig_compare(saved["res"], P)))
+                    secs.append(("Forecast metrics", te.metrics_table(saved["res"].metrics)))
+                except Exception:
+                    pass
+            st.session_state["report"] = (tuple(sel), build_report_html(f"Battery health report · {label}", secs))
     rep = st.session_state.get("report")
-    if rep and rep[0] == cell:
-        download("Download report (HTML)", rep[1], f"battery_report_{cell}.html", "text/html", key="rep_dl")
+    if rep and tuple(rep[0]) == tuple(sel):
+        download("Download report (HTML)", rep[1], f"battery_report_{label.replace(' ', '_')}.html", "text/html",
+                 key="rep_dl")
+
+
+def status_section(scope: str, sel: List[str], fs: pd.DataFrame, ev: pd.DataFrame, lim: Dict[str, float]) -> None:
+    """Health status for the current scope: instrument cards (single / selected) or triage (fleet)."""
+    if fs.empty:
+        st.info("Not enough valid cycles to assess health.")
+        return
+    if scope == "fleet":
+        k = st.columns(6)
+        k[0].metric("Batteries", len(fs))
+        k[1].metric("Mean SOH", fmt(100 * fs["SOH"].mean(), ".1f", "%"))
+        k[2].metric("Past end of life", int((fs["SOH"] <= fs["SOH_EOL"]).sum()))
+        k[3].metric("Critical / warning", f"{int((fs['Risk'] == 'Critical').sum())} / "
+                                          f"{int((fs['Risk'] == 'Warning').sum())}")
+        k[4].metric("Knees detected", int(fs["Knee"].sum()))
+        k[5].metric("Fleet cycles logged", f"{int(fs['Cycles'].sum()):,}")
+        show(fig_fleet_map(fs, P), key="fleet_map", data=fs.reset_index())
+        show(fig_risk_matrix(fs, P, cell), key="risk_matrix", data=fs.reset_index())
+        triage_table(fs, "triage_all")
+    else:
+        for c in sel:
+            battery_status_card(c, fs, lim, c)
+        if len(sel) > 1:
+            triage_table(fs[fs.index.isin(sel)], "triage_sel")
+        show(fig_risk_matrix(fs, P, sel[0], sel), key="risk_matrix", data=fs.reset_index())
+        st.caption("Selected batteries in colour, the rest of the fleet in grey. Quick RUL is a robust trend of the "
+                   "last 20 cycles for triage; the Models view gives the full probabilistic RUL.")
+    with st.expander("Event log", expanded=scope != "fleet", icon=":material/list_alt:"):
+        event_log(ev, sel, "ev")
+    with st.expander("Report", icon=":material/description:"):
+        st.caption("Self-contained HTML with interactive charts for the current selection (print to PDF from the "
+                   "browser).")
+        selection_report(sel if scope != "fleet" else list(fs.index[:8]), fs, ev, lim)
 
 
 def view_replay() -> None:
@@ -2580,33 +2710,49 @@ def half_cell_section() -> None:
 
 
 def view_data() -> None:
-    k = st.columns(6)
-    k[0].metric("Target cell", cell)
-    k[1].metric("Initial capacity", fmt(c_bol, ".3f", "Ah"))
-    k[2].metric("Valid discharge cycles", int(meta.loc[cell, "cycles"]))
-    k[3].metric("Capacity fade", fmt(meta.loc[cell, "fade_pct"], ".1f", "%"))
-    k[4].metric("Ambient / discharge current",
-                f"{fmt(meta.loc[cell, 'Ambient_C'], '.0f', '°C')} / {fmt(meta.loc[cell, 'I_dis_A'], '.1f', 'A')}")
-    k[5].metric("Regeneration events", int(meta.loc[cell].get("regen_events", 0) or 0),
-                help="Upward capacity jumps (> 1 % of initial) after rest periods; kept in the data and "
-                     "marked ▲ on the fade chart.")
+    global cell, ct_cell, eis_cell, c_bol, soh_eol
+    lim = asdict(te.SafetyLimits())
+    fs, ev = fleet_cached(ct, DATA_KEY, float(eol_ah), lim)
+    all_cells = list(meta.index)
+    labels = [DIAG_SCOPE_LABEL[k] for k in DIAG_SCOPES]
+    st.session_state.setdefault("diag_scope", labels[0])
+    c1, c2 = st.columns([3, 1.2], vertical_alignment="bottom")
+    with c1:
+        try:
+            choice = st.segmented_control("Scope", labels, key="diag_scope", label_visibility="collapsed")
+        except Exception:
+            choice = st.radio("Scope", labels, key="diag_scope", horizontal=True, label_visibility="collapsed")
+    choice = choice or labels[0]
+    scope = DIAG_SCOPES[labels.index(choice)]
+    c2.button("Select most critical", key="pick_crit", icon=":material/priority_high:", on_click=_pick_critical,
+              args=(fs,), help="Switches to 'Selected batteries' with the six highest-risk cells.")
+    if scope == "single":
+        sel = [cell]
+        st.caption(f"Analysing the target battery from the control bar: **{cell_label(cell, meta)}**.")
+    elif scope == "selected":
+        st.session_state.setdefault("diag_cells", [cell])
+        sel = st.multiselect("Batteries", all_cells, key="diag_cells", max_selections=8,
+                             format_func=lambda c: cell_label(c, meta),
+                             help="Up to 8 batteries; every section below follows this selection.") or [cell]
+    else:
+        sel = all_cells
+    st.session_state["_diag_sel"] = sel
 
-    kn = knee_cached(ct_cell, DATA_KEY, cell)
-    if kn.get("found"):
-        st.caption(f"Knee point detected at n = {kn['knee_n']} (SOH {kn['soh_at_knee']:.3f}): fade accelerates "
-                   f"{kn['ratio']:.1f}× (F-test p = {kn['p_value']:.1g}). Marked ★ on the fade chart; beyond it the "
-                   "risk of sudden capacity loss rises, which the maintenance optimiser accounts for.")
-    issues = validation_cached(store, DATA_KEY, cell)
-    n_out = int(ct_cell["outlier"].sum())
-    with st.expander(f"Data quality: {len(issues)} telemetry issue(s), {n_out} outlier cycle(s), "
-                     f"{len(cell_errors)} skipped cell(s)", expanded=bool(issues)):
-        if issues:
-            for msg in issues:
-                st.warning(msg)
-        else:
-            st.success("Schema, physical ranges and time ordering passed for this cell.")
-        if cell_errors:
-            show_table(pd.DataFrame({"Cell": list(cell_errors), "Reason": list(cell_errors.values())}).set_index("Cell"))
+    section("Health status")
+    status_section(scope, sel, fs, ev, lim)
+
+    bad = {c: e for c, e in cell_errors.items()}
+    with st.expander(f"Data quality · {len(bad)} skipped cell(s)", icon=":material/fact_check:"):
+        for c in sel[:8]:
+            issues = validation_cached(store, DATA_KEY, c)
+            n_out = int(ct[(ct["Cell_ID"] == c)]["outlier"].sum())
+            (st.warning if issues else st.success)(
+                f"{c}: {len(issues)} telemetry issue(s), {n_out} excluded cycle(s)"
+                + ("" if not issues else " · " + "; ".join(issues[:3])))
+        if len(sel) > 8:
+            st.caption("Per-cell checks are listed for the first eight batteries.")
+        if bad:
+            show_table(pd.DataFrame({"Cell": list(bad), "Reason": list(bad.values())}).set_index("Cell"))
 
     section("Capacity fade: compare batteries")
     fade_explorer()
@@ -2614,11 +2760,25 @@ def view_data() -> None:
     section("Cohort by ambient temperature")
     norm_x = st.toggle("Normalise x to fraction of recorded life", value=False, key="grid_norm",
                        help="Aligns cells with very different cycle counts.")
-    show(fig_cohort_grid(ct, meta, cell, P, norm_x), key="cohort_grid",
+    grid_sel = sel if scope != "fleet" else [cell]
+    show(fig_cohort_grid(ct, meta, grid_sel, P, norm_x), key="cohort_grid",
          data=ct.loc[~ct["outlier"], ["Cell_ID", "n", "SOH"]].merge(
              meta[["Ambient_C", "I_dis_A"]].reset_index(), on="Cell_ID"))
     with st.expander("Mission 1 · How do operating conditions influence degradation?", expanded=False):
         condition_effects_section()
+
+    if len(sel) > 1:
+        st.markdown("---")
+        focus = st.selectbox("Focus battery for the detailed analyses below", sel,
+                             index=sel.index(cell) if cell in sel else 0, key="diag_focus",
+                             format_func=lambda c: cell_label(c, meta),
+                             help="Indicator trajectories, ICA / DVA, degradation modes, half-cell fitting and the "
+                                  "stress timeline analyse one battery at a time.")
+        cell = focus
+        ct_cell = ct[ct["Cell_ID"] == cell].sort_values("n")
+        eis_cell = te.valid_eis(imp, cell)
+        c_bol = float(meta.loc[cell, "C_bol_Ah"])
+        soh_eol = te.soh_eol_for(c_bol, eol_ah)
 
     section("Mission 1 · Which parameter best represents health?")
     health_indicator_section()
@@ -3793,8 +3953,8 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # =============================================================================
 # Dispatch: only the active view runs
 # =============================================================================
-_VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_overview, VIEWS[1]: view_replay, VIEWS[2]: view_data,
-                                           VIEWS[3]: view_models, VIEWS[4]: view_ops}
+_VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_data, VIEWS[1]: view_replay, VIEWS[2]: view_models,
+                                           VIEWS[3]: view_ops}
 try:
     _VIEW_FN.get(view, view_data)()
 except Exception as exc:

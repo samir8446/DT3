@@ -1,4 +1,4 @@
-# Battery digital twin & operando diagnostics (v4.5)
+# Battery digital twin & operando diagnostics (v4.6)
 
 ```bash
 pip install -r requirements.txt
@@ -14,13 +14,15 @@ Files: `twin_engine.py` (all computation, no UI), `app.py` (Streamlit views), `b
 synthetic-truth recovery). Set `TWIN_CACHE_DIR` to persist downloads and uploads; `GIT_COMMIT`
 is recorded in run manifests.
 
-## Operations centre (first view)
+## Diagnostics (first view)
 
-Live status bar, fleet KPIs, an instrument cluster (SOH, quick RUL, resistance growth, peak temperature
-gauges) for the selected battery, a fleet health treemap, a risk matrix (remaining life vs degradation
-speed), a triage table with risk levels and alerts, a filterable event log (knees, EOL crossings,
-over-temperature, cold charging, regeneration, excluded cycles) and a one-click HTML report.
-The Operations view adds a what-if scenario planner driven by the cohort stress-factor law.
+One view, one selection. A scope switch chooses **Single battery**, **Selected batteries** (up to 8, or
+"Select most critical" from the fleet ranking) or **Whole fleet**. The health status adapts: instrument
+cards (SOH, quick RUL, resistance growth and peak-temperature gauges with alert banner) per battery, or the
+fleet treemap and triage table. The risk matrix always shows the selection against the grey fleet. Every
+section below (fade comparison, raw telemetry, cohort grid, health indicators, ICA/DVA, degradation modes,
+half-cell fitting, stress exposure, event log, HTML report) follows the same selection; single-battery
+analyses use a "focus battery" chosen from the selection.
 
 ## New in v4.5 (model clean-up)
 
