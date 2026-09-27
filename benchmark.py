@@ -41,7 +41,7 @@ def main(argv=None) -> int:
     ap.add_argument("--fracs", type=float, nargs="+", default=[0.2, 0.3, 0.4, 0.5, 0.6])
     ap.add_argument("--paradigms", nargs="+", default=list(te.BENCH_PARADIGMS), choices=te.BENCH_PARADIGMS)
     ap.add_argument("--cells", nargs="*", help="subset of cells (default: all with enough cycles)")
-    ap.add_argument("--ml-model", default="Gradient Boosting", choices=te.ML_MODELS)
+    ap.add_argument("--ml-model", default="Hist. Gradient Boosting", choices=te.ML_MODELS)
     ap.add_argument("--ml-strategy", default="increment", choices=te.ML_STRATEGIES)
     ap.add_argument("--conformal-cells", type=int, default=4)
     ap.add_argument("--band-level", type=float, default=0.9)

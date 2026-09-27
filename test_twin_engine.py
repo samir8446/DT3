@@ -139,7 +139,7 @@ def test_increment_ml_extrapolates_beyond_training_horizon():
 
 def test_conformal_band_brackets_point_forecast():
     _, ct, _, _ = synthetic()
-    r = te.train_ml_forecast(ct, "S002", 30, "Gradient Boosting", conformal_cells=3)
+    r = te.train_ml_forecast(ct, "S002", 30, "Hist. Gradient Boosting", conformal_cells=3)
     assert r.soh_lo is not None and len(r.calibration_cells) == 3
     assert np.all(r.soh_lo <= r.soh_pred + 1e-12) and np.all(r.soh_pred <= r.soh_hi + 1e-12)
     assert r.metrics.coverage is not None and 0 <= r.metrics.coverage <= 1
@@ -448,7 +448,7 @@ def test_robust_baseline_repairs_crashed_logging_segment():
 def test_model_registry_all_models_and_param_validation():
     X = np.random.default_rng(0).normal(size=(60, 3))
     y = X[:, 0] - 0.5 * X[:, 1] ** 2
-    assert len(te.ML_MODELS) >= 10
+    assert 6 <= len(te.ML_MODELS) <= 10
     for name in te.ML_MODELS:
         m = te.make_model(name, 0, te.default_params(name)).fit(X, y)
         assert np.all(np.isfinite(m.predict(X))), name
@@ -565,6 +565,58 @@ def test_replacement_dp_is_safe_and_competitive():
     # DPPolicy honours the measured-ambient cold guard
     pol = te.DPPolicy(dp)
     assert pol(np.array([0.95, p.R_int0, p.R_ct0]), -5.0, p, e, cycle=0) <= e.cold_max_current_A
+
+
+def test_delta_q_features_and_early_life_lifetime():
+    _, ct, _, _ = synthetic()
+    assert set(te.QV_COLS) <= set(ct.columns) and ct[te.QV_COLS[5]].notna().mean() > 0.9
+    d = ct[ct["Cell_ID"] == "S006"]
+    dq = te.delta_q_curve(d, 2, 40)
+    assert dq is not None and np.nanmean(dq) < 0                     # aged cell delivers less charge at each V
+    el = te.early_life_lifetime(ct, eol_ah=1.6, n_b=20)
+    if el["available"]:
+        assert el["corr_logvar_loglife"] < 0                          # Severson: larger variance -> shorter life
+        assert el["mape_pct"] < el["baseline_mape_pct"]
+    desc = te.early_life_descriptors(ct[~ct["outlier"]], 30)
+    assert "dq_logvar" in desc.columns and desc["dq_logvar"].notna().all()
+
+
+def test_hierarchical_bayes_shrinks_with_data_and_is_calibrated():
+    _, ct, _, _ = synthetic()
+    early = te.hierarchical_bayes_forecast(ct, "S004", 12, eol_ah=1.6)
+    late = te.hierarchical_bayes_forecast(ct, "S004", 45, eol_ah=1.6)
+    assert late.params["prior_weight"] < early.params["prior_weight"]     # self-updating: data take over
+    assert late.metrics.rmse < 0.02 and late.metrics.coverage >= 0.5
+    pop = te.hierarchical_population(ct, exclude="S004")
+    assert pop["available"] and pop["Sigma"].shape == (2, 2)
+    g = te.physics_gp_forecast(ct, "S004", 45, eol_ah=1.6)
+    assert np.isfinite(g.metrics.rmse) and g.metrics.rmse < 0.03
+
+
+def test_physics_particle_filter_and_ensemble():
+    store, ct, imp, _ = synthetic()
+    pf = te.particle_filter_forecast(ct, "S004", 36, eol_ah=1.6, n_particles=1500)
+    assert pf.name == te.PF_NAME and pf.metrics.rmse < 0.03 and pf.params["prior_cells"] >= 3
+    res = te.compare_paradigms(store.cell_frame("S004"), ct, imp, "S004", 0.4, te.TwinParameters(),
+                               te.PINNConfig(epochs=20), "Ridge", conformal_cells=0, run_pinn=False, eol_ah=1.6)
+    assert {te.HB_NAME, te.GP_NAME, te.ENS_NAME} <= set(res.predictions), res.errors
+    w = res.prognostics[te.ENS_NAME].params["weights"]
+    assert abs(sum(w.values()) - 1) < 1e-6 and len(w) >= 3
+    ens = res.metrics[te.ENS_NAME]
+    assert ens.rmse <= max(res.metrics[m].rmse for m in w) + 1e-9          # never worse than the worst member
+
+
+def test_pinn_half_cell_mode_coupling():
+    _, ct, imp, _ = synthetic()
+    g = ct[(ct["Cell_ID"] == "S004") & ~ct["outlier"]]
+    loss = 100 * (1 - g["SOH"].to_numpy())
+    mt = pd.DataFrame({"n": g["n"].to_numpy()[::6], "LLI (%)": 0.7 * loss[::6], "LAM_PE (%)": 0.2 * loss[::6],
+                       "LAM_NE (%)": 0.1 * loss[::6]})
+    r = te.train_pinn(ct, imp, "S004", 36, te.PINNConfig(epochs=600, physics="mechanistic"), eol_ah=1.6,
+                      mode_targets=mt)
+    mech = r.mechanisms.set_index("n").loc[36]
+    share_lli = (mech["Q_SEI"] + mech["Q_plating"]) / mech.sum()
+    assert 0.5 < share_lli < 0.85 and "modes" in r.history.columns
 
 
 if __name__ == "__main__":                            # minimal runner when pytest is absent

@@ -492,6 +492,12 @@ def paradigm_style(name: str, P: Palette, i: int = 0) -> Tuple[str, str, str]:
         return P.semi, "dot", "triangle-up"
     if name == te.PF_NAME:
         return P.pf, "longdash", "star"
+    if name == te.HB_NAME:
+        return "#882255", "dashdot", "hexagon"
+    if name == te.GP_NAME:
+        return "#44AA99", "dot", "triangle-down"
+    if name == te.ENS_NAME:
+        return P.text, "solid", "circle"
     return P.series[i % len(P.series)], DASHES[(i + 3) % len(DASHES)], SYMBOLS[i % len(SYMBOLS)]
 
 
@@ -1704,6 +1710,55 @@ def fig_half_cell_modes(tab: pd.DataFrame, P: Palette) -> go.Figure:
     return style_fig(fig, P, 500, "Quantitative degradation modes from half-cell fitting")
 
 
+def fig_dq_curves(ct_all: pd.DataFrame, el: Dict[str, Any], P: Palette) -> go.Figure:
+    """Delta-Q(V) = Q_nb(V) - Q_na(V) per cell, coloured by log10 cycle life (Severson et al. 2019, Fig. 2)."""
+    tab = el["table"].set_index("Cell_ID")
+    lives = tab["life"].dropna()
+    lo, hi = (np.log10(lives.min()), np.log10(lives.max())) if len(lives) else (1, 3)
+    fig = go.Figure()
+    for cid, d in ct_all[~ct_all["outlier"]].groupby("Cell_ID"):
+        dq = te.delta_q_curve(d, el["n_a"], el["n_b"])
+        if dq is None:
+            continue
+        life = tab.loc[cid, "life"] if cid in tab.index else np.nan
+        frac = (np.log10(life) - lo) / max(hi - lo, 1e-9) if np.isfinite(life) else None
+        col = sample_colorscale("Viridis", [float(np.clip(frac, 0, 1))])[0] if frac is not None else P.cohort
+        fig.add_trace(go.Scatter(x=1000 * dq, y=te.QV_GRID, mode="lines", name=cid, showlegend=False,
+                                 line=dict(color=col, width=2 if frac is not None else 1, dash="solid" if frac is not None else "dot"),
+                                 hovertemplate=f"<b>{cid}</b> life {life if np.isfinite(life) else 'censored'}"
+                                               "<br>ΔQ %{x:.1f} mAh at %{y:.2f} V<extra></extra>"))
+    if len(lives):
+        fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers", showlegend=False, hoverinfo="skip",
+                                 marker=dict(colorscale="Viridis", cmin=lo, cmax=hi, color=[lo], showscale=True,
+                                             colorbar=dict(title=dict(text="log₁₀ life", font=dict(color=P.text)),
+                                                           tickfont=dict(color=P.muted), thickness=12))))
+    fig.add_vline(x=0, line_color=P.muted, line_width=1)
+    fig.update_xaxes(title_text=f"ΔQ(V) = Q(n={el['n_b']}) − Q(n={el['n_a']})  (mAh)")
+    fig.update_yaxes(title_text="Voltage (V)")
+    return style_fig(fig, P, 520, "Early-life ΔQ(V) curves, coloured by eventual cycle life (dotted = censored)",
+                     hovermode="closest")
+
+
+def fig_lifetime_parity(el: Dict[str, Any], P: Palette, all_cells: Sequence[str]) -> go.Figure:
+    d = el["loco"]
+    fig = go.Figure()
+    lo, hi = float(min(d["life"].min(), d["life_pred"].min())) * 0.85, float(max(d["life"].max(), d["life_pred"].max())) * 1.15
+    fig.add_trace(go.Scatter(x=[lo, hi], y=[lo, hi], mode="lines", name="Perfect", line=dict(color=P.muted, dash="dash")))
+    fig.add_trace(go.Scatter(x=[lo, hi, hi, lo], y=[lo * 0.8, hi * 0.8, hi * 1.2, lo * 1.2], fill="toself",
+                             fillcolor=rgba(P.muted, 0.1), line=dict(width=0), name="±20 %", hoverinfo="skip"))
+    for _, r in d.iterrows():
+        col, sym = cell_style(r["Cell_ID"], all_cells)
+        fig.add_trace(go.Scatter(x=[r["life"]], y=[r["life_pred"]], mode="markers+text", text=[r["Cell_ID"]],
+                                 textposition="top center", textfont=dict(size=10, color=P.muted), showlegend=False,
+                                 marker=dict(color=col, symbol=sym, size=11, line=dict(color=P.text, width=0.8)),
+                                 hovertemplate=f"<b>{r['Cell_ID']}</b><br>actual %{{x:.0f}} · predicted %{{y:.0f}} cycles"
+                                               "<extra></extra>"))
+    fig.update_xaxes(title_text="Actual cycles to end of life", type="log")
+    fig.update_yaxes(title_text="Predicted from early cycles (leave-one-cell-out)", type="log")
+    return style_fig(fig, P, 520, f"Early-life lifetime prediction · MAPE {el['mape_pct']:.1f}% "
+                                  f"(cohort-mean baseline {el['baseline_mape_pct']:.1f}%)", hovermode="closest")
+
+
 # =============================================================================
 # Cached data access & computation
 # =============================================================================
@@ -1808,6 +1863,11 @@ def dp_cached(econ: Dict[str, Any], phys: Dict[str, Any], maint: Dict[str, Any],
 def half_cell_cached(_prep: pd.DataFrame, _ct_cell: pd.DataFrame, key: str, cell: str, n_curves: int,
                      ir: bool) -> Tuple[pd.DataFrame, List[te.HalfCellFit]]:
     return te.half_cell_trajectory(_prep, _ct_cell, n_curves, ir)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def early_life_cached(_ct: pd.DataFrame, key: str, eol_ah: float, n_a: int, n_b: int) -> Dict[str, Any]:
+    return te.early_life_lifetime(_ct, eol_ah, n_a, n_b)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -1963,13 +2023,13 @@ inject_css(P)
 pills = "".join(f'<span class="bt-pill">{t}</span>' for t in
                 ("Health-indicator ranking", "LLI · LAM · CL modes", "Dual time-scale EKF twin",
                  "Mechanistic PINN: SEI · plating · LAM", "Particle filter", "Semi-empirical law",
-                 "14-model ML workbench", "Conformal bands", "Integrated O&M optimisation"))
+                 "8-model ML workbench", "Conformal bands", "Integrated O&M optimisation"))
 st.markdown(
     '<div class="bt-hero">'
     '<div class="bt-kicker">Self-updating digital twin · NASA Ames Li-ion ageing data</div>'
     '<div class="bt-title">🔋 Battery Digital Twin &amp; Operando Diagnostics</div>'
     '<div class="bt-sub">NASA Ames 18650 LiCoO₂ / graphite ageing telemetry: incremental capacity analysis, '
-    'a 14-model ML workbench, a self-updating ECM twin and a mechanism-resolved physics-informed neural '
+    'an 8-model ML workbench, hierarchical Bayes, particle filter, stacked ensemble, a self-updating ECM twin and a mechanism-resolved physics-informed neural '
     'network (SEI growth, lithium plating, loss of active material, Butler–Volmer kinetics), benchmarked '
     'across batteries and forecast origins with calibrated uncertainty.</div>'
     f'<div>{pills}</div></div>',
@@ -2608,10 +2668,18 @@ def methods_panel() -> None:
                     "ridge prior on the exponent:")
         st.latex(r"\mathrm{SOH} = 1 - B(T, I)\,\mathrm{Ah}^{z},\qquad z \approx 0.5\ \text{(SEI, diffusion-limited)},"
                  r"\quad z \approx 1\ \text{(linear)},\quad z > 1\ \text{(accelerating)}")
-        st.markdown("**Particle filter** (Saha & Goebel 2009) on the double-exponential capacity model, prior from "
-                    "cohort fits, Student-t likelihood, systematic resampling:")
-        st.latex(r"\mathrm{SOH}(n) = a\,e^{b n} + c\,e^{d n},\qquad w_k^{(i)} \propto w_{k-1}^{(i)}\,"
-                 r"p\!\left(y_k \mid \theta^{(i)}\right)")
+        st.markdown("**Hierarchical Bayes** (partial pooling): every cell has its own power-law parameters, drawn "
+                    "from a fleet distribution whose mean depends on the operating conditions. The fleet is the prior "
+                    "and the battery's own data update it (Laplace posterior):")
+        st.latex(r"\mathrm{SOH} = s_0\left[1 - e^{a}\left(\tfrac{\mathrm{Ah}}{100}\right)^{z}\right],\qquad "
+                 r"(a, z)_c \sim \mathcal{N}\!\left(G\,x_c,\ \Sigma\right),\quad x_c = \left[1,\ \tfrac{1}{T_\mathrm{ref}} - "
+                 r"\tfrac{1}{T_c},\ \ln\tfrac{I_c}{2\,\mathrm{A}}\right]")
+        st.markdown("**Particle filter** on the same physics law with the hierarchical prior (Student-t likelihood, "
+                    "systematic resampling); **physics-mean GP**: hierarchical-Bayes trend plus a GP residual in "
+                    "throughput; **stacked ensemble** weighted by backtest skill on the battery's own history:")
+        st.latex(r"w_k^{(i)} \propto w_{k-1}^{(i)}\,p\!\left(y_k \mid \theta^{(i)}\right),\qquad "
+                 r"\mathrm{SOH}(\mathrm{Ah}) = m_\theta(\mathrm{Ah}) + f(\mathrm{Ah}),\ f \sim \mathcal{GP}(0, k_\mathrm{RBF}),"
+                 r"\qquad \hat y = \sum_i \frac{\mathrm{RMSE}_i^{-2}}{\sum_j \mathrm{RMSE}_j^{-2}}\,\hat y_i")
         st.markdown("**Health-indicator ranking** (Coble & Hines 2009): monotonicity, trendability, prognosability "
                     "and |Spearman ρ| with SOH on beginning-of-life-normalised indicators, plus a leave-one-cell-out "
                     "test; PCA decides whether one parameter suffices. **Degradation modes**: LLI / LAM / CL proxies "
@@ -2629,7 +2697,10 @@ def methods_panel() -> None:
             "| Equivalent-circuit | 1-RC ECM inside the dual EKF twin and the operations plant |\n"
             "| Electrochemical / physics-based | Butler–Volmer and SEI-type fade law in the hybrid PINN |\n"
             "| Data-driven | RF, GBR, GPR, SVR, MLP, Ridge fade-rate models with conformal bands |\n"
-            "| Bayesian filtering | Dual EKF (states + rate), particle filter |")
+            "| Bayesian filtering / inference | Dual EKF (states + rate); particle filter and hierarchical "
+            "Bayes on the physics power law; physics-mean GP |\n"
+            "| Early-life data-driven | ΔQ(V) elastic net (Severson et al. 2019) |\n"
+            "| Model combination | Skill-weighted stacked ensemble |")
         st.markdown("**Metrics.** RMSE on held-out cycles; RUL from the origin with right-censoring; relative "
                     "accuracy, α-λ and prognostic horizon after Saxena et al.; empirical band coverage.")
         st.markdown(
@@ -2692,12 +2763,11 @@ R2_NOTE = ("**Reading the scores.** *Accuracy* = 100 × (1 − mean absolute per
 
 def ml_section() -> None:
     section("Machine-learning workbench", icon=":material/model_training:")
-    st.markdown("Two tasks, 14 models, every hyperparameter adjustable. **Forecast**: predict future SOH from the past "
+    st.markdown("Two tasks, 8 curated models, every hyperparameter adjustable. **Forecast**: predict future SOH from the past "
                 "(prognosis). **Estimate**: infer the present SOH from operando indicators measured on the same cycle "
                 "(diagnosis, no capacity test needed).")
-    models = st.multiselect("Models", list(te.ML_MODELS), default=["Random Forest", "Extra Trees", "Gradient Boosting",
-                                                                    "Hist. Gradient Boosting", "Gaussian Process",
-                                                                    "Ridge"],
+    models = st.multiselect("Models", list(te.ML_MODELS), default=["Extra Trees", "Hist. Gradient Boosting",
+                                                                    "Gaussian Process", "Bayesian Ridge"],
                             key="ml_models", help="Select any number; the leaderboard ranks them.")
     params = hyperparam_editor(models, "hp")
     t_fc, t_est = st.tabs([":material/trending_down: Forecast future SOH", ":material/biotech: Estimate SOH from indicators"])
@@ -2728,11 +2798,8 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
         train_cells = tuple(st.multiselect("Train on these batteries", others, default=[c for c in near if c in others],
                                            key="ml_train_cells", format_func=lambda c: cell_label(c, meta)))
     d1, d2, d3 = st.columns(3)
-    strategy = d1.selectbox("Strategy", list(te.ML_STRATEGIES), key="ml_strategy",
-                            format_func=lambda s: "Fade-rate model (increment)" if s == "increment"
-                            else "Direct SOH(n) regression (legacy)",
-                            help="The increment strategy learns dSOH/dn as a function of SOH, so tree models "
-                                 "keep extrapolating beyond the longest training life.")
+    strategy = "increment"
+    d1.markdown("**Fade-rate model**  \n*dSOH/dn = g(SOH, conditions, early-life features)*, integrated forward")
     conf = d2.slider("Conformal calibration cells (0 = no band)", 0, 8, 3, key="ml_conf")
     level = d3.select_slider("Band level", [0.8, 0.9, 0.95], value=0.9, key="ml_level")
     use_pop = source == "cohort"
@@ -2948,9 +3015,7 @@ def physics_section() -> None:
         h1, h2 = st.columns(2, gap="large")
         with h1:
             st.markdown("**ECM twin observer**")
-            observer = st.radio("Observer", ["dual", "joint"], horizontal=True,
-                                format_func=lambda o: "Dual time-scale (per cycle, fast)" if o == "dual"
-                                else "Joint EKF (per sample, slow)")
+            observer = "dual"
             if observer == "dual":
                 use_cap = st.toggle("Use full-discharge capacity measurements", value=False,
                                     help="Off = operando setting: only partial-window voltage and load-step "
@@ -3022,18 +3087,35 @@ def physics_section() -> None:
     ml_pick = c2.selectbox("ML reference model", list(te.ML_MODELS), index=1)
     level = c3.select_slider("Band level", [0.8, 0.9, 0.95], value=0.9, key="cmp_level")
     reuse = c4.toggle("Reuse cached observer run", value=True)
-    d1, d2, d3 = st.columns(3)
-    use_semi = d1.toggle("Semi-empirical power law", value=True,
-                         help="Q_loss = B·Ah^z (Wang et al. 2011) with a cohort prior on z; Monte-Carlo band.")
-    use_pf = d2.toggle("Particle filter (double exponential)", value=True,
-                       help="Saha & Goebel (2009) capacity model; population prior, sequential Bayesian update.")
-    run_pinn = d3.toggle("Hybrid PINN", value=True, help="Switch off for a fast comparison (the PINN takes seconds).")
-    extra = tuple(k for k, on in (("semi", use_semi), ("pf", use_pf)) if on)
+    st.markdown("**Paradigms to compare**")
+    d = st.columns(4)
+    use_semi = d[0].toggle("Semi-empirical law", value=True,
+                           help="SOH = s0[1 − B·Ah^z] (Wang et al. 2011) with a cohort prior on z.")
+    use_hb = d[1].toggle("Hierarchical Bayes", value=True,
+                         help="Partial pooling: the fleet (with temperature and current covariates) is the prior, "
+                              "this battery's data update it.")
+    use_pf = d[2].toggle("Particle filter", value=True,
+                         help="Sequential Monte Carlo on the physics power law with the hierarchical prior.")
+    use_gp = d[3].toggle("Physics-mean GP", value=True,
+                         help="Hierarchical-Bayes trend + Gaussian-process residual.")
+    e_ = st.columns(4)
+    use_ens = e_[0].toggle("Stacked ensemble", value=True,
+                           help="Skill-weighted combination (weights from a backtest on this battery's own history).")
+    run_pinn = e_[1].toggle("Hybrid PINN", value=True, help="Switch off for a fast comparison (the PINN takes seconds).")
+    hc = st.session_state.get("hc")
+    has_modes = bool(hc and hc[0] == cell and len(hc[1][0]))
+    use_modes = e_[2].toggle("Constrain PINN with half-cell modes", value=has_modes, disabled=not has_modes,
+                             help="Uses the LLI / LAM fitted in Data › half-cell OCV fitting (cycles ≤ n₀ only). "
+                                  "Run that fit first for this battery.")
+    extra = tuple(k for k, on in (("semi", use_semi), ("pf", use_pf), ("hb", use_hb), ("gp", use_gp),
+                                  ("ens", use_ens)) if on)
+    mode_targets = hc[1][0] if (use_modes and has_modes) else None
     obs_key = (DATA_KEY, cell, observer, tuple(sorted(asdict(twin_params).items())),
                tuple(sorted(asdict(dual_cfg).items())))
     cmp_cfg = dict(cell=cell, observer=observer, frac=frac2, ml_model=ml_pick, band_level=level,
                    eol_ah=float(eol_ah), twin=asdict(twin_params), dual=asdict(dual_cfg), pinn=asdict(pinn_cfg),
-                   pinn_seeds=list(range(members)), extra=list(extra), run_pinn=run_pinn)
+                   pinn_seeds=list(range(members)), extra=list(extra), run_pinn=run_pinn,
+                   pinn_modes=mode_targets is not None)
 
     if st.button("Run benchmark on this cell", type="primary", key="cmp_go"):
         bar = st.progress(0.0, text="Initialising observer…")
@@ -3044,7 +3126,8 @@ def physics_section() -> None:
             res_new = te.compare_paradigms(raw, ct, imp, cell, frac2, twin_params, pinn_cfg, ml_pick, eol_ah,
                                            ekf=ekf_res, progress=lambda f, m: bar.progress(f, text=m),
                                            observer=observer, dual_cfg=dual_cfg, band_level=level,
-                                           pinn_seeds=tuple(range(members)), extra=extra, run_pinn=run_pinn)
+                                           pinn_seeds=tuple(range(members)), extra=extra, run_pinn=run_pinn,
+                                           mode_targets=mode_targets)
             if res_new.ekf is not None:
                 st.session_state["ekf"] = {"key": obs_key, "res": res_new.ekf}
             st.session_state["cmp"] = {"cfg": cmp_cfg, "res": res_new}
@@ -3106,6 +3189,15 @@ def physics_section() -> None:
             q = pr[te.PF_NAME].params
             lines.append(f"Particle filter: prior from {q['prior_cells']} cohort fits, {q['n_particles']} particles, "
                          f"{q['resampling_steps']} resampling steps")
+        if te.HB_NAME in pr:
+            q = pr[te.HB_NAME].params
+            lines.append(f"Hierarchical Bayes: z = {q['z']:.2f} (fleet prior {q['prior_z']:.2f}); the forecast still "
+                         f"leans {100 * q['prior_weight']:.0f}% on the fleet prior ({q['population_cells']} cells"
+                         f"{', temperature/current covariates' if q['covariates'] else ''})")
+        if te.ENS_NAME in pr:
+            wts = pr[te.ENS_NAME].params["weights"]
+            lines.append("Ensemble weights (backtest skill): " + ", ".join(f"{k.split(' · ')[0]} {v:.2f}"
+                                                                           for k, v in wts.items()))
         if lines:
             card("Prognostic model parameters", lines)
     with b:
@@ -3240,10 +3332,11 @@ def cross_cell_section() -> None:
         sel = c1.multiselect("Cells", pool, default=pool[: min(6, len(pool))], key="bench_cells")
         fracs = c2.multiselect("Origins (fraction of life)", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7], default=[0.3, 0.5],
                                key="bench_fracs")
-        pars = c3.multiselect("Paradigms", list(te.BENCH_PARADIGMS), default=["ML", "Twin", "SemiEmp", "PF"],
+        pars = c3.multiselect("Paradigms", list(te.BENCH_PARADIGMS), default=["ML", "Twin", "HB", "PF"],
                               key="bench_pars", format_func={"ML": "ML surrogate", "Twin": "ECM twin (dual EKF)",
                                                              "PINN": "Hybrid PINN", "SemiEmp": "Semi-empirical",
-                                                             "PF": "Particle filter"}.get,
+                                                             "PF": "Particle filter", "HB": "Hierarchical Bayes",
+                                                             "GP": "Physics-mean GP"}.get,
                               help="The PINN adds ~seconds per cell and origin.")
         cfg = te.BenchmarkConfig(fracs=tuple(sorted(fracs)) or (0.4,), paradigms=tuple(pars) or ("Twin",),
                                  eol_ah=float(eol_ah), pinn_epochs=500, conformal_cells=3)
@@ -3332,9 +3425,39 @@ def update_frequency_section() -> None:
         manifest_button(cfg, "update_frequency", DATA_KEY)
 
 
+def early_life_section() -> None:
+    section("Early-life lifetime prediction from ΔQ(V)")
+    st.markdown("Severson et al. (*Nature Energy* 4, 2019) showed that the variance of ΔQ(V), the change of the "
+                "discharge curve between an early and a slightly later cycle, predicts cycle life long before capacity "
+                "fades visibly. Here the same idea is applied to your cohort, with a leave-one-cell-out elastic net. "
+                "The ΔQ(V) statistics also feed the ML fade-rate models as early-life descriptors.")
+    c1, c2 = st.columns(2)
+    n_a = c1.slider("Reference cycle", 1, 10, 2, key="el_a")
+    n_b = c2.slider("Comparison cycle (early window end)", n_a + 5, 80, max(n_a + 5, 20), key="el_b")
+    el = early_life_cached(ct, DATA_KEY, float(eol_ah), int(n_a), int(n_b))
+    if el["table"].empty:
+        st.info("Not enough cells with this many cycles.")
+        return
+    show(fig_dq_curves(ct, el, P), key="el_dq", data=el["table"])
+    if not el["available"]:
+        st.info("Fewer than five cells reached end of life with usable ΔQ(V): the lifetime regression is not "
+                "available (lower the end-of-life capacity in the control bar to include more cells).")
+        return
+    k = st.columns(4)
+    k[0].metric("Cells with known life", el["n_cells"])
+    k[1].metric("corr(log var ΔQ, log life)", fmt(el["corr_logvar_loglife"], ".2f"))
+    k[2].metric("LOCO lifetime error", fmt(el["mape_pct"], ".1f", "%"))
+    k[3].metric("Cohort-mean baseline", fmt(el["baseline_mape_pct"], ".1f", "%"))
+    show(fig_lifetime_parity(el, P, list(meta.index)), key="el_parity", data=el["loco"])
+    st.caption("NASA cells live 40–200 cycles and the cohort mixes temperatures, currents and cut-offs. The early "
+               "window is therefore much shorter than Severson's (cycle 10 → 100), and the elastic net also sees the "
+               "operating conditions. A strongly negative correlation means ΔQ(V) carries lifetime information.")
+
+
 def view_models() -> None:
     methods_panel()
     ml_section()
+    early_life_section()
     physics_section()
     ablation_section()
     update_frequency_section()
