@@ -43,12 +43,26 @@ from plotly.subplots import make_subplots
 
 import twin_engine as te
 
+# ---- engine / app version handshake -------------------------------------------------------------
+# Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
+# not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
+REQUIRED_ENGINE = "4.9"
+if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
+    import importlib
+    te = importlib.reload(te)
+
 st.set_page_config(
     page_title="Battery Digital Twin · Operando Diagnostics",
     page_icon="🔋",
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
+    st.error(f"**Version mismatch.** This app.py needs twin_engine.py version {REQUIRED_ENGINE}.x, but the file "
+             f"deployed next to it is version {getattr(te, 'ENGINE_VERSION', 'unknown')}. Upload **both** files from "
+             "the same release to the repository (same folder), then reboot the app (Manage app → ⋮ → Reboot).")
+    st.stop()
 
 # =============================================================================
 # Constants & version gates
@@ -2785,7 +2799,8 @@ def view_replay() -> None:
                                  help="Between checks the twin sees only partial-window voltage and load-step "
                                       "resistance. Set 0 to watch pure operando tracking, including its drift.")
     show_models = st.multiselect(
-        "Live models", list(te.LIVE_MODELS), default=["twin", "mech", "pf", "trend", "ens"], key="rp_models",
+        "Live models", list(te.LIVE_MODELS),
+        default=[m for m in ("twin", "mech", "pf", "trend", "ens") if m in te.LIVE_MODELS], key="rp_models",
         format_func=lambda m: te.LIVE_MODELS[m] + (" · experimental, slow" if m == "pinn" else ""),
         help="ECM twin: physics + operando voltage. Particle filter: power law with the fleet prior, robust to knees. "
              "Adaptive trend KF: level-slope-curvature filter that bends quickly when fade accelerates. Hierarchical "
