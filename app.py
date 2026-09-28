@@ -1663,8 +1663,11 @@ def fig_replay(ct_cell: pd.DataFrame, pc: pd.DataFrame, fc: Any, n: int, soh_eol
     return style_fig(fig, P, 520, "Live twin: assimilating one discharge at a time", hovermode="x unified")
 
 
-LIVE_COLORS = {"twin": "#0072B2", "pf": "#E69F00", "trend": "#009E73", "hb": "#CC79A7", "ens": None}
-LIVE_DASH = {"twin": "dash", "pf": "dot", "trend": "dashdot", "hb": "longdash", "ens": "solid"}
+LIVE_COLORS = {"twin": "#0072B2", "mech": "#D55E00", "pinn": "#882255", "pf": "#E69F00", "trend": "#009E73",
+               "hb": "#CC79A7", "ens": None}
+LIVE_DASH = {"twin": "dash", "mech": "solid", "pinn": "dot", "pf": "dot", "trend": "dashdot", "hb": "longdash",
+             "ens": "solid"}
+MECH_COLORS = {"SEI": "#0072B2", "plating": "#56B4E9", "LAM": "#E69F00"}
 
 
 def _live_color(m: str, P: Palette) -> str:
@@ -1716,9 +1719,14 @@ def fig_live_main(ct_cell: pd.DataFrame, pc: pd.DataFrame, fr: Any, n: int, soh_
 
 def fig_live_track(track: pd.DataFrame, n: int, eol_true: Optional[int], P: Palette, n_max: int,
                    show_models: Sequence[str]) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12, row_heights=[0.55, 0.45],
+    has_mech = any(c.startswith("share_") for c in track.columns)
+    nrow = 3 if has_mech else 2
+    fig = make_subplots(rows=nrow, cols=1, shared_xaxes=True, vertical_spacing=0.09,
+                        row_heights=[0.42, 0.29, 0.29] if has_mech else [0.55, 0.45],
                         subplot_titles=("Predicted end-of-life cycle converging as data arrive",
-                                        "Live ensemble weights (recent 5-cycle-ahead skill)"))
+                                        "Live ensemble weights (recent 5-cycle-ahead skill)")
+                        + (("Which mechanism consumes the capacity? (mechanistic PF, share of loss so far)",)
+                           if has_mech else ()))
     _style_subplot_titles(fig, P)
     t = track[track["n"] <= n]
     for m in show_models:
@@ -1732,17 +1740,26 @@ def fig_live_track(track: pd.DataFrame, n: int, eol_true: Optional[int], P: Pale
     if eol_true is not None:
         fig.add_hline(y=eol_true, line_dash="dash", line_color=P.eol, row=1, col=1,
                       annotation_text=f"actual EOL n = {eol_true}", annotation_font=dict(color=P.eol))
-    for m in [m for m in ("twin", "pf", "trend", "hb") if f"w_{m}" in t]:
+    if has_mech:
+        for k_ in te.MECH_NAMES:
+            c = f"share_{k_}"
+            if c in t:
+                fig.add_trace(go.Scatter(x=t["n"], y=t[c], mode="lines", stackgroup="mech", name=f"{k_} share",
+                                         line=dict(color=MECH_COLORS[k_], width=0.8),
+                                         fillcolor=rgba(MECH_COLORS[k_], 0.65),
+                                         hovertemplate="%{y:.0%}<extra>" + k_ + "</extra>"), row=3, col=1)
+        fig.update_yaxes(title_text="share", range=[0, 1], tickformat=".0%", row=3, col=1)
+    for m in [m for m in ("twin", "mech", "pinn", "pf", "trend", "hb") if f"w_{m}" in t]:
         fig.add_trace(go.Scatter(x=t["n"], y=t[f"w_{m}"], mode="lines", stackgroup="w", name=f"weight · {te.LIVE_MODELS[m]}",
                                  legendgroup=m, showlegend=False, line=dict(color=_live_color(m, P), width=0.8),
                                  fillcolor=rgba(_live_color(m, P), 0.6),
                                  hovertemplate="%{y:.2f}<extra>" + html.escape(te.LIVE_MODELS[m]) + "</extra>"),
                       row=2, col=1)
     fig.update_xaxes(range=[0, n_max])
-    fig.update_xaxes(title_text="Discharge cycle n (data assimilated so far)", row=2, col=1)
+    fig.update_xaxes(title_text="Discharge cycle n (data assimilated so far)", row=nrow, col=1)
     fig.update_yaxes(title_text="EOL cycle", row=1, col=1)
     fig.update_yaxes(title_text="weight", range=[0, 1], row=2, col=1)
-    return style_fig(fig, P, 680, None)
+    return style_fig(fig, P, 880 if has_mech else 680, None)
 
 
 def fig_replay_track(track: pd.DataFrame, pc: pd.DataFrame, n: int, rul_true: Optional[int], P: Palette,
@@ -1990,9 +2007,9 @@ def replay_cached(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.D
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def live_cached(_ekf: te.EKFResult, _ct: pd.DataFrame, key: str, cell: str, soh_eol: float, level: float,
-                cap_every: int, models: Tuple[str, ...]) -> Tuple[Dict[int, Any], pd.DataFrame]:
-    return te.live_multi_model(_ct, cell, _ekf, soh_eol, level, models)
+def live_cached(_ekf: te.EKFResult, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str,
+                soh_eol: float, level: float, cap_every: int, models: Tuple[str, ...]) -> Tuple[Dict[int, Any], pd.DataFrame]:
+    return te.live_multi_model(_ct, cell, _ekf, soh_eol, level, models, imp=_imp)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -2768,16 +2785,20 @@ def view_replay() -> None:
                                  help="Between checks the twin sees only partial-window voltage and load-step "
                                       "resistance. Set 0 to watch pure operando tracking, including its drift.")
     show_models = st.multiselect(
-        "Live models", list(te.LIVE_MODELS), default=["twin", "pf", "trend", "ens"], key="rp_models",
-        format_func=te.LIVE_MODELS.get,
+        "Live models", list(te.LIVE_MODELS), default=["twin", "mech", "pf", "trend", "ens"], key="rp_models",
+        format_func=lambda m: te.LIVE_MODELS[m] + (" · experimental, slow" if m == "pinn" else ""),
         help="ECM twin: physics + operando voltage. Particle filter: power law with the fleet prior, robust to knees. "
              "Adaptive trend KF: level-slope-curvature filter that bends quickly when fade accelerates. Hierarchical "
-             "Bayes: fleet-informed power law. Live ensemble: weights every model by its recent 5-cycle-ahead error.")
+             "Bayes: fleet-informed power law. Mechanistic PF: SEI, lithium-plating and LAM kinetics driven by each "
+             "cycle's measured temperature and current, so the operating conditions decide which mechanism grows. "
+             "Mechanistic PINN: the same equations in a physics-informed network, retrained every 25 cycles "
+             "(adds ~15 s). Live ensemble: weights every model by its recent 5-cycle-ahead error.")
     with st.spinner("Streaming the battery through all models (runs once, then animates)…"):
         res, _track_old = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol),
                                         level, int(cap_every))
-        frames, track = live_cached(res, ct, DATA_KEY, cell, float(soh_eol), level, int(cap_every),
-                                    ("twin", "pf", "trend", "hb"))
+        st.session_state["ekf"] = {"key": (DATA_KEY, cell, "live"), "res": res}     # feeds Operations initialisation
+        run_models = ("twin", "mech", "pf", "trend", "hb") + (("pinn",) if "pinn" in show_models else ())
+        frames, track = live_cached(res, ct, imp, DATA_KEY, cell, float(soh_eol), level, int(cap_every), run_models)
     pc = res.per_cycle
     ns = pc["n"].astype(int).tolist()
     if len(ns) < 6:
@@ -2832,8 +2853,15 @@ def view_replay() -> None:
                            and np.isfinite(ens_rul[2]) else None), delta_color="off")
         k[4].metric("Most trusted now", te.LIVE_MODELS[lead].split(" · ")[0] if lead else "—",
                     delta=f"weight {fr.weights[lead]:.2f}" if lead else None, delta_color="off")
-        k[5].metric("Personal k / prior", f"{row['k_ah'] / res.params.get('k_prior', row['k_ah']):.2f}×",
-                    help="The twin's own degradation rate relative to the fleet prior (Sage–Husa adaptive).")
+        sh = fr.mech_shares if fr is not None else None
+        if sh:
+            dom = max(sh, key=sh.get)
+            k[5].metric("Dominant mechanism", dom, delta=f"{100 * sh[dom]:.0f}% of the loss so far", delta_color="off",
+                        help="Mechanistic PF: share of the capacity lost so far owed to SEI growth, lithium plating "
+                             "and loss of active material, driven by the measured temperature and current.")
+        else:
+            k[5].metric("Personal k / prior", f"{row['k_ah'] / res.params.get('k_prior', row['k_ah']):.2f}×",
+                        help="The twin's own degradation rate relative to the fleet prior (Sage–Husa adaptive).")
         st.progress(min(1.0, (n - ns[0]) / max(ns[-1] - ns[0], 1)),
                     text=f"{'▶ streaming' if st.session_state.get(key_p) else '⏸ paused'} · "
                          f"{len(good[good['n'] <= n])} discharges assimilated")
@@ -2860,6 +2888,28 @@ def view_replay() -> None:
             frame()
     else:
         frame()
+    with st.expander("Mechanistic model: governing equations", icon=":material/functions:"):
+        st.markdown("The mechanistic particle filter integrates the degradation kinetics cycle by cycle with the "
+                    "**measured** cell temperature T and current I, so the operating conditions decide which mechanism "
+                    "grows: Arrhenius acceleration of SEI growth when hot, the cold gate of lithium plating below "
+                    "~10 °C, the C-rate power of LAM under high current. Rate constants and latent losses are "
+                    "estimated jointly by a particle filter from the measured capacity.")
+        st.latex(r"\mathrm{SOH} = s_0 - Q_\mathrm{SEI} - Q_\mathrm{pl} - Q_\mathrm{LAM}")
+        st.latex(r"\Delta Q_\mathrm{SEI} = k_\mathrm{SEI}\,e^{\frac{E_\mathrm{SEI}}{R}\left(\frac{1}{T_\mathrm{ref}}"
+                 r"-\frac{1}{T}\right)}\,\frac{2\,\mathrm{SOH}}{1 + Q_\mathrm{SEI}/\delta}")
+        st.latex(r"\Delta Q_\mathrm{pl} = k_\mathrm{pl}\,e^{\frac{E_\mathrm{pl}}{R}\left(\frac{1}{T}-\frac{1}"
+                 r"{T_\mathrm{ref}}\right)}\,\frac{I_\mathrm{ch}}{C_0}\left[\frac{1}{1+e^{(T-T_\mathrm{onset})/3}}"
+                 r" + \kappa\,\frac{Q_\mathrm{LAM}}{0.05}\right]")
+        st.latex(r"\Delta Q_\mathrm{LAM} = k_\mathrm{LAM}\,e^{\frac{E_\mathrm{LAM}}{R}\left(\frac{1}{T_\mathrm{ref}}"
+                 r"-\frac{1}{T}\right)}\left(\frac{I}{C_0}\right)^{\beta} 2\,\mathrm{SOH}\left(1 + "
+                 r"\frac{Q_\mathrm{LAM}}{\varepsilon}\right)")
+        st.caption("Priors: E_SEI = 30, E_pl = 50, E_LAM = 20 kJ/mol; rate constants log-normal around literature-scale "
+                   "values. The attributed shares are model-based: validate them against the half-cell LLI / LAM in "
+                   "Diagnostics (plating and SEI are LLI, LAM is LAM).")
+    pinn_equations_panel()
+    methods_panel()
+    ablation_section()
+    update_frequency_section()
     st.caption("Harsh operation (cold plating, knees, high temperature) breaks any single physics law. The live "
                "ensemble moves its weight, cycle by cycle, to the models that are currently predicting well: watch "
                "the weight panel shift when the fade accelerates. "
@@ -3769,7 +3819,8 @@ def cross_cell_section() -> None:
         sel = c1.multiselect("Cells", pool, default=pool[: min(6, len(pool))], key="bench_cells")
         fracs = c2.multiselect("Origins (fraction of life)", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7], default=[0.3, 0.5],
                                key="bench_fracs")
-        pars = c3.multiselect("Paradigms", list(te.BENCH_PARADIGMS), default=["ML", "Twin", "HB", "PF"],
+        pars = c3.multiselect("Paradigms", [p_ for p_ in te.BENCH_PARADIGMS if p_ != "PINN"],
+                              default=["ML", "Twin", "HB", "PF"],
                               key="bench_pars", format_func={"ML": "ML surrogate", "Twin": "ECM twin (dual EKF)",
                                                              "PINN": "Hybrid PINN", "SemiEmp": "Semi-empirical",
                                                              "PF": "Particle filter", "HB": "Hierarchical Bayes",
@@ -3891,13 +3942,27 @@ def early_life_section() -> None:
                "operating conditions. A strongly negative correlation means ΔQ(V) carries lifetime information.")
 
 
+def ml_methods_panel() -> None:
+    with st.expander("Methods: machine-learning models", icon=":material/menu_book:"):
+        st.markdown("**Fade-rate forecasting.** A regressor learns the degradation rate as a function of the current "
+                    "state, the operating conditions and early-life descriptors, and is integrated forward from the "
+                    "forecast origin, so tree models keep extrapolating beyond the longest training life:")
+        st.latex(r"\frac{d\,\mathrm{SOH}}{dn} = g_\phi\!\left(\mathrm{SOH},\ T,\ I,\ V_\mathrm{cut},\ "
+                 r"\text{early slope},\ \text{early } R \text{ growth},\ \log\operatorname{var}\Delta Q(V)\right) \le 0")
+        st.markdown("**Uncertainty.** Split-conformal bands calibrated on the batteries closest in operating conditions, "
+                    "widening with the forecast horizon. **Estimation.** Present SOH from operando indicators measured on "
+                    "the same cycle, with random, chronological or by-battery splits. **Tuning.** Random search validated "
+                    "by forecast backtests on other batteries (forecasting) or grouped cross-validation by battery "
+                    "(estimation). **Early life.** Elastic net on ΔQ(V) statistics (Severson et al. 2019).")
+        st.markdown("**Scores.** Accuracy = 100 × (1 − MAPE); fade skill = 1 − SSE / SSE of a 'no further fade' "
+                    "forecast; R², RMSE and MAE on held-out cycles; RUL error and α-λ accuracy (Saxena et al. 2010). "
+                    "Physics-based and mechanistic models (twin, particle filters, PINN) live in the Live twin view.")
+
+
 def view_models() -> None:
-    methods_panel()
+    ml_methods_panel()
     ml_section()
     early_life_section()
-    physics_section()
-    ablation_section()
-    update_frequency_section()
     cross_cell_section()
 
 
@@ -3941,7 +4006,7 @@ def view_ops() -> None:
         seed = e4.number_input("Mismatch draw (seed)", 0, 999, 0, 1, disabled=mismatch == 0)
         ekf_saved = st.session_state.get("ekf")
         use_twin = st.toggle("Initialise the model from the latest observer run", value=False,
-                             disabled=ekf_saved is None, help="Available after a benchmark run in the Models view.")
+                             disabled=ekf_saved is None, help="Available after opening the Live twin for a battery.")
         show_base = st.toggle("Overlay fixed-current baselines", value=True)
 
     econ = te.Economics(price_per_Ah=tuple(price), replacement_cost=float(replacement), soh_eol=float(soh_eol_ops),

@@ -721,6 +721,33 @@ def test_live_accuracy_tables():
     assert late["EOL error (cycles)"].isna().all()
 
 
+def test_mechanistic_particle_filter_follows_operating_conditions():
+    m, imp, _ = te.make_synthetic_master(n_cells=6, n_cycles=110, ambients=(24, 4, 43, 4, 24, 43),
+                                         currents=(2.0, 2.0, 2.0, 2.0, 4.0, 4.0), seed=0, noise_v=0.01)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    shares = {}
+    for cell in ("S001", "S002", "S006"):
+        g = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]]
+        soh_eol = te.soh_eol_for(float(g["C_bol_Ah"].iloc[0]), 1.6)
+        frames, track = te.live_multi_model(ct, cell, None, soh_eol, models=("mech", "trend"))
+        last = frames[max(frames)]
+        assert "mech" in last.forecasts and last.mech_shares is not None
+        assert abs(sum(last.mech_shares.values()) - 1) < 1e-9
+        assert {"share_SEI", "share_plating", "share_LAM"} <= set(track.columns)
+        shares[cell] = last.mech_shares
+        errs = [np.sqrt(np.mean((np.interp(g[(g["n"] > n0) & (g["n"] <= n0 + 20)]["n"], fr.n_grid, fr.forecasts["mech"][0])
+                                 - g[(g["n"] > n0) & (g["n"] <= n0 + 20)]["SOH"]) ** 2))
+                for n0, fr in frames.items() if 40 <= n0 <= g["n"].max() - 20 and n0 % 10 == 0]
+        assert np.mean(errs) < 0.03
+    assert shares["S002"]["plating"] > shares["S001"]["plating"] + 0.2          # cold cell: plating dominates
+    assert shares["S002"]["plating"] > 0.4
+    s = te.MechanisticStream(2.0, 1.0, n_particles=200)
+    s.step(4.0, 2.0, 0.998)
+    paths, mech = s.forecast(10, 4.0, 2.0, n_samples=50)
+    assert paths.shape == (50, 10) and mech.shape == (10, 3) and (np.diff(mech, axis=0) >= -1e-12).all()
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

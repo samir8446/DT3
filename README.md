@@ -1,4 +1,4 @@
-# Battery digital twin & operando diagnostics (v4.8)
+# Battery digital twin & operando diagnostics (v4.9)
 
 ```bash
 pip install -r requirements.txt
@@ -10,9 +10,21 @@ docker build -t battery-twin . && docker run -p 8501:8501 -v twin-data:/data bat
 ```
 
 Files: `twin_engine.py` (all computation, no UI), `app.py` (Streamlit views), `benchmark.py`
-(offline sweep → results file the app can load), `tests/` (54 tests incl. gradient checks and
+(offline sweep → results file the app can load), `tests/` (56 tests incl. gradient checks and
 synthetic-truth recovery). Set `TWIN_CACHE_DIR` to persist downloads and uploads; `GIT_COMMIT`
 is recorded in run manifests.
+
+## New in v4.9: mechanism-aware live twin
+
+- Mechanistic particle filter (`MechanisticStream`): SEI growth, lithium plating and loss of active material
+  integrated cycle by cycle with the *measured* temperature and current, so operating conditions decide which
+  mechanism grows (Arrhenius SEI when hot, cold-gated plating, C-rate LAM). Rate constants and latent losses
+  are estimated jointly; the Live twin shows the mechanism shares live and the dominant mechanism.
+  Synthetic harsh cells: 20-cycle RMSE 0.003 at 4 °C, 0.004 at 4 A, 0.008 at 43 °C + 4 A (twin: 0.005 /
+  0.009 / 0.060).
+- Optional live mechanistic PINN, retrained every 25 cycles (experimental, slow).
+- Models view is machine learning only (workbench, early-life ΔQ(V), cross-cell benchmark). The PINN, the
+  physics equations, the measurement ablation and the update-frequency study moved to the Live twin.
 
 ## New in v4.8: live multi-model twin
 

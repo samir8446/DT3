@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "4.8.1"
+ENGINE_VERSION = "4.9.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -5701,8 +5701,9 @@ def tune_soh_estimator(ct: pd.DataFrame, imp: Optional[pd.DataFrame], model_name
 # =============================================================================
 # 25. LIVE MULTI-MODEL TWIN: streamed particle filter, trend Kalman filter, HB, online weights
 # =============================================================================
-LIVE_MODELS = {"twin": "ECM twin · dual EKF", "pf": "Particle filter · power law", "trend": "Adaptive trend KF",
-               "hb": "Hierarchical Bayes", "ens": "Live ensemble"}
+LIVE_MODELS = {"twin": "ECM twin · dual EKF", "mech": "Mechanistic PF (SEI · plating · LAM)",
+               "pinn": "Mechanistic PINN (periodic refit)", "pf": "Particle filter · power law",
+               "trend": "Adaptive trend KF", "hb": "Hierarchical Bayes", "ens": "Live ensemble"}
 
 
 @dataclass
@@ -5712,6 +5713,8 @@ class LiveFrame:
     forecasts: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]   # model -> (median, lo, hi) on n_grid
     rul: Dict[str, Tuple[float, float, float]]       # model -> (median, 5 %, 95 %) cycles to EOL from n (nan = beyond)
     weights: Dict[str, float]
+    mech_shares: Optional[Dict[str, float]] = None   # mechanistic PF: share of the loss so far per mechanism
+    mech_future: Optional[np.ndarray] = None         # mechanistic PF: mean future losses [n_future, 3]
 
 
 def _q_summary(paths: np.ndarray, level: float, soh_eol: float) -> Tuple[Tuple[np.ndarray, ...], Tuple[float, ...]]:
@@ -5758,9 +5761,11 @@ def _trend_kf_paths(y: np.ndarray, n_future: int, n_samples: int, rng: np.random
 
 
 def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], soh_eol: float, level: float = 0.9,
-                     models: Sequence[str] = ("twin", "pf", "trend", "hb"), horizon_factor: float = 1.4,
+                     models: Sequence[str] = ("twin", "mech", "pf", "trend", "hb"), horizon_factor: float = 1.4,
                      n_particles: int = 2000, h_eval: int = 5, forget: float = 0.85, hb_stride: int = 2,
-                     seed: int = 0, progress: ProgressFn = None) -> Tuple[Dict[int, LiveFrame], pd.DataFrame]:
+                     seed: int = 0, progress: ProgressFn = None, imp: Optional[pd.DataFrame] = None,
+                     pinn_every: int = 25, pinn_epochs: int = 600,
+                     mech_prior: Optional[MechPrior] = None) -> Tuple[Dict[int, LiveFrame], pd.DataFrame]:
     """Stream one battery's life through several models at once. At every discharge n each model
     assimilates only data up to n and forecasts the rest of life; each model is then scored on how
     well it predicted cycle n from cycle n - h_eval (exponentially forgotten squared error), and the
@@ -5788,6 +5793,11 @@ def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], s
         parts[:, 2] = np.clip(parts[:, 2], 0.3, 3.0)
         logw = np.zeros(n_particles)
     hb_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    T_cyc = good["T_mean_C"].astype(float).ffill().bfill().to_numpy() if "T_mean_C" in good else np.full(len(ns), 25.0)
+    I_cyc = good["I_dis_A"].astype(float).ffill().bfill().to_numpy() if "I_dis_A" in good else np.full(len(ns), 2.0)
+    c_bol = float(good["C_bol_Ah"].iloc[0]) if "C_bol_Ah" in good else 2.0
+    mech = MechanisticStream(c_bol, float(np.median(y[:3])), mech_prior, seed=seed + 11) if "mech" in models else None
+    pinn_cache: Optional[Tuple[int, np.ndarray, np.ndarray, float]] = None     # (fit n, grid, soh, resid sd)
     L_prior = np.linalg.cholesky(np.linalg.inv(Sg))
     frames: Dict[int, LiveFrame] = {}
     sq_err = {m: None for m in list(models) + ["ens"]}
@@ -5809,6 +5819,8 @@ def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], s
                 parts = parts[idx] + rng.standard_normal(parts.shape) * np.array([0.002, 0.05, 0.02])
                 parts[:, 2] = np.clip(parts[:, 2], 0.3, 3.0)
                 logw = np.zeros(n_particles)
+        if mech is not None:
+            mech.step(float(T_cyc[i]), float(I_cyc[i]), float(y[i]))
         if i < 5:
             continue
         fut = np.arange(n + 1, n_max + 1)
@@ -5836,6 +5848,29 @@ def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], s
             post = parts[rng.choice(n_particles, size=400, p=w)]
             paths = _pl_soh(post, ah_f) + 0.5 * sig_obs * rng.standard_normal((len(post), 1))
             fc["pf"], rul["pf"] = _q_summary(paths, level, soh_eol)
+        shares, mech_future = None, None
+        if mech is not None:
+            T_plan = float(np.median(T_cyc[max(0, i - 9):i + 1]))
+            I_plan = float(np.median(I_cyc[max(0, i - 9):i + 1]))
+            paths, mech_future = mech.forecast(len(fut), T_plan, I_plan)
+            fc["mech"], rul["mech"] = _q_summary(paths, level, soh_eol)
+            shares = dict(zip(MECH_NAMES, mech.shares().tolist()))
+        if "pinn" in names and i >= 15:
+            if pinn_cache is None or (i - pinn_cache[0]) >= pinn_every:
+                try:
+                    pr_ = train_pinn(ct, imp, cell_id, int(n), PINNConfig(epochs=pinn_epochs, physics="mechanistic"),
+                                     DEFAULT_EOL_AH)
+                    res_sd = float(np.std(np.interp(ns[:i + 1], pr_.n_grid, pr_.soh) - y[:i + 1]))
+                    pinn_cache = (i, pr_.n_grid, pr_.soh, max(res_sd, 0.004))
+                except Exception:
+                    pass
+            if pinn_cache is not None and pinn_cache[1].max() >= fut[0]:
+                med = np.interp(fut, pinn_cache[1], pinn_cache[2])
+                grow = pinn_cache[3] * np.sqrt(1 + (fut - n) / 20.0)
+                fc["pinn"] = (med, med - 1.645 * grow, med + 1.645 * grow)
+                cross = np.nonzero(med < soh_eol)[0]
+                r_ = float(fut[cross[0]] - n) if len(cross) else float("nan")
+                rul["pinn"] = (r_, r_, r_)
         if "trend" in names:
             paths = _trend_kf_paths(y[:i + 1], len(fut), 400, rng)
             fc["trend"], rul["trend"] = _q_summary(paths, level, soh_eol)
@@ -5880,8 +5915,10 @@ def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], s
             rul["ens"] = (float(fut[cross[0]] - n) if len(cross) else float("nan"),
                           float(fut[lo_c[0]] - n) if len(lo_c) else float("nan"),
                           float(fut[hi_c[0]] - n) if len(hi_c) else float("nan"))
-        frames[int(n)] = LiveFrame(int(n), fut, fc, rul, wts)
-        row = {"n": int(n), "soh": float(y[i])}
+        frames[int(n)] = LiveFrame(int(n), fut, fc, rul, wts, shares, mech_future)
+        row = {"n": int(n), "soh": float(y[i]), "T_C": float(T_cyc[i]), "I_A": float(I_cyc[i])}
+        if shares:
+            row.update({f"share_{k}": v for k, v in shares.items()})
         for m in fc:
             row[f"eol_{m}"] = n + rul.get(m, (np.nan,))[0] if m in rul else np.nan
             row[f"w_{m}"] = wts.get(m, np.nan)
@@ -5938,3 +5975,111 @@ def live_forecast_accuracy(frame: "LiveFrame", good: pd.DataFrame, soh_eol: Opti
                      "Predicted EOL": frame.n + r if np.isfinite(r) else float("nan"), "EOL error (cycles)": rul_err,
                      "Cycles scored": int(len(sel))})
     return pd.DataFrame(rows).sort_values("RMSE") if rows else pd.DataFrame()
+
+
+# =============================================================================
+# 26. MECHANISTIC PARTICLE FILTER: SEI + LITHIUM PLATING + LAM, driven by operating conditions
+# =============================================================================
+MECH_PF_NAME = "Mechanistic PF (SEI · plating · LAM)"
+MECH_NAMES = ("SEI", "plating", "LAM")
+
+
+@dataclass
+class MechPrior:
+    """Log-normal priors of the mechanism rate constants (per cycle, at T_ref and 1C) and shapes.
+    The *operating conditions* then decide which mechanism dominates through the kinetic laws:
+    Arrhenius acceleration of SEI growth when hot, the cold gate and inverse-Arrhenius factor of
+    plating when cold, the C-rate power of LAM under high current."""
+    k_sei: float = 4e-4
+    k_pl: float = 2e-5
+    k_lam: float = 1e-4
+    log_sd: float = 1.2
+    Ea_sei: float = 30e3
+    Ea_pl: float = 50e3
+    Ea_lam: float = 20e3
+    beta_lam: float = 1.0
+    T_ref_C: float = 25.0
+    T_onset_C: float = 10.0
+    I_charge_A: float = 1.5
+
+
+def _mech_rates(theta: np.ndarray, Q: np.ndarray, soh: np.ndarray, T_C: float, I_A: float, c_bol: float,
+                pr: MechPrior) -> np.ndarray:
+    """Per-cycle increments dQ = (dQ_SEI, dQ_pl, dQ_LAM) for every particle.
+    theta columns: log k_SEI, log k_pl, log k_LAM, log delta, log eps, log kappa; Q columns: Q_SEI, Q_pl, Q_LAM."""
+    T = T_C + 273.15
+    Tr = pr.T_ref_C + 273.15
+    arr = lambda Ea: math.exp(Ea / R_GAS * (1 / Tr - 1 / T))
+    thr = 2.0 * np.clip(soh, 0.05, 1.2)                                   # Ah throughput / C_bol this cycle
+    k_s, k_p, k_l = np.exp(theta[:, 0]), np.exp(theta[:, 1]), np.exp(theta[:, 2])
+    delta, eps, kappa = np.exp(theta[:, 3]), np.exp(theta[:, 4]), np.exp(theta[:, 5])
+    d_sei = k_s * arr(pr.Ea_sei) * thr / (1 + Q[:, 0] / delta)
+    gate = 1.0 / (1.0 + math.exp((T_C - pr.T_onset_C) / 3.0))
+    cold = math.exp(pr.Ea_pl / R_GAS * (1 / T - 1 / Tr))
+    d_pl = k_p * cold * (pr.I_charge_A / c_bol) * (gate + kappa * Q[:, 2] / 0.05)
+    d_lam = k_l * arr(pr.Ea_lam) * (max(I_A, 0.05) / c_bol) ** pr.beta_lam * thr * (1 + Q[:, 2] / eps)
+    return np.column_stack([d_sei, d_pl, d_lam])
+
+
+class MechanisticStream:
+    """State-parameter particle filter on the mechanism ODEs. Each particle carries the rate constants
+    and its own latent losses (Q_SEI, Q_pl, Q_LAM); every discharge the particles are propagated with
+    the *measured* cell temperature and current of that cycle, then re-weighted by the measured SOH
+    (Student-t likelihood), with systematic resampling and parameter roughening."""
+
+    def __init__(self, c_bol: float, soh0: float, prior: Optional[MechPrior] = None, n_particles: int = 3000,
+                 sigma_obs: float = 0.008, seed: int = 0):
+        self.pr = prior or MechPrior()
+        self.c_bol, self.sig, self.N = c_bol, sigma_obs, n_particles
+        self.rng = np.random.default_rng(seed)
+        pr = self.pr
+        mu = np.log([pr.k_sei, pr.k_pl, pr.k_lam, 0.05, 0.05, 1.0])
+        sd = np.array([pr.log_sd, pr.log_sd * 1.5, pr.log_sd, 0.8, 0.8, 0.8])
+        self.theta = mu + sd * self.rng.standard_normal((n_particles, 6))
+        self.Q = np.zeros((n_particles, 3))
+        self.s0 = soh0 + 0.01 * self.rng.standard_normal(n_particles)
+        self.logw = np.zeros(n_particles)
+        self.resamples = 0
+
+    def soh(self) -> np.ndarray:
+        return self.s0 - self.Q.sum(axis=1)
+
+    def step(self, T_C: float, I_A: float, y: Optional[float]) -> None:
+        self.Q = self.Q + _mech_rates(self.theta, self.Q, self.soh(), T_C, I_A, self.c_bol, self.pr)
+        if y is None or not np.isfinite(y):
+            return
+        r = (y - self.soh()) / self.sig
+        self.logw += -2.5 * np.log1p(r ** 2 / 4.0)
+        self.logw -= self.logw.max()
+        w = np.exp(self.logw)
+        w /= w.sum()
+        if 1.0 / np.sum(w ** 2) < self.N / 2:
+            pos = (self.rng.random() + np.arange(self.N)) / self.N
+            idx = np.minimum(np.searchsorted(np.cumsum(w), pos), self.N - 1)
+            self.theta = self.theta[idx] + 0.04 * self.rng.standard_normal(self.theta.shape)
+            self.Q, self.s0 = self.Q[idx], self.s0[idx] + 0.001 * self.rng.standard_normal(self.N)
+            self.logw = np.zeros(self.N)
+            self.resamples += 1
+
+    def weights(self) -> np.ndarray:
+        w = np.exp(self.logw - self.logw.max())
+        return w / w.sum()
+
+    def shares(self) -> np.ndarray:
+        """Posterior-mean share of the capacity lost so far owed to SEI / plating / LAM."""
+        Qm = self.weights() @ self.Q
+        return Qm / max(Qm.sum(), 1e-12)
+
+    def forecast(self, n_future: int, T_C: float, I_A: float, n_samples: int = 400) -> Tuple[np.ndarray, np.ndarray]:
+        """Integrate the mechanism ODEs forward under the planned conditions (T, I) for n_future cycles.
+        Returns (SOH paths [n_samples, n_future], mean per-mechanism losses [n_future, 3])."""
+        idx = self.rng.choice(self.N, size=n_samples, p=self.weights())
+        th, Q, s0 = self.theta[idx], self.Q[idx].copy(), self.s0[idx]
+        paths = np.empty((n_samples, n_future))
+        mech = np.empty((n_future, 3))
+        for h in range(n_future):
+            Q = Q + _mech_rates(th, Q, s0 - Q.sum(axis=1), T_C, I_A, self.c_bol, self.pr)
+            paths[:, h] = s0 - Q.sum(axis=1)
+            mech[h] = Q.mean(axis=0)
+        paths += 0.5 * self.sig * self.rng.standard_normal((n_samples, 1))
+        return paths, mech
