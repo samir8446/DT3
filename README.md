@@ -1,4 +1,4 @@
-# Battery digital twin & operando diagnostics (v4.6)
+# Battery digital twin & operando diagnostics (v4.7)
 
 ```bash
 pip install -r requirements.txt
@@ -10,9 +10,19 @@ docker build -t battery-twin . && docker run -p 8501:8501 -v twin-data:/data bat
 ```
 
 Files: `twin_engine.py` (all computation, no UI), `app.py` (Streamlit views), `benchmark.py`
-(offline sweep → results file the app can load), `tests/` (50 tests incl. gradient checks and
+(offline sweep → results file the app can load), `tests/` (52 tests incl. gradient checks and
 synthetic-truth recovery). Set `TWIN_CACHE_DIR` to persist downloads and uploads; `GIT_COMMIT`
 is recorded in run manifests.
+
+## New in v4.7
+
+- Twin accuracy: voltage-model errors treated as correlated (effective independent samples, default 3) and an
+  adaptive EKF that re-opens to the data under persistent mismatch; optional periodic reference capacity checks
+  (app default: every 10 cycles). On noisy synthetic data: SOH bias 0.019 -> 0.004, ±2σ coverage 25 % -> 86 %.
+- Automatic hyperparameter tuning (random search). Forecast task: validated by forecast backtests on the
+  nearest-condition *other* batteries; estimation task: grouped CV by battery inside the training split.
+  Robust score mean + 0.5 SD; defaults always a candidate. MLP now has small-data defaults and early stopping.
+- Cohort plot: one figure per ambient temperature with its own legend; data gaps shown as gaps.
 
 ## Diagnostics (first view)
 

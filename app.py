@@ -688,6 +688,52 @@ def fig_cohort_grid(ct_all: pd.DataFrame, meta: pd.DataFrame, cell_id: Any, P: P
                      hovermode="closest")
 
 
+def _break_gaps(x: np.ndarray, y: np.ndarray, factor: float = 5.0, min_gap: float = 8.0) -> Tuple[List, List]:
+    """Insert None where consecutive cycles are far apart, so missing data are shown as gaps
+    instead of long straight lines."""
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    if len(x) < 3:
+        return list(x), list(y)
+    dx = np.diff(x)
+    step = float(np.median(dx)) if len(dx) else 1.0
+    xs, ys = [x[0]], [y[0]]
+    for i in range(1, len(x)):
+        if dx[i - 1] > max(factor * step, min_gap):
+            xs.append(None)
+            ys.append(None)
+        xs.append(x[i])
+        ys.append(y[i])
+    return xs, ys
+
+
+def fig_cohort_group(ct_all: pd.DataFrame, meta: pd.DataFrame, group_cells: Sequence[str], highlight: Sequence[str],
+                     P: Palette, title: str, normalise_x: bool = False) -> go.Figure:
+    """One ambient-temperature group with its own legend (one entry per battery)."""
+    good = ct_all[~ct_all["outlier"]]
+    allc = list(meta.index)
+    fig = go.Figure()
+    for cid in sorted(group_cells):
+        d = good[good["Cell_ID"] == cid].sort_values("n")
+        if d.empty:
+            continue
+        col, sym = cell_style(cid, allc)
+        is_t = cid in highlight
+        x = (d["n"] / d["n"].max()).to_numpy() if normalise_x else d["n"].to_numpy()
+        xs, ys = _break_gaps(d["n"].to_numpy(), d["SOH"].to_numpy())
+        if normalise_x:
+            nmax = float(d["n"].max())
+            xs = [v / nmax if v is not None else None for v in xs]
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines+markers", name=cell_label(cid, meta) + ("  ★" if is_t else ""),
+            line=dict(color=col, width=3.6 if is_t else 1.8), connectgaps=False,
+            marker=dict(symbol=sym, size=7 if is_t else 5, maxdisplayed=16, line=dict(color=P.plot_bg, width=0.5)),
+            opacity=1.0 if (is_t or not highlight) else 0.75,
+            hovertemplate=f"<b>{cid}</b> n=%{{x}}: SOH %{{y:.3f}}<extra></extra>"))
+    fig.update_xaxes(title_text="Fraction of recorded life" if normalise_x else "Discharge cycle n")
+    fig.update_yaxes(title_text="SOH (–)")
+    return style_fig(fig, P, 470, title, hovermode="closest")
+
+
 TRACE_MODES = ("Single cycle", "Choose cycles", "Every k-th cycle", "Range of cycles", "All cycles")
 
 
@@ -1846,8 +1892,8 @@ def pooled_ea_cached(_ct: pd.DataFrame, key: str, min_ambient: float) -> Dict[st
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def replay_cached(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str,
-                  soh_eol: float, level: float) -> Tuple[te.EKFResult, pd.DataFrame]:
-    r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(), None)
+                  soh_eol: float, level: float, cap_every: int = 10) -> Tuple[te.EKFResult, pd.DataFrame]:
+    r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(), te.DualTwinConfig(capacity_every=cap_every))
     n_max = int(r.per_cycle["n"].max() * 1.6)
     rows = []
     for n in r.per_cycle["n"].astype(int):
@@ -2582,8 +2628,13 @@ def view_replay() -> None:
                 "cycle, updates SOH, resistances and the personal degradation rate *k*, and re-forecasts the "
                 "remaining life. Nothing after the cursor is visible to the twin.")
     level = 0.9
+    cap_every = st.select_slider("Reference capacity check every N cycles (0 = operando only)", [0, 5, 10, 20, 50],
+                                 value=10, key="rp_cap",
+                                 help="Between checks the twin sees only partial-window voltage and load-step "
+                                      "resistance. Set 0 to watch pure operando tracking, including its drift.")
     with st.spinner("Preparing the replay (runs the twin once, then animates)…"):
-        res, track = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol), level)
+        res, track = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol), level,
+                                   int(cap_every))
     pc = res.per_cycle
     ns = pc["n"].astype(int).tolist()
     if len(ns) < 6:
@@ -2761,9 +2812,16 @@ def view_data() -> None:
     norm_x = st.toggle("Normalise x to fraction of recorded life", value=False, key="grid_norm",
                        help="Aligns cells with very different cycle counts.")
     grid_sel = sel if scope != "fleet" else [cell]
-    show(fig_cohort_grid(ct, meta, grid_sel, P, norm_x), key="cohort_grid",
-         data=ct.loc[~ct["outlier"], ["Cell_ID", "n", "SOH"]].merge(
-             meta[["Ambient_C", "I_dis_A"]].reset_index(), on="Cell_ID"))
+    amb = meta["Ambient_C"].round(0)
+    groups = sorted(amb.dropna().unique())
+    only_sel = scope != "fleet" and st.toggle("Only groups containing the selection", value=False, key="grid_only")
+    for g in groups:
+        members = list(amb[amb == g].index)
+        if only_sel and not set(members) & set(grid_sel):
+            continue
+        show(fig_cohort_group(ct, meta, members, grid_sel, P, f"Ambient {g:.0f} °C · {len(members)} cells", norm_x),
+             key=f"cohort_{int(g)}",
+             data=ct.loc[~ct["outlier"] & ct["Cell_ID"].isin(members), ["Cell_ID", "n", "SOH"]])
     with st.expander("Mission 1 · How do operating conditions influence degradation?", expanded=False):
         condition_effects_section()
 
@@ -2939,6 +2997,47 @@ def ml_section() -> None:
         st.markdown(R2_NOTE)
 
 
+def tuning_block(task: str, models: Sequence[str], params: Dict[str, Dict[str, Any]], run: Callable[[str], Any]
+                 ) -> Dict[str, Dict[str, Any]]:
+    """Auto-tune button + results; returns the parameters to use (tuned where available and enabled)."""
+    store_key = f"tuned_{task}"
+    tuned: Dict[str, Any] = st.session_state.setdefault(store_key, {})
+    c1, c2, c3 = st.columns([1.4, 1.2, 2])
+    n_iter = c2.select_slider("Candidates per model", [8, 12, 16, 24, 32], value=12, key=f"{task}_niter")
+    if c1.button("Auto-tune hyperparameters", key=f"{task}_tune", icon=":material/auto_fix_high:",
+                 disabled=not models, help="Random search validated without touching the test data."):
+        prog = st.progress(0.0)
+        for i, m in enumerate(models):
+            prog.progress(i / len(models), text=f"Tuning {m}…")
+            try:
+                tuned[m] = run(m, int(n_iter))
+            except Exception as exc:
+                st.warning(f"{m}: tuning failed ({exc})")
+        prog.empty()
+    use = c3.toggle("Use tuned parameters", value=bool(tuned), key=f"{task}_use_tuned",
+                    disabled=not tuned, help="Off = the values in the hyperparameter panels above.")
+    if tuned:
+        rows = [{"Model": m, "Validation (default)": r.default_score, "Validation (tuned)": r.best_score,
+                 "Improvement (%)": r.improvement_pct, "Tuned settings": ", ".join(f"{k}={v:.3g}" if isinstance(v, float)
+                                                                                    else f"{k}={v}"
+                                                                                    for k, v in r.best_params.items()),
+                 "Time (s)": r.seconds} for m, r in tuned.items() if m in models]
+        if rows:
+            with st.expander(f"Tuning results · {next(iter(tuned.values())).validation}", expanded=False,
+                             icon=":material/insights:"):
+                show_table(pd.DataFrame(rows).set_index("Model").style.format(
+                    {"Validation (default)": "{:.4f}", "Validation (tuned)": "{:.4f}", "Improvement (%)": "{:+.0f}",
+                     "Time (s)": "{:.1f}"}))
+                st.caption("Score = mean + 0.5 SD of the validation RMSE (consistency across batteries is "
+                           "rewarded). Defaults are always a candidate, so tuned ≤ default on validation. The "
+                           "test data are never used, so tuned settings can still be worse on one particular "
+                           "battery: judge them on the leaderboard and the cross-cell benchmark.")
+    out = dict(params)
+    if use:
+        out.update({m: r.best_params for m, r in tuned.items() if m in models})
+    return out
+
+
 def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) -> None:
     all_cells = list(meta.index)
     c1, c2 = st.columns([2, 2])
@@ -2963,6 +3062,9 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
     conf = d2.slider("Conformal calibration cells (0 = no band)", 0, 8, 3, key="ml_conf")
     level = d3.select_slider("Band level", [0.8, 0.9, 0.95], value=0.9, key="ml_level")
     use_pop = source == "cohort"
+    params = tuning_block(f"fc_{cell}_{n0_ml}_{source}", models, params,
+                          lambda m, k: te.tune_ml_forecast(ct, cell, n0_ml, m, n_iter=k,
+                                                           use_population=source != "own", train_cells=train_cells))
     ml_cfg = dict(cell=cell, n0=n0_ml, models=tuple(models), source=source, train_cells=train_cells,
                   eol_ah=float(eol_ah), strategy=strategy, conformal_cells=conf, band_level=level,
                   params={m: params.get(m) for m in models})
@@ -3050,6 +3152,10 @@ def ml_estimation_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) 
         rest = [c for c in all_cells if c not in te_cells]
         tr_cells = tuple(e1.multiselect("Train batteries", rest, default=rest, key="est_train_cells",
                                         format_func=lambda c: cell_label(c, meta)))
+    params = tuning_block(f"est_{split}_{test_frac}_{hash((tr_cells, te_cells, tuple(feats))) % 10**6}", models, params,
+                          lambda m, k: te.tune_soh_estimator(ct, imp, m, tuple(feats), split, float(test_frac),
+                                                             list(tr_cells) or None, list(te_cells) or None, normalise,
+                                                             n_iter=k))
     cfg = dict(models=tuple(models), feats=tuple(feats), split=split, test_frac=test_frac, train=tr_cells,
                test=te_cells, normalise=normalise, params={m: params.get(m) for m in models})
     ready = bool(models) and bool(feats) and (split != "by_cell" or (tr_cells and te_cells))
@@ -3184,8 +3290,18 @@ def physics_section() -> None:
                 sig_v = st.slider("σᵥ voltage model error (mV)", 5, 60, 15, 1)
                 q_logk = st.select_slider("q_log k random walk per cycle", [0.005, 0.01, 0.02, 0.03, 0.05, 0.1],
                                           value=0.03)
+                cap_every = st.select_slider("Reference capacity check every N cycles (0 = never)",
+                                             [0, 5, 10, 20, 50], value=10, disabled=use_cap,
+                                             help="A periodic full-capacity measurement anchors SOH, like the "
+                                                  "reference tests used in real fleets; between checks the twin "
+                                                  "runs on operando voltage and resistance only.")
+                n_eff = st.select_slider("Effective independent voltage samples per cycle", [1, 2, 3, 5, 10, 25],
+                                         value=3, help="Voltage-model errors are correlated along a discharge "
+                                                       "curve; treating all 25 samples as independent makes the "
+                                                       "twin overconfident.")
                 dual_cfg = te.DualTwinConfig(use_capacity=use_cap, voltage_window_frac=float(win_frac),
-                                             sigma_v=sig_v / 1000.0, q_logk=float(q_logk))
+                                             sigma_v=sig_v / 1000.0, q_logk=float(q_logk),
+                                             capacity_every=0 if use_cap else int(cap_every), voltage_n_eff=float(n_eff))
                 twin_params = te.TwinParameters()
             else:
                 dual_cfg = te.DualTwinConfig()

@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "4.6.0"
+ENGINE_VERSION = "4.7.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -936,11 +936,13 @@ MODEL_SPECS: Dict[str, ModelSpec] = {m.name: m for m in (
     ModelSpec("Gaussian Process", "Kernel / Bayesian", "Smooth non-parametric fit with native uncertainty (O(n³)).",
               (_P("length_scale", "Initial RBF length scale", "log", 1.0, 0.05, 20.0), _P("noise", "Initial noise level", "log", 0.1, 1e-4, 1.0),
                _P("restarts", "Optimiser restarts", "int", 1, 0, 5))),
-    ModelSpec("MLP", "Neural network", "Feed-forward network (ReLU), early stopping optional.",
-              (_P("hidden", "Hidden layers", "layers", "64,64", help="comma-separated widths, e.g. 128,64,32"),
-               _P("alpha", "L2 penalty", "log", 1e-3, 1e-6, 1.0), _P("learning_rate_init", "Learning rate", "log", 3e-3, 1e-4, 0.1),
-               _P("max_iter", "Max epochs", "int", 3000, 200, 10000),
-               _P("activation", "Activation", "choice", "relu", options=("relu", "tanh", "logistic")))),
+    ModelSpec("MLP", "Neural network", "Small feed-forward network; small-data defaults (tanh, strong L2, early stopping).",
+              (_P("hidden", "Hidden layers", "layers", "32,16", help="comma-separated widths, e.g. 64,32"),
+               _P("alpha", "L2 penalty", "log", 1e-2, 1e-6, 1.0), _P("learning_rate_init", "Learning rate", "log", 3e-3, 1e-4, 0.1),
+               _P("max_iter", "Max epochs", "int", 2000, 200, 10000),
+               _P("activation", "Activation", "choice", "tanh", options=("tanh", "relu", "logistic")),
+               _P("early_stopping", "Early stopping", "choice", True, options=(True, False),
+                  help="Holds out 15% of the training rows and stops when their error stops improving."))),
     ModelSpec("Ridge", "Linear (polynomial)", "Polynomial features with L2 shrinkage.",
               (_P("degree", "Polynomial degree", "int", 3, 1, 5), _P("alpha", "Regularisation alpha", "log", 1.0, 1e-4, 1000.0)),
               poly=True),
@@ -1019,7 +1021,8 @@ def make_model(name: str, seed: int = 0, params: Optional[Dict[str, Any]] = None
     elif name == "MLP":
         est = MLPRegressor(hidden_layer_sizes=tuple(int(x) for x in p["hidden"].split(",")), alpha=p["alpha"],
                            learning_rate_init=p["learning_rate_init"], max_iter=p["max_iter"],
-                           activation=p["activation"], random_state=seed)
+                           activation=p["activation"], early_stopping=bool(p.get("early_stopping", True)),
+                           validation_fraction=0.15, n_iter_no_change=30, random_state=seed)
     elif name == "Ridge":
         est = LM.Ridge(alpha=p["alpha"])
     elif name == "ElasticNet":
@@ -1796,10 +1799,17 @@ class DualTwinConfig:
     p0_r_frac: float = 0.15
     robust_nis_quantile: float = 0.999
     update_every: int = 1             # assimilate measurements every m-th discharge (Mission 2)
+    capacity_every: int = 0           # periodic reference capacity check every N discharges (0 = never)
+    voltage_n_eff: float = 3.0        # effective independent voltage samples per cycle (errors are correlated)
+    adaptive: bool = True             # persistent-mismatch covariance inflation (adaptive EKF)
+    adapt_nis_level: float = 2.5      # EWMA of NIS/dof above this -> state covariance is inflated
+    adapt_memory: float = 0.8         # EWMA factor of the NIS tracker
 
     def __post_init__(self) -> None:
         if int(self.update_every) < 1:
             raise ValueError("update_every must be >= 1")
+        if int(self.capacity_every) < 0:
+            raise ValueError("capacity_every must be >= 0")
         if not 0 < self.voltage_window_frac <= 1:
             raise ValueError("voltage_window_frac must be in (0, 1]")
         if self.n_voltage_pts < 3:
@@ -1813,10 +1823,10 @@ class DualTwinConfig:
             raise ValueError("robust_nis_quantile must be in (0.5, 1)")
 
 
-TWIN_ABLATIONS: Dict[str, Dict[str, bool]] = {
-    "Open loop (population prior)": dict(use_voltage=False, use_rdc=False, use_capacity=False),
-    "Voltage (partial window)": dict(use_voltage=True, use_rdc=False, use_capacity=False),
-    "Voltage + load-step R": dict(use_voltage=True, use_rdc=True, use_capacity=False),
+TWIN_ABLATIONS: Dict[str, Dict[str, Any]] = {
+    "Open loop (population prior)": dict(use_voltage=False, use_rdc=False, use_capacity=False, capacity_every=0),
+    "Voltage (partial window)": dict(use_voltage=True, use_rdc=False, use_capacity=False, capacity_every=0),
+    "Voltage + load-step R": dict(use_voltage=True, use_rdc=True, use_capacity=False, capacity_every=0),
     "Voltage + R + capacity": dict(use_voltage=True, use_rdc=True, use_capacity=True),
 }
 
@@ -1892,7 +1902,10 @@ def _dual_measurement(x: np.ndarray, arr: Tuple[np.ndarray, np.ndarray, np.ndarr
             z.append(V[sel])
             h.append(vp)
             H.append(np.column_stack([dv_dsoh, I[sel], g[sel], np.zeros(len(sel))]))
-            R.append(np.full(len(sel), cfg.sigma_v ** 2))
+            # voltage-model errors are correlated along one discharge curve: n samples carry roughly the
+            # information of n_eff independent ones, so each sample's variance is scaled by n / n_eff
+            corr = max(len(sel) / max(cfg.voltage_n_eff, 1.0), 1.0)
+            R.append(np.full(len(sel), cfg.sigma_v ** 2 * corr))
             vres = V[sel] - vp
     if cfg.use_rdc and np.isfinite(v_rest) and abs(I[0]) > 0.1:
         i0 = abs(I[0])
@@ -1929,7 +1942,9 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
     prev_cum: Optional[float] = None
     n_upd = n_infl = 0
     N = len(prep.table)
-    any_meas = cfg.use_voltage or cfg.use_rdc or cfg.use_capacity
+    any_meas = cfg.use_voltage or cfg.use_rdc or cfg.use_capacity or cfg.capacity_every > 0
+    nis_ewma, n_adapt = 1.0, 0
+    cfg_cap = replace(cfg, use_capacity=True)
     for i, r in enumerate(prep.table.itertuples(index=False)):
         T = float(r.T_mean_C) if _finite(r.T_mean_C) else p.T_ref_C
         s = float(twin_stress(T, p))
@@ -1953,13 +1968,24 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
         due = (i % int(cfg.update_every)) == 0
         if any_meas and due and not bool(r.outlier) and arr is not None:
             p_soh0, p_lk0 = float(P[0, 0]), float(P[3, 3])
-            meas = _dual_measurement(x, arr, prep, cfg, r.Capacity_Ah)
+            cap_due = cfg.capacity_every > 0 and i % int(cfg.capacity_every) == 0
+            meas = _dual_measurement(x, arr, prep, cfg_cap if cap_due else cfg, r.Capacity_Ah)
             if meas is not None:
                 z, hx, H, Rv, vres = meas
                 m = len(z)
                 res = z - hx
                 S = H @ P @ H.T + np.diag(Rv)
                 nis = float(res @ np.linalg.solve(S, res))
+                # Adaptive EKF: a *persistent* large NIS (EWMA) means the state is wrong, not the data ->
+                # inflate the state covariance so the filter re-opens to the measurements (fading memory);
+                # an isolated spike is still treated as an outlier by inflating R below.
+                nis_ewma = cfg.adapt_memory * nis_ewma + (1 - cfg.adapt_memory) * nis / m
+                if cfg.adaptive and nis_ewma > cfg.adapt_nis_level:
+                    lam = min(nis_ewma / cfg.adapt_nis_level, 10.0)
+                    P = P * lam
+                    S = H @ P @ H.T + np.diag(Rv)
+                    nis = float(res @ np.linalg.solve(S, res))
+                    n_adapt += 1
                 thr = float(chi2.ppf(cfg.robust_nis_quantile, m))
                 if nis > thr:                       # robust: inflate R instead of rejecting
                     Rv = Rv * (nis / thr)
@@ -4660,6 +4686,23 @@ def estimation_frame(ct: pd.DataFrame, imp: Optional[pd.DataFrame], features: Se
     return d[["Cell_ID", "n", "SOH"] + feats]
 
 
+def _estimation_split(d: pd.DataFrame, split: str, test_frac: float, train_cells: Optional[Sequence[str]],
+                      test_cells: Optional[Sequence[str]], seed: int) -> Tuple[pd.DataFrame, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    if split == "random":
+        return d, rng.random(len(d)) < test_frac
+    if split == "chronological":
+        rank = d.groupby("Cell_ID")["n"].rank(pct=True)
+        return d, (rank > 1 - test_frac).to_numpy()
+    cells = sorted(d["Cell_ID"].unique())
+    test_cells = [c for c in (test_cells or []) if c in cells]
+    train_cells = [c for c in (train_cells or [c for c in cells if c not in test_cells]) if c in cells]
+    if not test_cells or not train_cells or set(test_cells) & set(train_cells):
+        raise ValueError("by_cell split needs disjoint, non-empty train and test cell lists")
+    d = d[d["Cell_ID"].isin(train_cells + test_cells)]
+    return d, d["Cell_ID"].isin(test_cells).to_numpy()
+
+
 def train_soh_estimator(ct: pd.DataFrame, imp: Optional[pd.DataFrame], model_name: str,
                         features: Sequence[str] = DEFAULT_EST_FEATURES, params: Optional[Dict[str, Any]] = None,
                         split: str = "chronological", test_frac: float = 0.3,
@@ -4688,19 +4731,7 @@ def train_soh_estimator(ct: pd.DataFrame, imp: Optional[pd.DataFrame], model_nam
     d = d.dropna(subset=["SOH"])
     d = d[d[feats].notna().mean(axis=1) >= 0.5]                 # need at least half the indicators
     rng = np.random.default_rng(seed)
-    if split == "random":
-        is_test = rng.random(len(d)) < test_frac
-    elif split == "chronological":
-        rank = d.groupby("Cell_ID")["n"].rank(pct=True)
-        is_test = (rank > 1 - test_frac).to_numpy()
-    else:
-        cells = sorted(d["Cell_ID"].unique())
-        test_cells = [c for c in (test_cells or []) if c in cells]
-        train_cells = [c for c in (train_cells or [c for c in cells if c not in test_cells]) if c in cells]
-        if not test_cells or not train_cells or set(test_cells) & set(train_cells):
-            raise ValueError("by_cell split needs disjoint, non-empty train and test cell lists")
-        d = d[d["Cell_ID"].isin(train_cells + test_cells)]
-        is_test = d["Cell_ID"].isin(test_cells).to_numpy()
+    d, is_test = _estimation_split(d, split, test_frac, train_cells, test_cells, seed)
     tr, te_ = d[~is_test], d[is_test]
     if len(tr) < 10 or len(te_) < 3:
         raise ValueError("Split leaves too few training (< 10) or test (< 3) cycles.")
@@ -5499,7 +5530,154 @@ def stacked_ensemble(ct: pd.DataFrame, cell_id: str, n0: int, soh_eol: float,
             pool.append(rng.choice(np.asarray(r, float), size=max(1, int(round(1000 * wi))), replace=True))
     rs = np.concatenate(pool) if pool else None
     fc = ProgForecast(ENS_NAME, n_grid, mean, lo, hi, rs,
-                      {"weights": dict(zip(members, w.round(3).tolist())), "backtest_rmse": rmse, "n_b": n_b})
+                      {"weights": dict(zip(members, w.tolist())), "backtest_rmse": rmse, "n_b": n_b})
     fc.metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), n_grid, mean, n0, soh_eol, lo, hi,
                                   alpha)
     return fc
+
+
+
+# =============================================================================
+# 24. AUTOMATIC HYPERPARAMETER TUNING (leakage-free validation)
+# =============================================================================
+MLP_ARCHITECTURES = ("32", "64", "128", "32,16", "64,32", "64,64", "128,64", "64,32,16")
+
+
+@dataclass
+class TuningResult:
+    model: str
+    best_params: Dict[str, Any]
+    default_params: Dict[str, Any]
+    best_score: float
+    default_score: float
+    trials: pd.DataFrame                 # one row per candidate: score, mean, sd, params
+    validation: str                      # description of the validation scheme
+    seconds: float
+
+    @property
+    def improvement_pct(self) -> float:
+        return 100.0 * (1 - self.best_score / self.default_score) if self.default_score > 0 else float("nan")
+
+
+def sample_params(name: str, rng: np.random.Generator) -> Dict[str, Any]:
+    """Random draw from a model's declared search space (log-uniform for scale parameters)."""
+    out: Dict[str, Any] = {}
+    for h in MODEL_SPECS[name].params:
+        if h.kind == "int":
+            if h.key in ("max_depth",) and h.low == 0:
+                out[h.key] = int(rng.choice([0, 3, 5, 8, 12, 20]))
+            else:
+                lo, hi = int(h.low), int(h.high)
+                out[h.key] = int(round(math.exp(rng.uniform(math.log(max(lo, 1)), math.log(hi))))) \
+                    if hi / max(lo, 1) > 20 else int(rng.integers(lo, hi + 1))
+        elif h.kind == "float":
+            out[h.key] = float(rng.uniform(h.low, h.high))
+        elif h.kind == "log":
+            out[h.key] = float(math.exp(rng.uniform(math.log(h.low), math.log(h.high))))
+        elif h.kind == "choice":
+            out[h.key] = h.options[int(rng.integers(len(h.options)))]
+        else:
+            out[h.key] = MLP_ARCHITECTURES[int(rng.integers(len(MLP_ARCHITECTURES)))]
+    return validate_params(name, out)
+
+
+def _robust_score(errs: Sequence[float]) -> Tuple[float, float, float]:
+    e = np.asarray([x for x in errs if np.isfinite(x)], dtype=float)
+    if not len(e):
+        return float("inf"), float("nan"), float("nan")
+    return float(e.mean() + 0.5 * e.std()), float(e.mean()), float(e.std())
+
+
+def tune_ml_forecast(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str, n_iter: int = 15, n_val: int = 3,
+                     use_population: bool = True, train_cells: Optional[Sequence[str]] = None, seed: int = 0,
+                     progress: ProgressFn = None) -> TuningResult:
+    """Random-search hyperparameter tuning for the fade-rate forecaster, validated by *forecast
+    backtests on other batteries*: every candidate forecasts the n_val cohort cells closest in
+    operating conditions (never the target) from the same fraction of life, trained exactly as the
+    real forecast would be, and is scored on their held-out futures. Score = mean + 0.5 SD of the
+    validation RMSEs (rewards settings that work consistently, not on one lucky cell). The default
+    settings are always a candidate, so tuning cannot do worse than the defaults on validation."""
+    t0 = time.time()
+    good = ct[~ct["outlier"]]
+    meta = cell_meta(ct)
+    frac = n0 / max(float(meta.loc[cell_id, "cycles"]), 1.0)
+    pool = [c for c in (train_cells or meta.index) if c != cell_id]
+    val = [c for c in calibration_partners(meta, cell_id, len(meta)) if c in pool][:n_val]
+    if not val:
+        raise ValueError("Tuning needs at least one other battery for validation.")
+    rng = np.random.default_rng(seed)
+    cands = [default_params(model_name)] + [sample_params(model_name, rng) for _ in range(max(n_iter - 1, 0))]
+    rows = []
+    for j, prm in enumerate(cands):
+        _report(progress, j / len(cands), f"{model_name}: candidate {j + 1}/{len(cands)}")
+        errs = []
+        for c in val:
+            cyc = int(meta.loc[c, "cycles"])
+            n0_c = int(max(5, round(frac * cyc)))
+            try:
+                n_g, p_g, _, _ = _ml_curve(good, meta, c, n0_c, model_name, "increment", use_population, 3.0, seed,
+                                           int(cyc * 1.2) + 1, {c: n0_c}, prm,
+                                           [x for x in pool if x != c] if train_cells is not None else None)
+                d = good[(good["Cell_ID"] == c) & (good["n"] > n0_c)]
+                if len(d):
+                    errs.append(float(np.sqrt(np.mean((np.interp(d["n"], n_g, p_g) - d["SOH"]) ** 2))))
+            except Exception:
+                errs.append(float("inf"))
+        sc, mu, sd = _robust_score(errs)
+        rows.append({"candidate": j, "score": sc, "mean RMSE": mu, "sd RMSE": sd, "params": prm,
+                     "is_default": j == 0})
+    _report(progress, 1.0, "tuning done")
+    tab = pd.DataFrame(rows).sort_values("score").reset_index(drop=True)
+    best = tab.iloc[0]
+    return TuningResult(model_name, dict(best["params"]), default_params(model_name), float(best["score"]),
+                        float(tab.loc[tab["is_default"], "score"].iloc[0]), tab,
+                        f"forecast backtest on {', '.join(val)} from {100 * frac:.0f}% of life", time.time() - t0)
+
+
+def tune_soh_estimator(ct: pd.DataFrame, imp: Optional[pd.DataFrame], model_name: str,
+                       features: Sequence[str] = DEFAULT_EST_FEATURES, split: str = "chronological",
+                       test_frac: float = 0.3, train_cells: Optional[Sequence[str]] = None,
+                       test_cells: Optional[Sequence[str]] = None, normalise: bool = True, n_iter: int = 20,
+                       seed: int = 0, progress: ProgressFn = None) -> TuningResult:
+    """Random-search tuning for the SOH estimator with grouped cross-validation *inside the training
+    set only* (folds = batteries, so a model is always scored on batteries it has not seen; the
+    test set of the chosen split is never touched). Falls back to 5-fold CV over cycles when the
+    training set has fewer than three batteries."""
+    from sklearn.model_selection import GroupKFold, KFold
+
+    t0 = time.time()
+    d = estimation_frame(ct, imp, features, normalise)
+    feats = [c for c in d.columns if c not in ("Cell_ID", "n", "SOH")]
+    d = d.dropna(subset=["SOH"])
+    d = d[d[feats].notna().mean(axis=1) >= 0.5]
+    d, is_test = _estimation_split(d, split, test_frac, train_cells, test_cells, seed)
+    tr = d[~is_test]
+    X, y, groups = tr[feats].to_numpy(float), tr["SOH"].to_numpy(float), tr["Cell_ID"].to_numpy()
+    n_groups = len(np.unique(groups))
+    if n_groups >= 3:
+        folds = list(GroupKFold(n_splits=min(5, n_groups)).split(X, y, groups))
+        scheme = f"grouped {len(folds)}-fold CV by battery on the training set"
+    else:
+        folds = list(KFold(5, shuffle=True, random_state=seed).split(X))
+        scheme = "5-fold CV over training cycles"
+    rng = np.random.default_rng(seed)
+    cands = [default_params(model_name)] + [sample_params(model_name, rng) for _ in range(max(n_iter - 1, 0))]
+    rows = []
+    for j, prm in enumerate(cands):
+        _report(progress, j / len(cands), f"{model_name}: candidate {j + 1}/{len(cands)}")
+        errs = []
+        for a, b in folds:
+            try:
+                Xa, ya, _ = _gp_subsample(model_name, X[a], y[a], np.ones(len(a)), seed)
+                mdl = _StandardisedTarget(make_model(model_name, seed, prm)).fit(Xa, ya)
+                errs.append(float(np.sqrt(np.mean((mdl.predict(X[b]) - y[b]) ** 2))))
+            except Exception:
+                errs.append(float("inf"))
+        sc, mu, sd = _robust_score(errs)
+        rows.append({"candidate": j, "score": sc, "mean RMSE": mu, "sd RMSE": sd, "params": prm,
+                     "is_default": j == 0})
+    _report(progress, 1.0, "tuning done")
+    tab = pd.DataFrame(rows).sort_values("score").reset_index(drop=True)
+    best = tab.iloc[0]
+    return TuningResult(model_name, dict(best["params"]), default_params(model_name), float(best["score"]),
+                        float(tab.loc[tab["is_default"], "score"].iloc[0]), tab, scheme, time.time() - t0)

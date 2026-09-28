@@ -619,6 +619,42 @@ def test_pinn_half_cell_mode_coupling():
     assert 0.5 < share_lli < 0.85 and "modes" in r.history.columns
 
 
+def test_hyperparameter_tuning_is_leakage_free_and_never_worse_on_validation():
+    _, ct, imp, _ = synthetic()
+    r = te.tune_ml_forecast(ct, "S004", 36, "Ridge", n_iter=4, n_val=2)
+    assert r.best_score <= r.default_score + 1e-12 and len(r.trials) == 4
+    assert "S004" not in r.validation                                      # the target is never a validation cell
+    te.validate_params("Ridge", r.best_params)
+    e = te.tune_soh_estimator(ct, imp, "Ridge", n_iter=4, split="by_cell", train_cells=["S001", "S002", "S003", "S005"],
+                              test_cells=["S004"])
+    assert e.best_score <= e.default_score + 1e-12 and "grouped" in e.validation
+    rng = np.random.default_rng(0)
+    for name in te.ML_MODELS:
+        te.validate_params(name, te.sample_params(name, rng))              # search space stays valid
+
+
+def test_twin_capacity_checks_and_correlated_voltage_fix_bias():
+    m, imp, _ = te.make_synthetic_master(n_cells=6, n_cycles=120, seed=0, noise_v=0.01)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    g = ct[(ct["Cell_ID"] == "S005") & ~ct["outlier"]]
+
+    def track(cfg):
+        r = te.run_dual_twin(store.cell_frame("S005"), ct, imp, "S005", te.TwinParameters(), cfg)
+        e = g[["n", "SOH"]].merge(r.per_cycle[["n", "SOH", "SOH_std"]], on="n", suffixes=("", "_e"))
+        err = e["SOH_e"] - e["SOH"]
+        return abs(err.mean()), float(np.mean(np.abs(err) <= 2 * e["SOH_std"]))
+
+    b0, c0 = track(te.DualTwinConfig(voltage_n_eff=25, adaptive=False))
+    b1, c1 = track(te.DualTwinConfig(capacity_every=10))
+    assert b1 < 0.5 * b0 and c1 > c0 + 0.3
+    try:
+        te.DualTwinConfig(capacity_every=-1)
+        raise AssertionError("negative capacity_every accepted")
+    except ValueError:
+        pass
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
