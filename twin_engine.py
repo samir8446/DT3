@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "4.7.0"
+ENGINE_VERSION = "4.8.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -1804,6 +1804,9 @@ class DualTwinConfig:
     adaptive: bool = True             # persistent-mismatch covariance inflation (adaptive EKF)
     adapt_nis_level: float = 2.5      # EWMA of NIS/dof above this -> state covariance is inflated
     adapt_memory: float = 0.8         # EWMA factor of the NIS tracker
+    adaptive_q: bool = True           # Sage-Husa estimate of the degradation-rate process noise
+    q_logk_max: float = 0.3           # upper bound of the adapted log k random-walk step
+    adapt_q_memory: float = 0.85      # forgetting factor of the Sage-Husa estimator
 
     def __post_init__(self) -> None:
         if int(self.update_every) < 1:
@@ -1945,6 +1948,7 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
     any_meas = cfg.use_voltage or cfg.use_rdc or cfg.use_capacity or cfg.capacity_every > 0
     nis_ewma, n_adapt = 1.0, 0
     cfg_cap = replace(cfg, use_capacity=True)
+    q_lk2 = cfg.q_logk ** 2               # Sage-Husa running estimate of Var(delta log k) per cycle
     for i, r in enumerate(prep.table.itertuples(index=False)):
         T = float(r.T_mean_C) if _finite(r.T_mean_C) else p.T_ref_C
         s = float(twin_stress(T, p))
@@ -1992,7 +1996,15 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
                     S = H @ P @ H.T + np.diag(Rv)
                     n_infl += 1
                 K = np.linalg.solve(S, H @ P).T
-                x = x + K @ res
+                dx = K @ res
+                x = x + dx
+                if cfg.adaptive_q:
+                    # Sage-Husa: the correction the filter had to apply to log k measures how fast the true
+                    # degradation rate is really moving (e.g. a knee, cold plating); widen the random walk
+                    # accordingly so the rate re-converges quickly, then relax back when corrections shrink.
+                    b = 1 - cfg.adapt_q_memory
+                    q_lk2 = (1 - b) * q_lk2 + b * float(dx[3]) ** 2
+                    Qd[3, 3] = min(max(q_lk2, cfg.q_logk ** 2), cfg.q_logk_max ** 2)
                 IKH = np.eye(4) - K @ H
                 P = IKH @ P @ IKH.T + K @ np.diag(Rv) @ K.T
                 P = 0.5 * (P + P.T)
@@ -3685,7 +3697,8 @@ def make_synthetic_master(n_cells: int = 4, n_cycles: int = 80,
                           currents: Sequence[float] = (2.0, 2.0, 2.0, 2.0),
                           k_true: Optional[Sequence[float]] = None, seed: int = 0,
                           dt_s: float = 20.0, noise_v: float = 0.003, c_bol: float = 2.0,
-                          eis_every: int = 20) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Dict[str, float]]]:
+                          eis_every: int = 20, knee: Optional[Dict[int, Tuple[int, float]]] = None
+                          ) -> Tuple[pd.DataFrame, pd.DataFrame, Dict[str, Dict[str, float]]]:
     """Synthetic telemetry in the master schema from the twin's own physics: generic OCV,
     1-RC ECM, throughput-driven Arrhenius fade with coupled resistance growth. Returns
     (master, impedance, truth) where truth holds each cell's k_ah and SOH trajectory.
@@ -3756,6 +3769,8 @@ def make_synthetic_master(n_cells: int = 4, n_cycles: int = 80,
             # ---- ageing over this charge + discharge ----
             A = (Q + cap)
             dsoh = k * float(twin_stress(np.mean(temps), p)) * A
+            if knee and c in knee and n + 1 >= knee[c][0]:      # harsh-regime test: fade accelerates after a knee
+                dsoh *= knee[c][1]
             soh -= dsoh
             r_int += p.beta_int * r_int0 * dsoh
             r_ct += p.beta_ct * r_ct0 * dsoh
@@ -5681,3 +5696,209 @@ def tune_soh_estimator(ct: pd.DataFrame, imp: Optional[pd.DataFrame], model_name
     best = tab.iloc[0]
     return TuningResult(model_name, dict(best["params"]), default_params(model_name), float(best["score"]),
                         float(tab.loc[tab["is_default"], "score"].iloc[0]), tab, scheme, time.time() - t0)
+
+
+# =============================================================================
+# 25. LIVE MULTI-MODEL TWIN: streamed particle filter, trend Kalman filter, HB, online weights
+# =============================================================================
+LIVE_MODELS = {"twin": "ECM twin · dual EKF", "pf": "Particle filter · power law", "trend": "Adaptive trend KF",
+               "hb": "Hierarchical Bayes", "ens": "Live ensemble"}
+
+
+@dataclass
+class LiveFrame:
+    n: int
+    n_grid: np.ndarray                               # future cycles n+1 .. n_max
+    forecasts: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]]   # model -> (median, lo, hi) on n_grid
+    rul: Dict[str, Tuple[float, float, float]]       # model -> (median, 5 %, 95 %) cycles to EOL from n (nan = beyond)
+    weights: Dict[str, float]
+
+
+def _q_summary(paths: np.ndarray, level: float, soh_eol: float) -> Tuple[Tuple[np.ndarray, ...], Tuple[float, ...]]:
+    qa, qb = (1 - level) / 2, 1 - (1 - level) / 2
+    med, lo, hi = np.median(paths, axis=0), np.quantile(paths, qa, axis=0), np.quantile(paths, qb, axis=0)
+    below = paths < soh_eol
+    hit = below.any(axis=1)
+    rul = np.where(hit, below.argmax(axis=1) + 1, np.nan)
+    r = rul[np.isfinite(rul)]
+    rs = (float(np.median(r)), float(np.quantile(r, 0.05)), float(np.quantile(r, 0.95))) \
+        if len(r) >= 0.5 * len(rul) else (float("nan"),) * 3
+    return (med, lo, hi), rs
+
+
+def _trend_kf_paths(y: np.ndarray, n_future: int, n_samples: int, rng: np.random.Generator,
+                    q: Tuple[float, float, float] = (2e-6, 2e-7, 2e-8), r_obs: float = 0.006 ** 2
+                    ) -> np.ndarray:
+    """Local-quadratic-trend Kalman filter on SOH (state: level, slope, curvature per cycle).
+    The curvature state lets the forecast bend when fade accelerates (knee, plating). A Student-t
+    style gate down-weights regeneration spikes. Curvature is clipped to <= 0 in the forecast
+    (fade does not decelerate into recovery)."""
+    F = np.array([[1.0, 1.0, 0.5], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0]])
+    Q = np.diag(q)
+    H = np.array([[1.0, 0.0, 0.0]])
+    x = np.array([float(y[0]), -1e-3, 0.0])
+    P = np.diag([1e-4, 1e-6, 1e-8])
+    for k, yk in enumerate(y):
+        if k:
+            x, P = F @ x, F @ P @ F.T + Q
+        s = float(P[0, 0]) + r_obs
+        res = float(yk - x[0])
+        rr = r_obs * max(1.0, (res * res / s) / 9.0)          # robust gate (3 sigma)
+        s = float(P[0, 0]) + rr
+        K = (P @ H.T / s).ravel()
+        x = x + K * res
+        P = (np.eye(3) - np.outer(K, H)) @ P
+    L = np.linalg.cholesky(P + 1e-14 * np.eye(3))
+    X = x[None, :] + rng.standard_normal((n_samples, 3)) @ L.T
+    X[:, 2] = np.minimum(X[:, 2], 0.0)
+    X[:, 1] = np.minimum(X[:, 1], 0.0)
+    h = np.arange(1, n_future + 1)[None, :]
+    growth = np.sqrt(h * q[0] + h ** 3 * q[1] / 3.0)          # process-noise spread of the extrapolation
+    return X[:, [0]] + X[:, [1]] * h + 0.5 * X[:, [2]] * h ** 2 + growth * rng.standard_normal((n_samples, 1))
+
+
+def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], soh_eol: float, level: float = 0.9,
+                     models: Sequence[str] = ("twin", "pf", "trend", "hb"), horizon_factor: float = 1.4,
+                     n_particles: int = 2000, h_eval: int = 5, forget: float = 0.85, hb_stride: int = 2,
+                     seed: int = 0, progress: ProgressFn = None) -> Tuple[Dict[int, LiveFrame], pd.DataFrame]:
+    """Stream one battery's life through several models at once. At every discharge n each model
+    assimilates only data up to n and forecasts the rest of life; each model is then scored on how
+    well it predicted cycle n from cycle n - h_eval (exponentially forgotten squared error), and the
+    live ensemble weights the models by that recent skill (inverse MSE). When the physics of one
+    model breaks down (knee, cold plating, harsh operation) its weight falls within a few cycles.
+    Returns ({n: LiveFrame}, per-cycle track of predicted EOL, weights and running errors)."""
+    rng = np.random.default_rng(seed)
+    good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n").reset_index(drop=True)
+    ns = good["n"].astype(int).to_numpy()
+    y = good["SOH"].to_numpy(float)
+    ah = good["cum_Ah"].to_numpy(float) - float(good["cum_Ah"].iloc[0])
+    n_max = int(ns.max() * horizon_factor)
+    pop = hierarchical_population(ct, exclude=cell_id) if ("pf" in models or "hb" in models) else {"available": False}
+    meta = cell_meta(ct)
+    if pop.get("available"):
+        xcov = _cell_covariates(meta, [cell_id])[:, pop["keep"]]
+        mu, Sg = (xcov @ pop["G"])[0], pop["Sigma"]
+        sig_obs = max(pop["sigma_obs"], 0.003)
+    else:
+        mu, Sg, sig_obs = np.array([-2.5, 1.0]), np.diag([1.0, 0.3]) ** 2, 0.01
+    parts = None
+    if "pf" in models:
+        parts = np.column_stack([float(np.median(y[:3])) + 0.01 * rng.standard_normal(n_particles),
+                                 rng.multivariate_normal(mu, Sg * 1.5, size=n_particles)])
+        parts[:, 2] = np.clip(parts[:, 2], 0.3, 3.0)
+        logw = np.zeros(n_particles)
+    hb_cache: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    L_prior = np.linalg.cholesky(np.linalg.inv(Sg))
+    frames: Dict[int, LiveFrame] = {}
+    sq_err = {m: None for m in list(models) + ["ens"]}
+    rows = []
+    names = [m for m in models if m in LIVE_MODELS]
+    for i, n in enumerate(ns):
+        _report(progress, i / len(ns), f"streaming cycle {n}")
+        # ---- particle filter: assimilate this cycle
+        if parts is not None:
+            pred = _pl_soh(parts, np.array([max(ah[i], 1e-6)]))[:, 0]
+            r = (y[i] - pred) / sig_obs
+            logw += -2.5 * np.log1p(r ** 2 / 4.0)
+            logw -= logw.max()
+            w = np.exp(logw)
+            w /= w.sum()
+            if 1.0 / np.sum(w ** 2) < n_particles / 2:
+                pos = (rng.random() + np.arange(n_particles)) / n_particles
+                idx = np.minimum(np.searchsorted(np.cumsum(w), pos), n_particles - 1)
+                parts = parts[idx] + rng.standard_normal(parts.shape) * np.array([0.002, 0.05, 0.02])
+                parts[:, 2] = np.clip(parts[:, 2], 0.3, 3.0)
+                logw = np.zeros(n_particles)
+        if i < 5:
+            continue
+        fut = np.arange(n + 1, n_max + 1)
+        if not len(fut):
+            continue
+        da = np.diff(ah[max(0, i - 20):i + 1])
+        dah = float(np.median(da[da > 0])) if (da > 0).any() else 2.0
+        ah_f = ah[i] + (fut - n) * dah
+        fc: Dict[str, Tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        rul: Dict[str, Tuple[float, float, float]] = {}
+        if "twin" in names and ekf is not None:
+            try:
+                tf = twin_forecast(ekf, int(n), n_max, soh_eol, level)
+                sel = tf.n_grid > n
+                med, lo, hi = (np.interp(fut, tf.n_grid[sel], v[sel]) for v in (tf.soh, tf.lo, tf.hi))
+                fc["twin"] = (med, lo, hi)
+                rs = tf.rul_samples[np.isfinite(tf.rul_samples)] if tf.rul_samples is not None else np.array([])
+                rul["twin"] = ((float(np.median(rs)), float(np.quantile(rs, 0.05)), float(np.quantile(rs, 0.95)))
+                               if len(rs) >= 0.5 * len(tf.rul_samples) else (float("nan"),) * 3)
+            except Exception:
+                pass
+        if parts is not None:
+            w = np.exp(logw - logw.max())
+            w /= w.sum()
+            post = parts[rng.choice(n_particles, size=400, p=w)]
+            paths = _pl_soh(post, ah_f) + 0.5 * sig_obs * rng.standard_normal((len(post), 1))
+            fc["pf"], rul["pf"] = _q_summary(paths, level, soh_eol)
+        if "trend" in names:
+            paths = _trend_kf_paths(y[:i + 1], len(fut), 400, rng)
+            fc["trend"], rul["trend"] = _q_summary(paths, level, soh_eol)
+        if "hb" in names:
+            if hb_cache is None or i % hb_stride == 0:
+                try:
+                    th, cv = _fit_power_law(np.maximum(ah[:i + 1], 1e-6), y[:i + 1], mu, L_prior, sig_obs,
+                                            (float(np.median(y[:3])), 0.01))
+                    hb_cache = (th, cv)
+                except Exception:
+                    pass
+            if hb_cache is not None:
+                th = rng.multivariate_normal(hb_cache[0], hb_cache[1] + 1e-12 * np.eye(3), size=400)
+                th[:, 2] = np.clip(th[:, 2], 0.3, 3.0)
+                paths = _pl_soh(th, np.maximum(ah_f, 1e-6)) + 0.5 * sig_obs * rng.standard_normal((400, 1))
+                fc["hb"], rul["hb"] = _q_summary(paths, level, soh_eol)
+        # ---- online skill: how well did each model predict this cycle from n - h_eval?
+        prev = frames.get(int(ns[i - h_eval])) if i >= h_eval else None
+        errs = {}
+        if prev is not None:
+            for m, (med, _, _) in prev.forecasts.items():
+                if n in set(prev.n_grid.tolist()):
+                    e = float(np.interp(n, prev.n_grid, med) - y[i])
+                    errs[m] = e
+                    sq_err[m] = e * e if sq_err.get(m) is None else forget * sq_err[m] + (1 - forget) * e * e
+        avail = [m for m in fc if m != "ens"]
+        if all(sq_err.get(m) is not None for m in avail) and avail:
+            inv = np.array([1.0 / (sq_err[m] + 1e-7) for m in avail])
+        else:
+            inv = np.ones(len(avail))
+        wts = dict(zip(avail, (inv / inv.sum()).tolist()))
+        if len(avail) >= 2:
+            z = 1.6449
+            W = np.array([wts[m] for m in avail])
+            MU = np.array([fc[m][0] for m in avail])
+            SD = np.array([(fc[m][2] - fc[m][1]) / (2 * z) for m in avail])
+            mean = W @ MU
+            half = z * np.sqrt(np.maximum(W @ (SD ** 2 + MU ** 2) - mean ** 2, 0))
+            fc["ens"] = (mean, mean - half, mean + half)
+            cross = np.nonzero(mean < soh_eol)[0]
+            lo_c, hi_c = np.nonzero(mean - half < soh_eol)[0], np.nonzero(mean + half < soh_eol)[0]
+            rul["ens"] = (float(fut[cross[0]] - n) if len(cross) else float("nan"),
+                          float(fut[lo_c[0]] - n) if len(lo_c) else float("nan"),
+                          float(fut[hi_c[0]] - n) if len(hi_c) else float("nan"))
+        frames[int(n)] = LiveFrame(int(n), fut, fc, rul, wts)
+        row = {"n": int(n)}
+        for m in fc:
+            row[f"eol_{m}"] = n + rul.get(m, (np.nan,))[0] if m in rul else np.nan
+            row[f"w_{m}"] = wts.get(m, np.nan)
+            row[f"err_{m}"] = errs.get(m, np.nan)
+        rows.append(row)
+    _report(progress, 1.0, "live streaming done")
+    return frames, pd.DataFrame(rows)
+
+
+def live_skill_table(track: pd.DataFrame) -> pd.DataFrame:
+    """Running h-step-ahead accuracy of every live model (the basis of the ensemble weights)."""
+    out = []
+    for c in [c for c in track.columns if c.startswith("err_")]:
+        e = track[c].dropna()
+        if len(e):
+            m = c[4:]
+            out.append({"Model": LIVE_MODELS.get(m, m), "key": m, "RMSE (5-step ahead)": float(np.sqrt(np.mean(e ** 2))),
+                        "Bias": float(e.mean()), "Final weight": float(track[f"w_{m}"].dropna().iloc[-1])
+                        if f"w_{m}" in track and track[f"w_{m}"].notna().any() else float("nan")})
+    return pd.DataFrame(out).sort_values("RMSE (5-step ahead)") if out else pd.DataFrame()

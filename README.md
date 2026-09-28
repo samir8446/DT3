@@ -1,4 +1,4 @@
-# Battery digital twin & operando diagnostics (v4.7)
+# Battery digital twin & operando diagnostics (v4.8)
 
 ```bash
 pip install -r requirements.txt
@@ -10,9 +10,20 @@ docker build -t battery-twin . && docker run -p 8501:8501 -v twin-data:/data bat
 ```
 
 Files: `twin_engine.py` (all computation, no UI), `app.py` (Streamlit views), `benchmark.py`
-(offline sweep → results file the app can load), `tests/` (52 tests incl. gradient checks and
+(offline sweep → results file the app can load), `tests/` (54 tests incl. gradient checks and
 synthetic-truth recovery). Set `TWIN_CACHE_DIR` to persist downloads and uploads; `GIT_COMMIT`
 is recorded in run manifests.
+
+## New in v4.8: live multi-model twin
+
+- The Live twin streams several models cycle by cycle: ECM twin (dual EKF), particle filter on the physics
+  power law with the fleet prior, an adaptive trend Kalman filter (level-slope-curvature, bends quickly at
+  knees) and hierarchical Bayes. A live ensemble weights them by their recent 5-cycle-ahead error
+  (`live_multi_model`, `live_skill_table`). On synthetic knee cells (fade 2.5-3x faster after the knee)
+  the ensemble's 20-cycle forecast error is ~2.5x lower than the twin alone, with honest bands.
+- Twin: Sage-Husa adaptive process noise on the degradation rate (`adaptive_q`), so k re-converges quickly
+  after a regime change.
+- Synthetic generator: optional knee (`knee={cell_index: (n_knee, factor)}`) for harsh-regime tests.
 
 ## New in v4.7
 

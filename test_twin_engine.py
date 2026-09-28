@@ -655,6 +655,55 @@ def test_twin_capacity_checks_and_correlated_voltage_fix_bias():
         pass
 
 
+def _knee_cohort():
+    m, imp, _ = te.make_synthetic_master(n_cells=8, n_cycles=130, ambients=(24, 34, 43, 4, 24, 34, 43, 24), seed=0,
+                                         noise_v=0.01, knee={1: (50, 3.0)})
+    store = te.ParquetStore.from_dataframe(m)
+    return store, te.build_cycle_table(store), imp
+
+
+def test_live_multi_model_beats_twin_on_a_knee_and_reweights():
+    store, ct, imp = _knee_cohort()
+    cell = "S002"
+    g = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]]
+    soh_eol = te.soh_eol_for(float(g["C_bol_Ah"].iloc[0]), 1.6)
+    ekf = te.run_dual_twin(store.cell_frame(cell), ct, imp, cell, te.TwinParameters(),
+                           te.DualTwinConfig(capacity_every=10))
+    frames, track = te.live_multi_model(ct, cell, ekf, soh_eol)
+    assert {"twin", "pf", "trend", "hb", "ens"} <= set(frames[max(frames)].forecasts)
+    err = {}
+    for n0, fr in frames.items():
+        if 60 <= n0 <= g["n"].max() - 20 and n0 % 10 == 0:
+            w = g[(g["n"] > n0) & (g["n"] <= n0 + 20)]
+            for mdl, (med, _, _) in fr.forecasts.items():
+                err.setdefault(mdl, []).append(np.sqrt(np.mean((np.interp(w["n"], fr.n_grid, med) - w["SOH"]) ** 2)))
+    assert np.mean(err["ens"]) < 0.7 * np.mean(err["twin"])               # ensemble clearly better after the knee
+    wts = frames[max(frames)].weights
+    assert abs(sum(wts.values()) - 1) < 1e-9 and wts["twin"] < 0.5         # weight moved away from the twin
+    sk = te.live_skill_table(track)
+    assert len(sk) >= 4 and (sk["RMSE (5-step ahead)"] > 0).all()
+
+
+def test_adaptive_process_noise_helps_after_a_knee_without_hurting_normal_cells():
+    store, ct, imp = _knee_cohort()
+
+    def fc_err(cell, cfg):
+        g = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]]
+        soh_eol = te.soh_eol_for(float(g["C_bol_Ah"].iloc[0]), 1.6)
+        r = te.run_dual_twin(store.cell_frame(cell), ct, imp, cell, te.TwinParameters(), cfg)
+        e = []
+        for n0 in range(60, int(g["n"].max()) - 20, 10):
+            f = te.twin_forecast(r, n0, int(g["n"].max()) + 10, soh_eol, 0.9)
+            w = g[(g["n"] > n0) & (g["n"] <= n0 + 20)]
+            e.append(np.sqrt(np.mean((np.interp(w["n"], f.n_grid, f.soh) - w["SOH"]) ** 2)))
+        return float(np.mean(e))
+
+    base = te.DualTwinConfig(capacity_every=10, adaptive_q=False)
+    adapt = te.DualTwinConfig(capacity_every=10)
+    assert fc_err("S002", adapt) <= fc_err("S002", base) + 1e-9
+    assert fc_err("S001", adapt) <= 1.2 * fc_err("S001", base) + 1e-4
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

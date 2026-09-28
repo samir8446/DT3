@@ -1663,6 +1663,85 @@ def fig_replay(ct_cell: pd.DataFrame, pc: pd.DataFrame, fc: Any, n: int, soh_eol
     return style_fig(fig, P, 520, "Live twin: assimilating one discharge at a time", hovermode="x unified")
 
 
+LIVE_COLORS = {"twin": "#0072B2", "pf": "#E69F00", "trend": "#009E73", "hb": "#CC79A7", "ens": None}
+LIVE_DASH = {"twin": "dash", "pf": "dot", "trend": "dashdot", "hb": "longdash", "ens": "solid"}
+
+
+def _live_color(m: str, P: Palette) -> str:
+    return LIVE_COLORS.get(m) or P.text
+
+
+def fig_live_main(ct_cell: pd.DataFrame, pc: pd.DataFrame, fr: Any, n: int, soh_eol: float, P: Palette,
+                  reveal: bool, n_max: int, show_models: Sequence[str]) -> go.Figure:
+    good = ct_cell[~ct_cell["outlier"]]
+    seen, future = good[good["n"] <= n], good[good["n"] > n]
+    est = pc[pc["n"] <= n]
+    fig = go.Figure()
+    add_band(fig, est["n"].to_numpy(), (est["SOH"] - 2 * est["SOH_std"]).to_numpy(),
+             (est["SOH"] + 2 * est["SOH_std"]).to_numpy(), P.ekf, "Twin estimate ±2σ", group="est", alpha=0.15)
+    if fr is not None and "ens" in fr.forecasts and "ens" in show_models:
+        med, lo, hi = fr.forecasts["ens"]
+        add_band(fig, fr.n_grid, lo, hi, P.accent, "Live ensemble 90% band", group="ens", alpha=0.14)
+    if reveal and len(future):
+        fig.add_trace(go.Scatter(x=future["n"], y=future["SOH"], mode="markers", name="Future (hidden from models)",
+                                 marker=dict(color=P.muted, size=5, opacity=0.35, symbol="circle-open"),
+                                 hovertemplate="%{y:.4f}<extra>future</extra>"))
+    fig.add_trace(go.Scatter(x=seen["n"], y=seen["SOH"], mode="markers", name="Measured so far",
+                             marker=dict(color=P.measured, size=6), hovertemplate="%{y:.4f}<extra>measured</extra>"))
+    fig.add_trace(go.Scatter(x=est["n"], y=est["SOH"], mode="lines", name="Twin estimate (causal)", legendgroup="est",
+                             line=dict(color=P.ekf, width=2.6), hovertemplate="%{y:.4f}<extra>twin</extra>"))
+    if fr is not None:
+        for m in show_models:
+            if m not in fr.forecasts:
+                continue
+            med = fr.forecasts[m][0]
+            w = fr.weights.get(m)
+            label = te.LIVE_MODELS[m] + (f" · w = {w:.2f}" if w is not None and m != "ens" else "")
+            fig.add_trace(go.Scatter(x=fr.n_grid, y=med, mode="lines", name=label, legendgroup=m,
+                                     line=dict(color=_live_color(m, P), width=4 if m == "ens" else 2.2, dash=LIVE_DASH[m]),
+                                     hovertemplate="%{y:.4f}<extra>" + html.escape(te.LIVE_MODELS[m]) + "</extra>"))
+    fig.add_vline(x=n, line_color=P.ekf, line_width=1.5, line_dash="dot",
+                  annotation_text=f"now: n = {n}", annotation_font=dict(color=P.ekf, size=12))
+    fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, annotation_text="End of life",
+                  annotation_font=dict(color=P.eol))
+    lo_y = min(float(good["SOH"].min()), soh_eol) - 0.04
+    fig.update_xaxes(title_text="Discharge cycle n", range=[0, n_max])
+    fig.update_yaxes(title_text="State of health SOH (–)", range=[lo_y, 1.04])
+    return style_fig(fig, P, 560, "Live multi-model twin: every model assimilates one discharge at a time",
+                     hovermode="x unified")
+
+
+def fig_live_track(track: pd.DataFrame, n: int, eol_true: Optional[int], P: Palette, n_max: int,
+                   show_models: Sequence[str]) -> go.Figure:
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12, row_heights=[0.55, 0.45],
+                        subplot_titles=("Predicted end-of-life cycle converging as data arrive",
+                                        "Live ensemble weights (recent 5-cycle-ahead skill)"))
+    _style_subplot_titles(fig, P)
+    t = track[track["n"] <= n]
+    for m in show_models:
+        c = f"eol_{m}"
+        if c in t:
+            fig.add_trace(go.Scatter(x=t["n"], y=t[c], mode="lines", name=te.LIVE_MODELS[m], legendgroup=m,
+                                     line=dict(color=_live_color(m, P), width=3.4 if m == "ens" else 1.8,
+                                               dash=LIVE_DASH[m]), connectgaps=False,
+                                     hovertemplate="%{y:.0f}<extra>" + html.escape(te.LIVE_MODELS[m]) + "</extra>"),
+                          row=1, col=1)
+    if eol_true is not None:
+        fig.add_hline(y=eol_true, line_dash="dash", line_color=P.eol, row=1, col=1,
+                      annotation_text=f"actual EOL n = {eol_true}", annotation_font=dict(color=P.eol))
+    for m in [m for m in ("twin", "pf", "trend", "hb") if f"w_{m}" in t]:
+        fig.add_trace(go.Scatter(x=t["n"], y=t[f"w_{m}"], mode="lines", stackgroup="w", name=f"weight · {te.LIVE_MODELS[m]}",
+                                 legendgroup=m, showlegend=False, line=dict(color=_live_color(m, P), width=0.8),
+                                 fillcolor=rgba(_live_color(m, P), 0.6),
+                                 hovertemplate="%{y:.2f}<extra>" + html.escape(te.LIVE_MODELS[m]) + "</extra>"),
+                      row=2, col=1)
+    fig.update_xaxes(range=[0, n_max])
+    fig.update_xaxes(title_text="Discharge cycle n (data assimilated so far)", row=2, col=1)
+    fig.update_yaxes(title_text="EOL cycle", row=1, col=1)
+    fig.update_yaxes(title_text="weight", range=[0, 1], row=2, col=1)
+    return style_fig(fig, P, 680, None)
+
+
 def fig_replay_track(track: pd.DataFrame, pc: pd.DataFrame, n: int, rul_true: Optional[int], P: Palette,
                      n_max: int) -> go.Figure:
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
@@ -1905,6 +1984,12 @@ def replay_cached(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.D
             rows.append({"n": int(n), "eol_med": n + float(np.median(rs)), "eol_lo": n + float(np.quantile(rs, 0.05)),
                          "eol_hi": n + float(np.quantile(rs, 0.95)), "frac_censored": 1 - len(rs) / len(f.rul_samples)})
     return r, pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def live_cached(_ekf: te.EKFResult, _ct: pd.DataFrame, key: str, cell: str, soh_eol: float, level: float,
+                cap_every: int, models: Tuple[str, ...]) -> Tuple[Dict[int, Any], pd.DataFrame]:
+    return te.live_multi_model(_ct, cell, _ekf, soh_eol, level, models)
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -2632,9 +2717,17 @@ def view_replay() -> None:
                                  value=10, key="rp_cap",
                                  help="Between checks the twin sees only partial-window voltage and load-step "
                                       "resistance. Set 0 to watch pure operando tracking, including its drift.")
-    with st.spinner("Preparing the replay (runs the twin once, then animates)…"):
-        res, track = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol), level,
-                                   int(cap_every))
+    show_models = st.multiselect(
+        "Live models", list(te.LIVE_MODELS), default=["twin", "pf", "trend", "ens"], key="rp_models",
+        format_func=te.LIVE_MODELS.get,
+        help="ECM twin: physics + operando voltage. Particle filter: power law with the fleet prior, robust to knees. "
+             "Adaptive trend KF: level-slope-curvature filter that bends quickly when fade accelerates. Hierarchical "
+             "Bayes: fleet-informed power law. Live ensemble: weights every model by its recent 5-cycle-ahead error.")
+    with st.spinner("Streaming the battery through all models (runs once, then animates)…"):
+        res, _track_old = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol),
+                                        level, int(cap_every))
+        frames, track = live_cached(res, ct, DATA_KEY, cell, float(soh_eol), level, int(cap_every),
+                                    ("twin", "pf", "trend", "hb"))
     pc = res.per_cycle
     ns = pc["n"].astype(int).tolist()
     if len(ns) < 6:
@@ -2676,24 +2769,31 @@ def view_replay() -> None:
         n = int(st.session_state[key_n])
         n = min(ns, key=lambda v: abs(v - n))
         row = pc[pc["n"] == n].iloc[0]
-        fc = te.twin_forecast(res, n, n_max, soh_eol, level) if n >= 5 else None
-        rs = fc.rul_samples[np.isfinite(fc.rul_samples)] if fc is not None and fc.rul_samples is not None else []
+        fr = frames.get(n) or (frames[max(k_ for k_ in frames if k_ <= n)] if any(k_ <= n for k_ in frames) else None)
         meas = good[good["n"] <= n]["SOH"].tail(1)
+        ens_rul = fr.rul.get("ens") if fr is not None else None
+        lead = max(fr.weights, key=fr.weights.get) if fr is not None and fr.weights else None
         k = st.columns(6)
         k[0].metric("Cycle", f"{n} / {ns[-1]}")
         k[1].metric("Twin SOH", f"{row['SOH']:.3f}", delta=f"±{2 * row['SOH_std']:.3f} (2σ)", delta_color="off")
         k[2].metric("Measured SOH", f"{float(meas.iloc[0]):.3f}" if len(meas) else "—")
-        k[3].metric("Personal k / prior", f"{row['k_ah'] / res.params.get('k_prior', row['k_ah']):.2f}×")
-        k[4].metric("Predicted RUL", f"{np.median(rs):.0f} cyc" if len(rs) else "beyond horizon",
-                    delta=(f"90%: {np.quantile(rs, 0.05):.0f}–{np.quantile(rs, 0.95):.0f}" if len(rs) else None),
-                    delta_color="off")
-        k[5].metric("NIS / dof", fmt(row.get("NIS_norm", float("nan")), ".2f"),
-                    help="Normalised innovation squared: about 1 when the filter's uncertainty is consistent.")
+        k[3].metric("Ensemble RUL", f"{ens_rul[0]:.0f} cyc" if ens_rul and np.isfinite(ens_rul[0]) else "beyond horizon",
+                    delta=(f"90%: {ens_rul[1]:.0f}–{ens_rul[2]:.0f}" if ens_rul and np.isfinite(ens_rul[1])
+                           and np.isfinite(ens_rul[2]) else None), delta_color="off")
+        k[4].metric("Most trusted now", te.LIVE_MODELS[lead].split(" · ")[0] if lead else "—",
+                    delta=f"weight {fr.weights[lead]:.2f}" if lead else None, delta_color="off")
+        k[5].metric("Personal k / prior", f"{row['k_ah'] / res.params.get('k_prior', row['k_ah']):.2f}×",
+                    help="The twin's own degradation rate relative to the fleet prior (Sage–Husa adaptive).")
         st.progress(min(1.0, (n - ns[0]) / max(ns[-1] - ns[0], 1)),
                     text=f"{'▶ streaming' if st.session_state.get(key_p) else '⏸ paused'} · "
                          f"{len(good[good['n'] <= n])} discharges assimilated")
-        show(fig_replay(ct_cell, pc, fc, n, soh_eol, P, reveal, n_max), key="rp_main", export=False)
-        show(fig_replay_track(track, pc, n, eol_true, P, n_max), key="rp_track", export=False)
+        show(fig_live_main(ct_cell, pc, fr, n, soh_eol, P, reveal, n_max, show_models), key="rp_main", export=False)
+        show(fig_live_track(track, n, eol_true, P, n_max, show_models), key="rp_track", export=False)
+        sk = te.live_skill_table(track[track["n"] <= n])
+        if len(sk):
+            with st.expander("Live model scoreboard (5-cycle-ahead prediction error so far)", icon=":material/leaderboard:"):
+                show_table(sk.drop(columns=["key"]).set_index("Model").style.format(
+                    {"RMSE (5-step ahead)": "{:.4f}", "Bias": "{:+.4f}", "Final weight": "{:.2f}"}, na_rep="—"))
 
     if frag is not None:
         try:
@@ -2702,7 +2802,10 @@ def view_replay() -> None:
             frame()
     else:
         frame()
-    st.caption("The EOL band narrowing and the personal rate k settling are the self-updating behaviour: the twin "
+    st.caption("Harsh operation (cold plating, knees, high temperature) breaks any single physics law. The live "
+               "ensemble moves its weight, cycle by cycle, to the models that are currently predicting well: watch "
+               "the weight panel shift when the fade accelerates. "
+               "The EOL band narrowing and the personal rate k settling are the self-updating behaviour: the twin "
                "starts from the population prior and converges on this battery's own ageing law as evidence "
                "accumulates. Toggle 'Reveal future data' to judge each forecast against what actually happened.")
 
