@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "4.8.0"
+ENGINE_VERSION = "4.8.1"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -5881,7 +5881,7 @@ def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], s
                           float(fut[lo_c[0]] - n) if len(lo_c) else float("nan"),
                           float(fut[hi_c[0]] - n) if len(hi_c) else float("nan"))
         frames[int(n)] = LiveFrame(int(n), fut, fc, rul, wts)
-        row = {"n": int(n)}
+        row = {"n": int(n), "soh": float(y[i])}
         for m in fc:
             row[f"eol_{m}"] = n + rul.get(m, (np.nan,))[0] if m in rul else np.nan
             row[f"w_{m}"] = wts.get(m, np.nan)
@@ -5892,13 +5892,49 @@ def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], s
 
 
 def live_skill_table(track: pd.DataFrame) -> pd.DataFrame:
-    """Running h-step-ahead accuracy of every live model (the basis of the ensemble weights)."""
+    """Running h-step-ahead accuracy of every live model (the basis of the ensemble weights):
+    RMSE, MAE, bias and accuracy = 100 x (1 - mean |error| / measured SOH)."""
     out = []
     for c in [c for c in track.columns if c.startswith("err_")]:
-        e = track[c].dropna()
-        if len(e):
-            m = c[4:]
-            out.append({"Model": LIVE_MODELS.get(m, m), "key": m, "RMSE (5-step ahead)": float(np.sqrt(np.mean(e ** 2))),
-                        "Bias": float(e.mean()), "Final weight": float(track[f"w_{m}"].dropna().iloc[-1])
-                        if f"w_{m}" in track and track[f"w_{m}"].notna().any() else float("nan")})
+        d = track[[c] + (["soh"] if "soh" in track else [])].dropna()
+        if not len(d):
+            continue
+        e = d[c]
+        m = c[4:]
+        acc = 100 * (1 - float(np.mean(np.abs(e) / d["soh"].clip(lower=1e-6)))) if "soh" in d else float("nan")
+        out.append({"Model": LIVE_MODELS.get(m, m), "key": m, "Accuracy (%)": acc,
+                    "RMSE (5-step ahead)": float(np.sqrt(np.mean(e ** 2))), "MAE": float(np.mean(np.abs(e))),
+                    "Bias": float(e.mean()), "Predictions scored": int(len(e)),
+                    "Final weight": float(track[f"w_{m}"].dropna().iloc[-1])
+                    if f"w_{m}" in track and track[f"w_{m}"].notna().any() else float("nan")})
     return pd.DataFrame(out).sort_values("RMSE (5-step ahead)") if out else pd.DataFrame()
+
+
+def live_forecast_accuracy(frame: "LiveFrame", good: pd.DataFrame, soh_eol: Optional[float] = None,
+                           eol_true: Optional[float] = None) -> pd.DataFrame:
+    """Hindsight score of the forecasts made at one cycle against the cycles that followed (replay
+    only: uses data the models had not seen). Accuracy = 100 x (1 - MAPE) over the remaining
+    observed life; RUL error when the actual end of life is known."""
+    fut = good[good["n"] > frame.n]
+    rows = []
+    for m, (med, lo, hi) in frame.forecasts.items():
+        if not len(fut):
+            break
+        sel = fut[fut["n"] <= frame.n_grid.max()]
+        if not len(sel):
+            continue
+        p = np.interp(sel["n"], frame.n_grid, med)
+        e = p - sel["SOH"].to_numpy()
+        inside = (sel["SOH"].to_numpy() >= np.interp(sel["n"], frame.n_grid, lo)) & \
+                 (sel["SOH"].to_numpy() <= np.interp(sel["n"], frame.n_grid, hi))
+        r = frame.rul.get(m, (np.nan,))[0]
+        ahead = eol_true is not None and eol_true > frame.n              # EOL error only while EOL is still ahead
+        rul_err = (frame.n + r - eol_true) if (ahead and np.isfinite(r)) else float("nan")
+        if not ahead:
+            r = float("nan")
+        rows.append({"Model": LIVE_MODELS.get(m, m), "key": m,
+                     "Accuracy (%)": 100 * (1 - float(np.mean(np.abs(e) / np.maximum(sel["SOH"].to_numpy(), 1e-6)))),
+                     "RMSE": float(np.sqrt(np.mean(e ** 2))), "Band coverage": float(np.mean(inside)),
+                     "Predicted EOL": frame.n + r if np.isfinite(r) else float("nan"), "EOL error (cycles)": rul_err,
+                     "Cycles scored": int(len(sel))})
+    return pd.DataFrame(rows).sort_values("RMSE") if rows else pd.DataFrame()

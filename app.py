@@ -1672,7 +1672,8 @@ def _live_color(m: str, P: Palette) -> str:
 
 
 def fig_live_main(ct_cell: pd.DataFrame, pc: pd.DataFrame, fr: Any, n: int, soh_eol: float, P: Palette,
-                  reveal: bool, n_max: int, show_models: Sequence[str]) -> go.Figure:
+                  reveal: bool, n_max: int, show_models: Sequence[str],
+                  acc: Optional[Dict[str, float]] = None) -> go.Figure:
     good = ct_cell[~ct_cell["outlier"]]
     seen, future = good[good["n"] <= n], good[good["n"] > n]
     est = pc[pc["n"] <= n]
@@ -1696,7 +1697,9 @@ def fig_live_main(ct_cell: pd.DataFrame, pc: pd.DataFrame, fr: Any, n: int, soh_
                 continue
             med = fr.forecasts[m][0]
             w = fr.weights.get(m)
-            label = te.LIVE_MODELS[m] + (f" · w = {w:.2f}" if w is not None and m != "ens" else "")
+            a = (acc or {}).get(m)
+            label = te.LIVE_MODELS[m] + (f" · acc {a:.1f}%" if a is not None and np.isfinite(a) else "") \
+                + (f" · w = {w:.2f}" if w is not None and m != "ens" else "")
             fig.add_trace(go.Scatter(x=fr.n_grid, y=med, mode="lines", name=label, legendgroup=m,
                                      line=dict(color=_live_color(m, P), width=4 if m == "ens" else 2.2, dash=LIVE_DASH[m]),
                                      hovertemplate="%{y:.4f}<extra>" + html.escape(te.LIVE_MODELS[m]) + "</extra>"))
@@ -2706,6 +2709,43 @@ def status_section(scope: str, sel: List[str], fs: pd.DataFrame, ev: pd.DataFram
         selection_report(sel if scope != "fleet" else list(fs.index[:8]), fs, ev, lim)
 
 
+def live_accuracy_cards(sk: pd.DataFrame, fr: Any, show_models: Sequence[str], reveal: bool,
+                        eol_true: Optional[int]) -> None:
+    models = [m for m in show_models if fr is not None and m in fr.forecasts]
+    if not models:
+        return
+    st.markdown("**Live accuracy** · 5-cycle-ahead predictions scored so far (causal)")
+    by = sk.set_index("key") if len(sk) else pd.DataFrame()
+    best = by["Accuracy (%)"].idxmax() if len(by) else None
+    cols = st.columns(len(models))
+    for c, m in zip(cols, models):
+        name = te.LIVE_MODELS[m].split(" · ")[0]
+        if m in by.index:
+            c.metric(("★ " if m == best else "") + name, f"{by.loc[m, 'Accuracy (%)']:.2f}%",
+                     delta=f"RMSE {by.loc[m, 'RMSE (5-step ahead)']:.4f}", delta_color="off",
+                     help=f"{int(by.loc[m, 'Predictions scored'])} predictions scored; bias "
+                          f"{by.loc[m, 'Bias']:+.4f} (positive = optimistic).")
+        else:
+            c.metric(name, "—", help="Scored once the first 5-cycle-ahead prediction can be checked.")
+    if reveal:
+        good = ct_cell[~ct_cell["outlier"]]
+        hind = te.live_forecast_accuracy(fr, good, soh_eol, eol_true)
+        if len(hind):
+            hb = hind.set_index("key")
+            best_h = hb["Accuracy (%)"].idxmax()
+            st.markdown(f"**Forecast accuracy against the actual future** · forecasts made at n = {fr.n}, scored on "
+                        f"the {int(hb['Cycles scored'].max())} cycles that followed (hindsight)")
+            cols = st.columns(len(models))
+            for c, m in zip(cols, models):
+                if m in hb.index:
+                    r = hb.loc[m]
+                    eol_txt = (f"EOL error {r['EOL error (cycles)']:+.0f} cyc" if np.isfinite(r["EOL error (cycles)"])
+                               else f"coverage {100 * r['Band coverage']:.0f}%")
+                    c.metric(("★ " if m == best_h else "") + te.LIVE_MODELS[m].split(" · ")[0],
+                             f"{r['Accuracy (%)']:.2f}%", delta=eol_txt, delta_color="off",
+                             help=f"RMSE {r['RMSE']:.4f}; band coverage {100 * r['Band coverage']:.0f}%.")
+
+
 def view_replay() -> None:
     section(f"Live twin replay · {cell}")
     st.markdown("The recorded life of the battery is streamed one discharge at a time. At every step the dual "
@@ -2787,13 +2827,21 @@ def view_replay() -> None:
         st.progress(min(1.0, (n - ns[0]) / max(ns[-1] - ns[0], 1)),
                     text=f"{'▶ streaming' if st.session_state.get(key_p) else '⏸ paused'} · "
                          f"{len(good[good['n'] <= n])} discharges assimilated")
-        show(fig_live_main(ct_cell, pc, fr, n, soh_eol, P, reveal, n_max, show_models), key="rp_main", export=False)
-        show(fig_live_track(track, n, eol_true, P, n_max, show_models), key="rp_track", export=False)
         sk = te.live_skill_table(track[track["n"] <= n])
+        acc_map = dict(zip(sk["key"], sk["Accuracy (%)"])) if len(sk) else {}
+        show(fig_live_main(ct_cell, pc, fr, n, soh_eol, P, reveal, n_max, show_models, acc_map), key="rp_main",
+             export=False)
+        live_accuracy_cards(sk, fr, show_models, reveal, eol_true)
+        show(fig_live_track(track, n, eol_true, P, n_max, show_models), key="rp_track", export=False)
         if len(sk):
-            with st.expander("Live model scoreboard (5-cycle-ahead prediction error so far)", icon=":material/leaderboard:"):
+            with st.expander("Live model scoreboard", icon=":material/leaderboard:"):
                 show_table(sk.drop(columns=["key"]).set_index("Model").style.format(
-                    {"RMSE (5-step ahead)": "{:.4f}", "Bias": "{:+.4f}", "Final weight": "{:.2f}"}, na_rep="—"))
+                    {"Accuracy (%)": "{:.2f}", "RMSE (5-step ahead)": "{:.4f}", "MAE": "{:.4f}", "Bias": "{:+.4f}",
+                     "Final weight": "{:.2f}"}, na_rep="—")
+                    .highlight_max(subset=["Accuracy (%)"], props="background-color: rgba(0,158,115,0.25); font-weight: 700;"))
+                st.caption("Scored causally: every prediction was made 5 cycles before the measurement it is "
+                           "compared with, using only data available at that time. Accuracy = 100 × (1 − mean "
+                           "absolute percentage error).")
 
     if frag is not None:
         try:

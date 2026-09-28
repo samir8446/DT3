@@ -704,6 +704,23 @@ def test_adaptive_process_noise_helps_after_a_knee_without_hurting_normal_cells(
     assert fc_err("S001", adapt) <= 1.2 * fc_err("S001", base) + 1e-4
 
 
+def test_live_accuracy_tables():
+    store, ct, imp = _knee_cohort()
+    cell = "S001"
+    g = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]]
+    soh_eol = te.soh_eol_for(float(g["C_bol_Ah"].iloc[0]), 1.6)
+    ekf = te.run_dual_twin(store.cell_frame(cell), ct, imp, cell, te.TwinParameters(), te.DualTwinConfig())
+    frames, track = te.live_multi_model(ct, cell, ekf, soh_eol, models=("twin", "trend"))
+    sk = te.live_skill_table(track)
+    assert "Accuracy (%)" in sk and sk["Accuracy (%)"].between(80, 100).all()
+    eol = te.first_crossing(g["n"].to_numpy(), g["SOH"].to_numpy(), soh_eol, smooth=5)
+    early = te.live_forecast_accuracy(frames[min(frames)], g, soh_eol, eol)
+    assert len(early) >= 2 and early["Accuracy (%)"].between(0, 100).all()
+    late = te.live_forecast_accuracy(frames[max(k for k in frames if k < g["n"].max())], g, soh_eol,
+                                     int(g["n"].min()))                     # EOL already passed
+    assert late["EOL error (cycles)"].isna().all()
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
