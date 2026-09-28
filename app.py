@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "4.9"
+REQUIRED_ENGINE = "5.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -73,7 +73,8 @@ RESULTS_DIR = APP_DIR / "results"
 MASTER_NAME, IMP_NAME = "battery_master_data.parquet", "impedance_ground_truth.parquet"
 POLICIES = ["Twin-Aware", "Fixed 1 A", "Fixed 2 A", "Fixed 4 A"]
 VIEWS = [":material/monitoring: Diagnostics", ":material/play_circle: Live twin",
-         ":material/psychology: Models & forecasting", ":material/tune: Operations & control"]
+         ":material/psychology: Models & forecasting", ":material/tune: Operations & control",
+         ":material/fact_check: Study results"]
 SANS = "Inter, 'Source Sans Pro', 'Helvetica Neue', Arial, sans-serif"
 SERIF = "'STIX Two Text', 'Times New Roman', Times, serif"
 
@@ -501,25 +502,9 @@ def paradigm_style(name: str, P: Palette, i: int = 0) -> Tuple[str, str, str]:
         return P.ekf, PARADIGM_DASH["twin"], "square"
     if name == te.PINN_NAME:
         return P.pinn, PARADIGM_DASH["pinn"], "diamond"
-    if name == te.SEMI_NAME:
-        return P.semi, "dot", "triangle-up"
-    if name == te.PF_NAME:
-        return P.pf, "longdash", "star"
     if name == te.HB_NAME:
         return "#882255", "dashdot", "hexagon"
-    if name == te.GP_NAME:
-        return "#44AA99", "dot", "triangle-down"
-    if name == te.ENS_NAME:
-        return P.text, "solid", "circle"
     return P.series[i % len(P.series)], DASHES[(i + 3) % len(DASHES)], SYMBOLS[i % len(SYMBOLS)]
-
-
-# =============================================================================
-# Figure styling
-# =============================================================================
-AXIS_BLOCK_PX = 62      # tick labels + x-axis title below the plot area
-LEGEND_ROW_PX = 24
-TITLE_BAND_PX = 92
 
 
 def _legend_entries(fig: go.Figure) -> List[str]:
@@ -543,6 +528,11 @@ def _legend_rows(names: Sequence[str], width_px: int) -> int:
 def _style_subplot_titles(fig: go.Figure, P: Palette) -> None:
     for ann in fig.layout.annotations:
         ann.font = dict(size=13, color=P.text, family=P.font)
+
+
+AXIS_BLOCK_PX = 62      # tick labels + x-axis title below the plot area
+LEGEND_ROW_PX = 24
+TITLE_BAND_PX = 92
 
 
 def style_fig(fig: go.Figure, P: Palette, height: int = 460, title: Optional[str] = None,
@@ -624,82 +614,6 @@ def add_band(fig: go.Figure, n: np.ndarray, lo: np.ndarray, hi: np.ndarray, colo
 # =============================================================================
 # Figures: data & diagnostics
 # =============================================================================
-def fig_fade(ct_all: pd.DataFrame, cell_id: str, y: str, eol_line: Optional[float], P: Palette,
-             knee: Optional[Dict[str, Any]] = None) -> go.Figure:
-    fig = go.Figure()
-    first = True
-    for cid, d in ct_all[~ct_all["outlier"]].groupby("Cell_ID"):
-        if cid == cell_id:
-            continue
-        fig.add_trace(go.Scatter(x=d["n"], y=d[y], mode="lines", line=dict(color=P.cohort, width=1.3),
-                                 name="Cohort cells", legendgroup="cohort", showlegend=first,
-                                 hoverinfo="skip"))
-        first = False
-    d = ct_all[ct_all["Cell_ID"] == cell_id]
-    good, bad = d[~d["outlier"]], d[d["outlier"]]
-    fig.add_trace(go.Scatter(x=good["n"], y=good[y], mode="lines+markers", name=f"Target cell {cell_id}",
-                             line=dict(color=P.accent, width=3), marker=dict(size=6, color=P.accent),
-                             customdata=good[["Cycle_Index"]].to_numpy(),
-                             hovertemplate="%{y:.4f} · cycle %{customdata[0]}<extra></extra>"))
-    if "regen" in d.columns:
-        rg = good[good["regen"].astype(bool)]
-        if len(rg):
-            fig.add_trace(go.Scatter(x=rg["n"], y=rg[y], mode="markers", name="Capacity regeneration",
-                                     marker=dict(symbol="triangle-up", size=12, color=P.r_ct,
-                                                 line=dict(color=P.text, width=1)),
-                                     hovertemplate="%{y:.4f} (regeneration)<extra></extra>"))
-    if len(bad):
-        fig.add_trace(go.Scatter(x=bad["n"], y=bad[y], mode="markers", name="Flagged outliers",
-                                 marker=dict(symbol="x", size=9, color=P.eol, line=dict(width=2)),
-                                 hovertemplate="%{y:.4f} (outlier)<extra></extra>"))
-    if eol_line is not None:
-        fig.add_hline(y=eol_line, line_dash="dash", line_color=P.eol, line_width=1.5,
-                      annotation_text="End of life", annotation_position="bottom right",
-                      annotation_font=dict(color=P.eol, size=12))
-    if knee and knee.get("found"):
-        kn = int(knee["knee_n"])
-        ky = float(good.loc[(good["n"] - kn).abs().idxmin(), y]) if len(good) else None
-        fig.add_vline(x=kn, line_dash="dashdot", line_color=P.pinn, line_width=1.5)
-        fig.add_trace(go.Scatter(x=[kn], y=[ky], mode="markers", name="Knee point (non-linear ageing onset)",
-                                 marker=dict(symbol="star", size=16, color=P.pinn, line=dict(color=P.text, width=1)),
-                                 hovertemplate=f"knee at n = {kn}<extra></extra>"))
-    fig.update_xaxes(title_text="Discharge cycle n")
-    fig.update_yaxes(title_text="Discharge capacity (Ah)" if y == "Capacity_Ah" else "State of health SOH (–)")
-    fig.update_layout(clickmode="event+select")
-    return style_fig(fig, P, 470, f"Capacity fade trajectory, {cell_id} against cohort")
-
-
-def fig_cohort_grid(ct_all: pd.DataFrame, meta: pd.DataFrame, cell_id: Any, P: Palette,
-                    normalise_x: bool = False) -> go.Figure:
-    """One full-width panel per ambient temperature, stacked; every battery has its own colour and
-    marker (the same as in every other chart) and its own legend entry."""
-    amb = meta["Ambient_C"].round(0)
-    groups = sorted(amb.dropna().unique())
-    nrow = max(len(groups), 1)
-    fig = make_subplots(rows=nrow, cols=1, shared_xaxes=False, vertical_spacing=0.28 / nrow + 0.04,
-                        subplot_titles=[f"Ambient {g:.0f} °C · {int((amb == g).sum())} cells" for g in groups])
-    _style_subplot_titles(fig, P)
-    good = ct_all[~ct_all["outlier"]]
-    cells = list(meta.index)
-    for gi, g in enumerate(groups):
-        for cid in sorted(amb[amb == g].index):
-            d = good[good["Cell_ID"] == cid].sort_values("n")
-            if d.empty:
-                continue
-            col, sym = cell_style(cid, cells)
-            is_t = cid in cell_id if isinstance(cell_id, (list, tuple, set)) else cid == cell_id
-            x = d["n"] / d["n"].max() if normalise_x else d["n"]
-            fig.add_trace(go.Scatter(
-                x=x, y=d["SOH"], mode="lines+markers", name=cell_label(cid, meta) + ("  ★ selected" if is_t else ""),
-                legendgroup=cid, line=dict(color=col, width=3.4 if is_t else 1.8),
-                marker=dict(symbol=sym, size=7 if is_t else 5, maxdisplayed=14, line=dict(color=P.plot_bg, width=0.5)),
-                hovertemplate=f"<b>{cid}</b> n=%{{x}}: SOH %{{y:.3f}}<extra></extra>"), row=gi + 1, col=1)
-        fig.update_yaxes(title_text="SOH (–)", row=gi + 1, col=1)
-        fig.update_xaxes(title_text="Fraction of recorded life" if normalise_x else "Discharge cycle n",
-                         row=gi + 1, col=1)
-    fig.update_layout(legend=dict(groupclick="togglegroup"))
-    return style_fig(fig, P, 200 + 290 * nrow, "Cohort fade by ambient temperature (click a legend entry to hide a cell)",
-                     hovermode="closest")
 
 
 def _break_gaps(x: np.ndarray, y: np.ndarray, factor: float = 5.0, min_gap: float = 8.0) -> Tuple[List, List]:
@@ -1015,114 +929,6 @@ def fig_compare(res: te.ComparisonResult, P: Palette) -> go.Figure:
     fig.update_xaxes(title_text="Discharge cycle n")
     fig.update_yaxes(title_text="State of health SOH (–)")
     return style_fig(fig, P, 560, f"Forecast benchmark on {res.cell_id} with uncertainty bands")
-
-
-def fig_rul_hist(samples: Dict[str, np.ndarray], rul_true: Optional[int], lb: Optional[int], P: Palette) -> go.Figure:
-    """Overlaid RUL distributions of every probabilistic paradigm (twin MC, semi-empirical MC,
-    particle filter), with the true RUL or its censoring bound."""
-    fig = go.Figure()
-    s_max = 0.0
-    notes = []
-    for i, (name, smp) in enumerate(samples.items()):
-        smp = np.asarray(smp, dtype=float)
-        s = smp[np.isfinite(smp)]
-        col, _, _ = paradigm_style(name, P, i)
-        miss = 1 - len(s) / max(len(smp), 1)
-        if miss > 0.005:
-            notes.append(f"{name.split(' · ')[0]} {100 * miss:.0f}% beyond horizon")
-        if not len(s):
-            continue
-        s_max = max(s_max, float(s.max()))
-        fig.add_trace(go.Histogram(x=s, nbinsx=40, histnorm="probability density", name=name,
-                                   marker=dict(color=rgba(col, 0.45), line=dict(color=col, width=1)),
-                                   hovertemplate="%{x} cycles<extra>" + html.escape(name) + "</extra>"))
-        med = float(np.median(s))
-        fig.add_vline(x=med, line_color=col, line_width=2.2, line_dash="dot")
-    if rul_true is not None:
-        fig.add_vline(x=rul_true, line_color=P.eol, line_dash="dash", line_width=2.5,
-                      annotation_text=f"true {rul_true}", annotation_position="top left",
-                      annotation_font=dict(color=P.eol, size=12))
-    elif lb is not None:
-        fig.add_vrect(x0=lb, x1=max(s_max, lb) + 1, fillcolor=rgba(P.eol, 0.08), line_width=0,
-                      annotation_text=f"censored: true RUL > {lb}", annotation_position="top left",
-                      annotation_font=dict(color=P.eol, size=12))
-    fig.update_layout(barmode="overlay")
-    fig.update_xaxes(title_text="Remaining useful life after n₀ (cycles)")
-    fig.update_yaxes(title_text="Probability density")
-    title = "RUL distributions (dotted = median)" + (f" · {'; '.join(notes)}" if notes else "")
-    return style_fig(fig, P, 400, title, width_hint=720, hovermode="closest")
-
-
-def fig_params(res: te.ComparisonResult, P: Palette) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.13,
-                        subplot_titles=("Ohmic resistance R_int", "Charge-transfer resistance R_ct"))
-    _style_subplot_titles(fig, P)
-    for row, key, eis_col, label in ((1, "R_int", "Re_ohm", "Re"), (2, "R_ct", "Rct_ohm", "Rct")):
-        show_leg = row == 1
-        if res.ekf is not None:
-            e = res.ekf.per_cycle.dropna(subset=[key])
-            fig.add_trace(go.Scatter(x=e["n"], y=1e3 * e[key], mode="lines", name="Observer", legendgroup="obs",
-                                     showlegend=show_leg, line=dict(color=P.ekf, width=2.4, dash="dash"),
-                                     hovertemplate="%{y:.1f} mΩ<extra></extra>"), row=row, col=1)
-        if res.pinn is not None:
-            fig.add_trace(go.Scatter(x=res.pinn.n_grid, y=1e3 * getattr(res.pinn, key.lower()), mode="lines",
-                                     name="PINN", legendgroup="pinn", showlegend=show_leg,
-                                     line=dict(color=P.pinn, width=2.4),
-                                     hovertemplate="%{y:.1f} mΩ<extra></extra>"), row=row, col=1)
-        if len(res.eis):
-            ci = te._int_key(res.measured.sort_values("Cycle_Index")[["Cycle_Index", "n"]])
-            ee = pd.merge_asof(te._int_key(res.eis).sort_values("Cycle_Index"), ci, on="Cycle_Index",
-                               direction="backward")
-            fig.add_trace(go.Scatter(x=ee["n"].fillna(1), y=1e3 * ee[eis_col], mode="markers", name="EIS",
-                                     legendgroup="eis", showlegend=show_leg,
-                                     marker=dict(color=P.eis, symbol="x", size=9, line=dict(width=1.5)),
-                                     hovertemplate=f"%{{y:.1f}} mΩ (EIS {label})<extra></extra>"), row=row, col=1)
-        fig.add_vline(x=res.n0, line_dash="dot", line_color=P.accent, row=row, col=1)
-        fig.update_yaxes(title_text="Resistance (mΩ)", row=row, col=1)
-    fig.update_xaxes(title_text="Discharge cycle n", row=2, col=1)
-    return style_fig(fig, P, 580, "Identified resistances against EIS", width_hint=720)
-
-
-def fig_innovation(ekf: te.EKFResult, sigma_v: float, P: Palette) -> go.Figure:
-    """Voltage innovation (top) and normalised innovation squared NIS / dof (bottom).
-    A consistent filter has NIS / dof ~ 1: well below 1 means over-conservative noise
-    settings, well above 1 means over-confidence or model error."""
-    e = ekf.per_cycle.dropna(subset=["innov_mean_mV"])
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12, row_heights=[0.55, 0.45],
-                        subplot_titles=("Voltage innovation V_meas − V_pred", "Filter consistency NIS / dof"))
-    _style_subplot_titles(fig, P)
-    fig.add_hrect(y0=-2e3 * sigma_v, y1=2e3 * sigma_v, fillcolor=rgba(P.r_ct, 0.10), line_width=0, row=1, col=1)
-    add_band(fig, e["n"], e["innov_mean_mV"] - e["innov_std_mV"], e["innov_mean_mV"] + e["innov_std_mV"],
-             P.ekf, "±1 std within cycle", row=1, col=1, alpha=0.18)
-    fig.add_trace(go.Scatter(x=e["n"], y=e["innov_mean_mV"], mode="lines", name="Mean innovation",
-                             line=dict(color=P.ekf, width=2.4), hovertemplate="%{y:.1f} mV<extra></extra>"),
-                  row=1, col=1)
-    if "NIS_norm" in ekf.per_cycle.columns:
-        nis = ekf.per_cycle.dropna(subset=["NIS_norm"])
-        fig.add_trace(go.Scatter(x=nis["n"], y=nis["NIS_norm"], mode="markers", name="NIS / dof",
-                                 marker=dict(color=P.pinn, size=5, symbol="diamond"),
-                                 hovertemplate="%{y:.2f}<extra></extra>"), row=2, col=1)
-        fig.add_hline(y=1.0, line_dash="dash", line_color=P.muted, row=2, col=1,
-                      annotation_text="consistent = 1", annotation_font=dict(color=P.muted, size=11))
-        fig.update_yaxes(type="log", title_text="NIS / dof", row=2, col=1)
-    fig.update_yaxes(title_text="mV", row=1, col=1)
-    fig.update_xaxes(title_text="Discharge cycle n", row=2, col=1)
-    return style_fig(fig, P, 520, "Observer innovations and consistency", width_hint=720)
-
-
-def fig_pinn_loss(p: te.PINNResult, P: Palette) -> go.Figure:
-    fig = go.Figure()
-    spec = (("total", P.text, "Total", "solid"), ("data", P.r_ct, "Data", "dash"),
-            ("phys", P.pinn, "Physics", "dot"), ("bv", P.accent, "Butler–Volmer", "dashdot"),
-            ("eis", P.eis, "EIS anchor", "longdash"))
-    for key, col, label, dash in spec:
-        if key in p.history.columns:
-            fig.add_trace(go.Scatter(x=p.history["epoch"], y=p.history[key], mode="lines", name=label,
-                                     line=dict(color=col, width=3 if key == "total" else 1.8, dash=dash),
-                                     hovertemplate="%{y:.3e}<extra></extra>"))
-    fig.update_yaxes(type="log", title_text="Loss (normalised, log)")
-    fig.update_xaxes(title_text="Epoch")
-    return style_fig(fig, P, 400, "Hybrid PINN training losses", width_hint=720)
 
 
 def fig_ablation(results: Dict[str, te.EKFResult], ct_cell: pd.DataFrame, P: Palette) -> go.Figure:
@@ -1641,45 +1447,11 @@ def build_report_html(title: str, sections: List[Tuple[str, Any]]) -> str:
 # =============================================================================
 # Figures: live replay, DP policy, half-cell fitting
 # =============================================================================
-def fig_replay(ct_cell: pd.DataFrame, pc: pd.DataFrame, fc: Any, n: int, soh_eol: float, P: Palette,
-               reveal: bool, n_max: int) -> go.Figure:
-    good = ct_cell[~ct_cell["outlier"]]
-    seen, future = good[good["n"] <= n], good[good["n"] > n]
-    est = pc[pc["n"] <= n]
-    fig = go.Figure()
-    add_band(fig, est["n"].to_numpy(), (est["SOH"] - 2 * est["SOH_std"]).to_numpy(),
-             (est["SOH"] + 2 * est["SOH_std"]).to_numpy(), P.ekf, "Twin estimate ±2σ", group="est", alpha=0.18)
-    if fc is not None:
-        m = fc.n_grid > n
-        add_band(fig, fc.n_grid[m], fc.lo[m], fc.hi[m], P.pinn, f"{int(100 * fc.level)}% forecast band",
-                 group="fc", alpha=0.16)
-        fig.add_trace(go.Scatter(x=fc.n_grid[m], y=fc.soh[m], mode="lines", name="Forecast (median)",
-                                 legendgroup="fc", line=dict(color=P.pinn, width=2.6, dash="dash"),
-                                 hovertemplate="%{y:.4f}<extra>forecast</extra>"))
-    if reveal and len(future):
-        fig.add_trace(go.Scatter(x=future["n"], y=future["SOH"], mode="markers", name="Future (hidden from twin)",
-                                 marker=dict(color=P.muted, size=5, opacity=0.35, symbol="circle-open"),
-                                 hovertemplate="%{y:.4f}<extra>future</extra>"))
-    fig.add_trace(go.Scatter(x=seen["n"], y=seen["SOH"], mode="markers", name="Measured so far",
-                             marker=dict(color=P.measured, size=6), hovertemplate="%{y:.4f}<extra>measured</extra>"))
-    fig.add_trace(go.Scatter(x=est["n"], y=est["SOH"], mode="lines", name="Twin estimate (causal)", legendgroup="est",
-                             line=dict(color=P.ekf, width=3), hovertemplate="%{y:.4f}<extra>twin</extra>"))
-    if len(est):
-        fig.add_trace(go.Scatter(x=[est["n"].iloc[-1]], y=[est["SOH"].iloc[-1]], mode="markers", showlegend=False,
-                                 marker=dict(size=16, color=P.ekf, line=dict(color=P.plot_bg, width=3)), hoverinfo="skip"))
-    fig.add_vline(x=n, line_color=P.ekf, line_width=1.5, line_dash="dot",
-                  annotation_text=f"now: n = {n}", annotation_font=dict(color=P.ekf, size=12))
-    fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, annotation_text="End of life",
-                  annotation_font=dict(color=P.eol))
-    lo_y = min(float(good["SOH"].min()), soh_eol) - 0.03
-    fig.update_xaxes(title_text="Discharge cycle n", range=[0, n_max])
-    fig.update_yaxes(title_text="State of health SOH (–)", range=[lo_y, 1.04])
-    return style_fig(fig, P, 520, "Live twin: assimilating one discharge at a time", hovermode="x unified")
 
 
-LIVE_COLORS = {"twin": "#0072B2", "mech": "#D55E00", "pinn": "#882255", "pf": "#E69F00", "trend": "#009E73",
+LIVE_COLORS = {"twin": "#0072B2", "mech": "#D55E00", "pf": "#E69F00", "trend": "#009E73",
                "hb": "#CC79A7", "ens": None}
-LIVE_DASH = {"twin": "dash", "mech": "solid", "pinn": "dot", "pf": "dot", "trend": "dashdot", "hb": "longdash",
+LIVE_DASH = {"twin": "dash", "mech": "solid", "pf": "dot", "trend": "dashdot", "hb": "longdash",
              "ens": "solid"}
 MECH_COLORS = {"SEI": "#0072B2", "plating": "#56B4E9", "LAM": "#E69F00"}
 
@@ -1763,7 +1535,7 @@ def fig_live_track(track: pd.DataFrame, n: int, eol_true: Optional[int], P: Pale
                                          fillcolor=rgba(MECH_COLORS[k_], 0.65),
                                          hovertemplate="%{y:.0%}<extra>" + k_ + "</extra>"), row=3, col=1)
         fig.update_yaxes(title_text="share", range=[0, 1], tickformat=".0%", row=3, col=1)
-    for m in [m for m in ("twin", "mech", "pinn", "pf", "trend", "hb") if f"w_{m}" in t]:
+    for m in [m for m in ("twin", "mech", "pf", "trend", "hb") if f"w_{m}" in t]:
         fig.add_trace(go.Scatter(x=t["n"], y=t[f"w_{m}"], mode="lines", stackgroup="w", name=f"weight · {te.LIVE_MODELS[m]}",
                                  legendgroup=m, showlegend=False, line=dict(color=_live_color(m, P), width=0.8),
                                  fillcolor=rgba(_live_color(m, P), 0.6),
@@ -1774,34 +1546,6 @@ def fig_live_track(track: pd.DataFrame, n: int, eol_true: Optional[int], P: Pale
     fig.update_yaxes(title_text="EOL cycle", row=1, col=1)
     fig.update_yaxes(title_text="weight", range=[0, 1], row=2, col=1)
     return style_fig(fig, P, 880 if has_mech else 680, None)
-
-
-def fig_replay_track(track: pd.DataFrame, pc: pd.DataFrame, n: int, rul_true: Optional[int], P: Palette,
-                     n_max: int) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.12,
-                        subplot_titles=("Predicted end of life converging as data arrive",
-                                        "Personalised degradation rate k (self-updating parameter)"))
-    _style_subplot_titles(fig, P)
-    t = track[track["n"] <= n]
-    add_band(fig, t["n"].to_numpy(), t["eol_lo"].to_numpy(), t["eol_hi"].to_numpy(), P.pinn, "EOL 90% band",
-             group="eol", alpha=0.18, row=1, col=1)
-    fig.add_trace(go.Scatter(x=t["n"], y=t["eol_med"], mode="lines", name="Predicted EOL cycle", legendgroup="eol",
-                             line=dict(color=P.pinn, width=2.6), hovertemplate="%{y:.0f}<extra>EOL</extra>"), row=1, col=1)
-    if rul_true is not None:
-        fig.add_hline(y=rul_true, line_dash="dash", line_color=P.eol, row=1, col=1,
-                      annotation_text=f"actual EOL n = {rul_true}", annotation_font=dict(color=P.eol))
-    e = pc[pc["n"] <= n]
-    fig.add_trace(go.Scatter(x=e["n"], y=e["k_ah"] * 1e4, mode="lines", name="k (×10⁻⁴ per Ah)",
-                             line=dict(color=P.ekf, width=2.6), hovertemplate="%{y:.3f}<extra>k</extra>"), row=2, col=1)
-    ks = e["logk_std"] if "logk_std" in e else None
-    if ks is not None and len(e):
-        add_band(fig, e["n"].to_numpy(), (e["k_ah"] * np.exp(-2 * ks) * 1e4).to_numpy(),
-                 (e["k_ah"] * np.exp(2 * ks) * 1e4).to_numpy(), P.ekf, "k ±2σ", group="k", alpha=0.15, row=2, col=1)
-    fig.update_xaxes(range=[0, n_max])
-    fig.update_xaxes(title_text="Discharge cycle n (data assimilated so far)", row=2, col=1)
-    fig.update_yaxes(title_text="EOL cycle", row=1, col=1)
-    fig.update_yaxes(title_text="k ×10⁴", row=2, col=1)
-    return style_fig(fig, P, 640, None)
 
 
 def fig_dp_policy(dp: te.DPResult, P: Palette) -> go.Figure:
@@ -1928,6 +1672,46 @@ def fig_lifetime_parity(el: Dict[str, Any], P: Palette, all_cells: Sequence[str]
 
 
 # =============================================================================
+# Figures: study results (cohort-wide evidence)
+# =============================================================================
+def fig_cohort_models(summary: pd.DataFrame, P: Palette) -> go.Figure:
+    """Median 20-cycle forecast RMSE per condition group and live model, with interquartile bars."""
+    d = summary.reset_index()
+    groups = [g for g in list(te.GROUP_ORDER) + ["All batteries"] if g in set(d["Group"])]
+    fig = go.Figure()
+    for m in [m for m in ("twin", "mech", "pf", "trend", "hb", "ens") if m in set(d["model"])]:
+        dm = d[d["model"] == m].set_index("Group").reindex(groups)
+        col = LIVE_COLORS.get(m) or P.text
+        fig.add_trace(go.Bar(
+            x=groups, y=dm["median RMSE"], name=te.LIVE_MODELS[m], marker=dict(color=col, line=dict(color=P.text, width=0.4)),
+            error_y=dict(type="data", symmetric=False, array=(dm["IQR high"] - dm["median RMSE"]).clip(lower=0),
+                         arrayminus=(dm["median RMSE"] - dm["IQR low"]).clip(lower=0), color=P.muted, thickness=1),
+            customdata=np.column_stack([dm["cells"].fillna(0), dm["coverage"]]),
+            hovertemplate="%{x}<br>median RMSE %{y:.4f}<br>%{customdata[0]:.0f} cells · coverage %{customdata[1]:.0%}"
+                          "<extra>" + html.escape(te.LIVE_MODELS[m]) + "</extra>"))
+    fig.update_layout(barmode="group", bargap=0.2)
+    fig.update_yaxes(title_text="Median 20-cycle forecast RMSE (SOH)")
+    fig.update_xaxes(title_text=None)
+    return style_fig(fig, P, 520, "Forecast error by operating condition and model (bars: interquartile range)",
+                     hovermode="closest")
+
+
+def fig_mech_groups(mech: pd.DataFrame, P: Palette) -> go.Figure:
+    """Mechanism shares attributed by the mechanistic particle filter, per condition group."""
+    fig = go.Figure()
+    groups = [g for g in te.GROUP_ORDER if g in set(mech["Group"])]
+    for k in te.MECH_NAMES:
+        fig.add_trace(go.Box(x=mech["Group"], y=mech[f"share_{k}"], name=k, marker_color=MECH_COLORS[k],
+                             boxpoints="all", jitter=0.4, pointpos=0, line=dict(width=1.5),
+                             hovertemplate="%{x}: %{y:.0%}<extra>" + k + "</extra>"))
+    fig.update_layout(boxmode="group")
+    fig.update_xaxes(categoryorder="array", categoryarray=groups)
+    fig.update_yaxes(title_text="Share of capacity lost", tickformat=".0%", range=[0, 1])
+    return style_fig(fig, P, 480, "Which mechanism dominates under which conditions? (mechanistic PF, one point per battery)",
+                     hovermode="closest")
+
+
+# =============================================================================
 # Cached data access & computation
 # =============================================================================
 @st.cache_resource(show_spinner=False)
@@ -1999,14 +1783,10 @@ def est_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, model:
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def pooled_ea_cached(_ct: pd.DataFrame, key: str, min_ambient: float) -> Dict[str, Any]:
-    return te.estimate_pooled_arrhenius(_ct, min_ambient_C=min_ambient)
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
 def replay_cached(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str,
                   soh_eol: float, level: float, cap_every: int = 10) -> Tuple[te.EKFResult, pd.DataFrame]:
-    r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(), te.DualTwinConfig(capacity_every=cap_every))
+    r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(),
+                         te.twin_config_for(_ct, cell, te.DualTwinConfig(capacity_every=cap_every)))
     n_max = int(r.per_cycle["n"].max() * 1.6)
     rows = []
     for n in r.per_cycle["n"].astype(int):
@@ -2042,6 +1822,31 @@ def half_cell_cached(_prep: pd.DataFrame, _ct_cell: pd.DataFrame, key: str, cell
 @st.cache_data(show_spinner=False, max_entries=8)
 def early_life_cached(_ct: pd.DataFrame, key: str, eol_ah: float, n_a: int, n_b: int) -> Dict[str, Any]:
     return te.early_life_lifetime(_ct, eol_ah, n_a, n_b)
+
+
+@st.cache_data(show_spinner=False, max_entries=4)
+def update_cohort_cached(_store: Any, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, eol_ah: float,
+                         cells: Tuple[str, ...]) -> pd.DataFrame:
+    rows = []
+    for c in cells:
+        g = _ct[(_ct["Cell_ID"] == c) & ~_ct["outlier"]]
+        soh_eol_c = te.soh_eol_for(float(g["C_bol_Ah"].iloc[0]), eol_ah)
+        n0 = int(max(5, round(0.4 * g["n"].max())))
+        try:
+            tab, _ = te.update_frequency_study(_store.cell_frame(c), _ct, _imp, c, te.TwinParameters(),
+                                               te.twin_config_for(_ct, c, te.DualTwinConfig()), n0, soh_eol_c,
+                                               intervals=(1, 5, 20))
+            rows.append({"Cell_ID": c, "recommended": tab.attrs.get("recommended"),
+                         **{f"RMSE every {m}": float(tab.loc[m, "Tracking RMSE"]) for m in tab.index}})
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def calibrated_plant_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str
+                            ) -> Tuple[te.CellPhysics, pd.DataFrame]:
+    return te.calibrate_plant(_ct, _imp, cell)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -2336,7 +2141,11 @@ with st.container(border=True):
         cell = st.selectbox("Target cell", cells, key="cell", format_func=_cell_label,
                             index=cells.index("B0005") if "B0005" in cells else 0)
     with g2:
-        eol_ah = st.number_input("End-of-life capacity (Ah)", 0.8, 2.0, float(te.DEFAULT_EOL_AH), 0.05)
+        eol_ah = st.number_input("End-of-life capacity (Ah)", 0.8, 2.0, float(te.DEFAULT_EOL_AH), 0.05,
+                                 help="The single end-of-life definition used by diagnostics, forecasts, RUL and the "
+                                      "study (NASA convention: 1.4 Ah = 30 % fade of 2 Ah). Each battery's SOH "
+                                      "threshold is this capacity divided by its own beginning-of-life capacity. "
+                                      "The replacement SOH in Operations is a separate, optimised decision.")
 
     c_bol = float(meta.loc[cell, "C_bol_Ah"])
     soh_eol = te.soh_eol_for(c_bol, eol_ah)
@@ -2787,6 +2596,171 @@ def live_accuracy_cards(sk: pd.DataFrame, fr: Any, show_models: Sequence[str], r
                              help=f"RMSE {r['RMSE']:.4f}; band coverage {100 * r['Band coverage']:.0f}%.")
 
 
+def _study_answers(res: Dict[str, Any]) -> Dict[str, List[str]]:
+    """Plain-language answers to the Mission questions, generated from the evidence."""
+    A: Dict[str, List[str]] = {"M1": [], "M2": [], "M3": []}
+    hi = res.get("hi")
+    if hi is not None and len(hi):
+        top = hi.iloc[0]
+        A["M1"].append(f"Best health indicator: {top['Indicator']} (fitness {top['Fitness']:.2f}); best operando "
+                       f"power-fade indicator: {hi[~hi.index.isin(['Capacity_Ah', 'E_dis_Wh', 't_dis_s', 'Q_ch_Ah', 't_cc_s'])].iloc[0]['Indicator'] if len(hi) > 1 else '—'}.")
+    pca = res.get("pca") or {}
+    if pca.get("available"):
+        ev = pca["explained"]
+        A["M1"].append(f"One parameter or several? PC1 explains {100 * ev[0]:.0f}% of indicator variance and PC2 "
+                       f"{100 * ev[1]:.0f}%: " + ("a single health parameter suffices." if pca["single_parameter"] else
+                                                  "ageing is multi-dimensional (capacity and power fade diverge), "
+                                                  "so the twin tracks SOH and two resistances."))
+    sf = res.get("sf") or {}
+    if sf.get("available"):
+        co = sf["coefficients"]
+        parts = [f"{f}: {r['Estimate']:.3g} [{r['90% CI low']:.3g}, {r['90% CI high']:.3g}]" for f, r in co.iterrows()]
+        A["M1"].append(f"Operating conditions ({sf['n_cells']} cells, R² {sf['r2']:.2f}): " + "; ".join(parts) + ".")
+    mc = res.get("mech_checks")
+    if mc is not None and len(mc):
+        A["M1"].append("Mechanisms: " + "; ".join(f"{k.lower()} → {r['Verdict']}" for k, r in mc.iterrows()) + ".")
+    summ = res.get("summary")
+    if summ is not None and len(summ):
+        allb = summ.loc["All batteries"] if "All batteries" in summ.index.get_level_values(0) else None
+        if allb is not None:
+            best = allb["median RMSE"].idxmin()
+            A["M2"].append(f"Across all batteries the most accurate 20-cycle forecaster is {te.LIVE_MODELS[best]} "
+                           f"(median RMSE {allb.loc[best, 'median RMSE']:.4f}, accuracy "
+                           f"{allb.loc[best, 'median accuracy (%)']:.2f}%, band coverage {allb.loc[best, 'coverage']:.0%}).")
+        for grp in [g for g in te.GROUP_ORDER if g in summ.index.get_level_values(0)]:
+            gs = summ.loc[grp]
+            b = gs["median RMSE"].idxmin()
+            A["M2"].append(f"{grp}: best {te.LIVE_MODELS[b]} ({gs.loc[b, 'median RMSE']:.4f}; twin "
+                           f"{gs['median RMSE'].get('twin', float('nan')):.4f}).")
+    pt = res.get("paired")
+    if pt is not None and len(pt) and "All batteries" in pt.index:
+        r = pt.loc["All batteries"]
+        A["M2"].append(f"Live ensemble vs twin (paired): better in {r['ens better in']} forecasts, median difference "
+                       f"{r['median difference']:+.4f}, Wilcoxon p = {r['Wilcoxon p']:.3g}.")
+    up = res.get("update")
+    if up is not None and len(up):
+        rec = up["recommended"].dropna()
+        if len(rec):
+            A["M2"].append(f"Update interval: the sparsest schedule within tolerance is every {int(rec.median())} "
+                           f"cycle(s) (median over {len(rec)} batteries; range {int(rec.min())}–{int(rec.max())}).")
+    om = st.session_state.get("om")
+    dp = st.session_state.get("dp")
+    if dp:
+        A["M3"].append(f"Dynamic programming on the calibrated plant: long-run profit rate {dp['eval']['rate']:.4f} CU/h, "
+                       f"replacement at SOH {dp['eval']['threshold']:.3f}, P(sudden failure) "
+                       f"{100 * dp['eval']['p_failure']:.1f}%.")
+    if om:
+        b = te.integrated_optimum(om["study"]).get("best")
+        if b:
+            A["M3"].append(f"Best grid policy: {b['policy']}, replace at SOH {b['threshold']:.2f} → {b['rate']:.4f} CU/h.")
+    if not A["M3"]:
+        A["M3"].append("Run the integrated optimisation and the DP in Operations & control (with the calibrated "
+                       "plant) to fill in this answer.")
+    return A
+
+
+def view_study() -> None:
+    section("Study results: answers to the Mission questions")
+    st.markdown("Runs the live multi-model twin on **every usable battery** and scores each model's forecasts "
+                "(made at 30% and 50% of recorded life, over the next 20 cycles) per operating-condition group, "
+                "with paired statistical tests, mechanism-physics checks and a cohort update-interval study. "
+                "Results use the NASA data loaded in this session; nothing here is synthetic unless the demo "
+                "cohort is loaded.")
+    groups = te.condition_groups(ct)
+    with st.expander(f"Evaluation groups · {groups['Group'].nunique()} groups, {len(groups)} batteries",
+                     icon=":material/category:"):
+        show_table(groups[["Group", "Ambient_C", "I_dis_A", "rest_frac", "cycles"]].sort_values("Group")
+                   .style.format({"Ambient_C": "{:.0f}", "I_dis_A": "{:.1f}", "rest_frac": "{:.2f}"}))
+        st.caption("Pulsed-load cells (square-wave discharge) use a pulse-aware twin (no partial-window voltage "
+                   "model). Corrupted-logging cells are reported separately so they do not distort the others.")
+    c1, c2 = st.columns(2)
+    n_est = int((groups["cycles"] >= 25).sum())
+    run = c1.button(f"Run cohort study (≈ {3 * n_est + 20} s)", key="study_go", type="primary",
+                    icon=":material/science:")
+    with_update = c2.toggle("Include cohort update-interval study", value=True, key="study_upd")
+    if run:
+        prog = st.progress(0.0, text="Starting…")
+        cb = lambda f, m: prog.progress(min(max(float(f), 0.0), 1.0), text=m)
+        try:
+            val, mech = te.cohort_validation(store, ct, imp, float(eol_ah), progress=cb)
+            res = {"val": val, "mech": mech, "summary": te.cohort_summary(val),
+                   "paired": te.paired_model_test(val, "ens", "twin") if len(val) else pd.DataFrame(),
+                   "mech_checks": te.mechanism_checks(mech), "hi": hi_rank_cached(ct, imp, DATA_KEY),
+                   "pca": hi_pca_cached(ct, imp, DATA_KEY), "sf": stress_factors_cached(ct, DATA_KEY)}
+            if with_update:
+                prog.progress(0.95, text="Update-interval study on representative batteries…")
+                reps = tuple(groups.reset_index().sort_values("cycles", ascending=False).groupby("Group").head(2)["Cell_ID"])
+                res["update"] = update_cohort_cached(store, ct, imp, DATA_KEY, float(eol_ah), reps)
+            st.session_state["study"] = {"key": DATA_KEY, "res": res}
+        except Exception as exc:
+            report_error("Cohort study failed", exc, debug)
+        prog.empty()
+    saved = st.session_state.get("study")
+    if not saved or saved["key"] != DATA_KEY:
+        st.info("Press **Run cohort study** to generate the evidence. It runs once per dataset and is kept for the "
+                "session.")
+        return
+    res = saved["res"]
+    A = _study_answers(res)
+    section("Mission 1 · Health, operating conditions and mechanisms")
+    card("Answers", A["M1"] or ["—"])
+    if res.get("hi") is not None and len(res["hi"]):
+        show(fig_hi_rank(res["hi"], P), key="st_hi", data=res["hi"].reset_index())
+    if len(res["mech"]):
+        show(fig_mech_groups(res["mech"], P), key="st_mech", data=res["mech"])
+    if res.get("mech_checks") is not None and len(res["mech_checks"]):
+        show_table(res["mech_checks"].style.format({"median share (group)": "{:.0%}", "median share (reference)": "{:.0%}",
+                                                    "Mann-Whitney p": "{:.3g}"}, na_rep="—"))
+        st.caption("The attribution is model-based. Where the half-cell fit is available, compare plating + SEI with "
+                   "the fitted LLI and the LAM share with the fitted LAM in Diagnostics.")
+    section("Mission 2 · Prediction accuracy, informative variables and update frequency")
+    card("Answers", A["M2"] or ["—"])
+    if len(res["summary"]):
+        show(fig_cohort_models(res["summary"], P), key="st_models", data=res["summary"].reset_index())
+        show_table(res["summary"].style.format({"median RMSE": "{:.4f}", "IQR low": "{:.4f}", "IQR high": "{:.4f}",
+                                                "median accuracy (%)": "{:.2f}", "coverage": "{:.0%}",
+                                                "median |RUL error|": "{:.0f}"}, na_rep="—"))
+    if res.get("paired") is not None and len(res["paired"]):
+        st.markdown("**Is the live ensemble reliably better than the twin?** (paired Wilcoxon test on forecast RMSE)")
+        show_table(res["paired"].style.format({c: "{:.4f}" for c in res["paired"].columns if "RMSE" in c or "difference" in c}
+                                              | {"Wilcoxon p": "{:.3g}"}, na_rep="—"))
+    if res.get("update") is not None and len(res["update"]):
+        st.markdown("**How often should the twin update?** (tracking RMSE when updating every 1, 5 or 20 cycles)")
+        show_table(res["update"].set_index("Cell_ID").style.format("{:.4f}", subset=[c for c in res["update"].columns
+                                                                                   if c.startswith("RMSE")]))
+    section("Mission 3 · Integrated operation and maintenance")
+    card("Answers", A["M3"])
+    try:
+        _, tab = calibrated_plant_cached(ct, imp, DATA_KEY, cell)
+        st.markdown(f"**Plant calibrated on {cell}** (used by Operations & control when calibration is on)")
+        show_table(tab.style.format({"Value": "{:.4g}"}))
+    except Exception:
+        pass
+    section("Export")
+    val_csv = res["val"].to_csv(index=False).encode()
+    download("Download all forecast scores (CSV)", val_csv, "cohort_validation.csv", "text/csv", key="st_csv")
+    if st.button("Build study report (HTML)", key="st_rep", icon=":material/description:"):
+        secs: List[Tuple[str, Any]] = [("Mission 1 answers", " | ".join(A["M1"]))]
+        if res.get("hi") is not None and len(res["hi"]):
+            secs.append(("Health-indicator ranking", fig_hi_rank(res["hi"], P)))
+        if len(res["mech"]):
+            secs += [("Mechanism shares by condition", fig_mech_groups(res["mech"], P)),
+                     ("Mechanism physics checks", res["mech_checks"])]
+        secs += [("Mission 2 answers", " | ".join(A["M2"]))]
+        if len(res["summary"]):
+            secs += [("Forecast error by condition and model", fig_cohort_models(res["summary"], P)),
+                     ("Cohort summary", res["summary"].reset_index())]
+        if res.get("paired") is not None and len(res["paired"]):
+            secs.append(("Live ensemble vs twin (paired test)", res["paired"].reset_index()))
+        if res.get("update") is not None and len(res["update"]):
+            secs.append(("Update-interval study", res["update"]))
+        secs += [("Mission 3 answers", " | ".join(A["M3"])), ("Evaluation groups", groups.reset_index())]
+        st.session_state["study_report"] = build_report_html("Self-updating digital twin · study results", secs)
+    if st.session_state.get("study_report"):
+        download("Download study report (HTML)", st.session_state["study_report"], "study_results.html", "text/html",
+                 key="st_rep_dl")
+
+
 def view_replay() -> None:
     section(f"Live twin replay · {cell}")
     st.markdown("The recorded life of the battery is streamed one discharge at a time. At every step the dual "
@@ -2801,18 +2775,17 @@ def view_replay() -> None:
     show_models = st.multiselect(
         "Live models", list(te.LIVE_MODELS),
         default=[m for m in ("twin", "mech", "pf", "trend", "ens") if m in te.LIVE_MODELS], key="rp_models",
-        format_func=lambda m: te.LIVE_MODELS[m] + (" · experimental, slow" if m == "pinn" else ""),
+        format_func=te.LIVE_MODELS.get,
         help="ECM twin: physics + operando voltage. Particle filter: power law with the fleet prior, robust to knees. "
              "Adaptive trend KF: level-slope-curvature filter that bends quickly when fade accelerates. Hierarchical "
              "Bayes: fleet-informed power law. Mechanistic PF: SEI, lithium-plating and LAM kinetics driven by each "
              "cycle's measured temperature and current, so the operating conditions decide which mechanism grows. "
-             "Mechanistic PINN: the same equations in a physics-informed network, retrained every 25 cycles "
-             "(adds ~15 s). Live ensemble: weights every model by its recent 5-cycle-ahead error.")
+             "Live ensemble: weights every model by its recent 5-cycle-ahead error.")
     with st.spinner("Streaming the battery through all models (runs once, then animates)…"):
         res, _track_old = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol),
                                         level, int(cap_every))
         st.session_state["ekf"] = {"key": (DATA_KEY, cell, "live"), "res": res}     # feeds Operations initialisation
-        run_models = ("twin", "mech", "pf", "trend", "hb") + (("pinn",) if "pinn" in show_models else ())
+        run_models = ("twin", "mech", "pf", "trend", "hb")
         frames, track = live_cached(res, ct, imp, DATA_KEY, cell, float(soh_eol), level, int(cap_every), run_models)
     pc = res.per_cycle
     ns = pc["n"].astype(int).tolist()
@@ -3481,300 +3454,6 @@ def pinn_equations_panel() -> None:
                    "voltage terms help, and plating is only resolved on cold or knee-bearing cells.")
 
 
-def fig_mechanisms(mech: pd.DataFrame, n0: int, ct_cell: pd.DataFrame, P: Palette) -> go.Figure:
-    fig = go.Figure()
-    names = {"Q_SEI": "SEI growth (LLI)", "Q_plating": "Lithium plating (LLI)", "Q_LAM": "Loss of active material"}
-    cols = {"Q_SEI": P.mode_colors[0], "Q_plating": P.mode_colors[3], "Q_LAM": P.mode_colors[1]}
-    for k in ("Q_SEI", "Q_plating", "Q_LAM"):
-        if k in mech and mech[k].abs().max() > 0:
-            fig.add_trace(go.Scatter(x=mech["n"], y=100 * mech[k], mode="lines", stackgroup="loss", name=names[k],
-                                     line=dict(color=cols[k], width=1.5), fillcolor=rgba(cols[k], 0.55),
-                                     hovertemplate="%{y:.2f}%<extra>" + names[k] + "</extra>"))
-    good = ct_cell[~ct_cell["outlier"]]
-    fig.add_trace(go.Scatter(x=good["n"], y=100 * (1 - good["SOH"]), mode="markers", name="Measured capacity loss",
-                             marker=dict(color=P.measured, size=5, opacity=0.8),
-                             hovertemplate="%{y:.2f}%<extra>measured</extra>"))
-    fig.add_vline(x=n0, line_dash="dot", line_color=P.muted, annotation_text="n₀",
-                  annotation_font=dict(color=P.muted))
-    fig.update_xaxes(title_text="Discharge cycle n")
-    fig.update_yaxes(title_text="Capacity loss (% of C₀)")
-    return style_fig(fig, P, 500, "PINN mechanism decomposition: which process consumes the capacity?")
-
-
-def physics_section() -> None:
-    section("Physics-informed benchmark: ML, ECM twin, PINN, semi-empirical and particle filter")
-    with st.expander("Observer and PINN settings", expanded=False):
-        h1, h2 = st.columns(2, gap="large")
-        with h1:
-            st.markdown("**ECM twin observer**")
-            observer = "dual"
-            if observer == "dual":
-                use_cap = st.toggle("Use full-discharge capacity measurements", value=False,
-                                    help="Off = operando setting: only partial-window voltage and load-step "
-                                         "resistance, as in cells that never see a reference discharge.")
-                win_frac = st.slider("Voltage window (fraction of BOL capacity)", 0.3, 0.9, 0.6, 0.05)
-                sig_v = st.slider("σᵥ voltage model error (mV)", 5, 60, 15, 1)
-                q_logk = st.select_slider("q_log k random walk per cycle", [0.005, 0.01, 0.02, 0.03, 0.05, 0.1],
-                                          value=0.03)
-                cap_every = st.select_slider("Reference capacity check every N cycles (0 = never)",
-                                             [0, 5, 10, 20, 50], value=10, disabled=use_cap,
-                                             help="A periodic full-capacity measurement anchors SOH, like the "
-                                                  "reference tests used in real fleets; between checks the twin "
-                                                  "runs on operando voltage and resistance only.")
-                n_eff = st.select_slider("Effective independent voltage samples per cycle", [1, 2, 3, 5, 10, 25],
-                                         value=3, help="Voltage-model errors are correlated along a discharge "
-                                                       "curve; treating all 25 samples as independent makes the "
-                                                       "twin overconfident.")
-                dual_cfg = te.DualTwinConfig(use_capacity=use_cap, voltage_window_frac=float(win_frac),
-                                             sigma_v=sig_v / 1000.0, q_logk=float(q_logk),
-                                             capacity_every=0 if use_cap else int(cap_every), voltage_n_eff=float(n_eff))
-                twin_params = te.TwinParameters()
-            else:
-                dual_cfg = te.DualTwinConfig()
-                sigma_v = st.slider("σᵥ voltage noise (V)", 0.005, 0.200, 0.080, 0.005, format="%.3f")
-                q_soh = st.select_slider("q_SOH random walk (per Ah)", [1e-5, 5e-5, 1e-4, 5e-4, 1e-3, 5e-3],
-                                         value=5e-4, format_func=lambda v: f"{v:.0e}")
-                tau = st.slider("τ RC time constant (s)", 10, 300, 60, 10)
-                twin_params = te.TwinParameters(sigma_v=sigma_v, q_soh_per_ah=q_soh, tau_rc_s=float(tau))
-        with h2:
-            st.markdown("**Hybrid PINN**")
-            physics = st.radio("Physics", list(te.PINN_PHYSICS), index=1, key="pinn_physics", horizontal=True,
-                               format_func={"lumped": "Lumped fade law", "mechanistic": "Mechanism-resolved"}.get,
-                               help="Mechanism-resolved: separate SEI, lithium-plating and LAM kinetics with "
-                                    "resistance coupling and an electrochemical voltage equation.")
-            mech_on = physics == "mechanistic"
-            m1, m2, m3 = st.columns(3)
-            use_sei = m1.toggle("SEI", value=True, disabled=not mech_on, key="pinn_sei")
-            use_pl = m2.toggle("Plating", value=True, disabled=not mech_on, key="pinn_pl")
-            use_lam = m3.toggle("LAM", value=True, disabled=not mech_on, key="pinn_lam")
-            lam_volt = st.select_slider("λ voltage (mean discharge voltage)", [0.0, 0.1, 0.3, 1.0, 3.0], value=0.3,
-                                        disabled=not mech_on)
-            t_on = st.slider("Cold-plating onset (°C)", 0.0, 25.0, 10.0, 1.0, disabled=not mech_on)
-            epochs = st.select_slider("Training epochs", [300, 500, 1000, 1500, 2500, 4000], value=1500)
-            members = st.slider("Ensemble members (seeds)", 1, 5, 3,
-                                help="More than one member adds an epistemic band and an identifiability table.")
-            ea_mode = st.selectbox("Activation energy Eₐ", list(te.EA_MODES), index=0,
-                                   format_func={"fixed": "Fixed (literature value)",
-                                                "pooled": "Pooled across the cohort",
-                                                "learned": "Learned per cell (not identifiable)"}.get)
-            ea_fixed = st.number_input("Fixed Eₐ (kJ/mol)", 10.0, 120.0, 30.0, 1.0, disabled=ea_mode != "fixed")
-            lam_phys = st.select_slider("λ physics", [0.0, 0.1, 0.3, 1.0, 3.0, 10.0], value=1.0)
-            lam_bv = st.select_slider("λ Butler–Volmer", [0.0, 0.1, 0.3, 1.0, 3.0], value=0.3)
-            lam_eis = st.select_slider("λ EIS anchoring", [0.0, 0.1, 0.5, 1.0, 3.0], value=0.5)
-        if mech_on and not (use_sei or use_pl or use_lam):
-            st.warning("Enable at least one degradation mechanism; using SEI.")
-            use_sei = True
-        pinn_cfg = te.PINNConfig(epochs=int(epochs), lambda_phys=float(lam_phys), lambda_bv=float(lam_bv),
-                                 lambda_eis=float(lam_eis), ea_mode=ea_mode, ea_fixed_J_mol=float(ea_fixed) * 1e3,
-                                 physics=physics, use_sei=use_sei, use_plating=use_pl, use_lam=use_lam,
-                                 lambda_volt=float(lam_volt), T_plating_onset_C=float(t_on))
-    pinn_equations_panel()
-
-    if ea_mode == "pooled":
-        est = pooled_ea_cached(ct, DATA_KEY, 15.0)
-        if est["Ea_J_mol"] is None:
-            st.info("Pooled Eₐ needs at least three cells above 15 °C; the fixed value will be used.")
-        else:
-            verdict = ("identified" if est["identifiable"] else
-                       f"not identified (temperature span {est['temp_span_C']:.0f} °C) — fixed value used")
-            card("Cohort Arrhenius regression", [
-                f"Eₐ = {est['Ea_J_mol'] / 1e3:.1f} kJ/mol, 90% bootstrap CI "
-                f"{fmt(est['ci_lo'] / 1e3 if est['ci_lo'] else None, '.1f')}–"
-                f"{fmt(est['ci_hi'] / 1e3 if est['ci_hi'] else None, '.1f')} kJ/mol, {verdict}",
-                f"{est['n_cells']} cells, temperature span {est['temp_span_C']:.0f} °C"
-                + (f", current exponent α = {est['alpha_I']:.2f}" if est.get("alpha_I") is not None else "")])
-
-    c1, c2, c3, c4 = st.columns(4)
-    frac2 = c1.slider("Forecast origin n₀ (fraction of life)", 0.2, 0.8, 0.4, 0.05, key="cmp_frac")
-    ml_pick = c2.selectbox("ML reference model", list(te.ML_MODELS), index=1)
-    level = c3.select_slider("Band level", [0.8, 0.9, 0.95], value=0.9, key="cmp_level")
-    reuse = c4.toggle("Reuse cached observer run", value=True)
-    st.markdown("**Paradigms to compare**")
-    d = st.columns(4)
-    use_semi = d[0].toggle("Semi-empirical law", value=True,
-                           help="SOH = s0[1 − B·Ah^z] (Wang et al. 2011) with a cohort prior on z.")
-    use_hb = d[1].toggle("Hierarchical Bayes", value=True,
-                         help="Partial pooling: the fleet (with temperature and current covariates) is the prior, "
-                              "this battery's data update it.")
-    use_pf = d[2].toggle("Particle filter", value=True,
-                         help="Sequential Monte Carlo on the physics power law with the hierarchical prior.")
-    use_gp = d[3].toggle("Physics-mean GP", value=True,
-                         help="Hierarchical-Bayes trend + Gaussian-process residual.")
-    e_ = st.columns(4)
-    use_ens = e_[0].toggle("Stacked ensemble", value=True,
-                           help="Skill-weighted combination (weights from a backtest on this battery's own history).")
-    run_pinn = e_[1].toggle("Hybrid PINN", value=True, help="Switch off for a fast comparison (the PINN takes seconds).")
-    hc = st.session_state.get("hc")
-    has_modes = bool(hc and hc[0] == cell and len(hc[1][0]))
-    use_modes = e_[2].toggle("Constrain PINN with half-cell modes", value=has_modes, disabled=not has_modes,
-                             help="Uses the LLI / LAM fitted in Data › half-cell OCV fitting (cycles ≤ n₀ only). "
-                                  "Run that fit first for this battery.")
-    extra = tuple(k for k, on in (("semi", use_semi), ("pf", use_pf), ("hb", use_hb), ("gp", use_gp),
-                                  ("ens", use_ens)) if on)
-    mode_targets = hc[1][0] if (use_modes and has_modes) else None
-    obs_key = (DATA_KEY, cell, observer, tuple(sorted(asdict(twin_params).items())),
-               tuple(sorted(asdict(dual_cfg).items())))
-    cmp_cfg = dict(cell=cell, observer=observer, frac=frac2, ml_model=ml_pick, band_level=level,
-                   eol_ah=float(eol_ah), twin=asdict(twin_params), dual=asdict(dual_cfg), pinn=asdict(pinn_cfg),
-                   pinn_seeds=list(range(members)), extra=list(extra), run_pinn=run_pinn,
-                   pinn_modes=mode_targets is not None)
-
-    if st.button("Run benchmark on this cell", type="primary", key="cmp_go"):
-        bar = st.progress(0.0, text="Initialising observer…")
-        try:
-            cached = st.session_state.get("ekf")
-            ekf_res = cached["res"] if (reuse and cached and cached["key"] == obs_key) else None
-            raw = cell_frame(store, DATA_KEY, cell)
-            res_new = te.compare_paradigms(raw, ct, imp, cell, frac2, twin_params, pinn_cfg, ml_pick, eol_ah,
-                                           ekf=ekf_res, progress=lambda f, m: bar.progress(f, text=m),
-                                           observer=observer, dual_cfg=dual_cfg, band_level=level,
-                                           pinn_seeds=tuple(range(members)), extra=extra, run_pinn=run_pinn,
-                                           mode_targets=mode_targets)
-            if res_new.ekf is not None:
-                st.session_state["ekf"] = {"key": obs_key, "res": res_new.ekf}
-            st.session_state["cmp"] = {"cfg": cmp_cfg, "res": res_new}
-        except Exception as exc:
-            report_error("Benchmark failed", exc, debug)
-        finally:
-            bar.empty()
-
-    saved = st.session_state.get("cmp")
-    if not saved:
-        return
-    res: te.ComparisonResult = saved["res"]
-    if res.cell_id != cell:
-        st.info(f"The stored benchmark belongs to {res.cell_id}. Run the benchmark to update it.")
-        return
-    if saved["cfg"] != cmp_cfg:
-        st.warning("Settings changed since the last run; the results below use the previous settings.")
-    for name, msg in res.errors.items():
-        st.warning(f"{name}: {msg}")
-
-    mcols = st.columns(max(len(res.metrics), 1))
-    for col, (name, m) in zip(mcols, res.metrics.items()):
-        if m.censored:
-            delta = f"censored: true RUL > {m.rul_true_lb}"
-        elif m.rul_error is not None:
-            delta = f"RUL error {m.rul_error:+d} cycles"
-        else:
-            delta = None
-        cov = "" if m.coverage is None else f" · coverage {m.coverage:.0%}"
-        col.metric(f"{name} RMSE{cov}", fmt(m.rmse, ".4f"), delta, delta_color="off")
-
-    data = pd.concat([pd.DataFrame({"paradigm": k, "n": n, "soh": p}) for k, (n, p) in res.predictions.items()]) \
-        if res.predictions else None
-    show(fig_compare(res, P), key="cmp_fig", data=data)
-    with st.expander("Held-out metrics table"):
-        show_table(te.metrics_table(res.metrics).style.format(
-            {"RMSE": "{:.4f}", "MAE": "{:.4f}", "R²": "{:.3f}", "RUL true": "{:.0f}", "RUL pred": "{:.0f}",
-             "RUL error": "{:+.0f}", "RA": "{:.2f}", "Coverage": "{:.2f}", "Band width": "{:.4f}",
-             "RUL lower bound": "{:.0f}"}, na_rep="—"))
-    manifest_button(cmp_cfg, "comparison", DATA_KEY, {"errors": res.errors, "ea": (res.ea or {}).get("Ea_J_mol")})
-
-    a = b = st.container()  # stacked full width
-    with a:
-        show(fig_params(res, P), key="cmp_params", export=False)
-        if res.rul_samples:
-            m = next(iter(res.metrics.values()), None)
-            show(fig_rul_hist(res.rul_samples, m.rul_true if m else None, m.rul_true_lb if m else None, P),
-                 key="rul_hist", data=pd.concat([pd.DataFrame({"paradigm": k, "rul_samples": v})
-                                                 for k, v in res.rul_samples.items()]))
-        pr = getattr(res, "prognostics", {}) or {}
-        lines = []
-        if te.SEMI_NAME in pr:
-            q = pr[te.SEMI_NAME].params
-            regime = ("diffusion-limited SEI (≈ √Ah)" if q["z"] < 0.75 else "near-linear in throughput"
-                      if q["z"] < 1.25 else "accelerating")
-            lines.append(f"Semi-empirical: z = {q['z']:.2f} ({regime}; cohort prior {q['z_prior']:.2f}), "
-                         f"B = {q['B']:.2e}, {q['Ah_per_cycle']:.2f} Ah per cycle ahead")
-        if te.PF_NAME in pr:
-            q = pr[te.PF_NAME].params
-            lines.append(f"Particle filter: prior from {q['prior_cells']} cohort fits, {q['n_particles']} particles, "
-                         f"{q['resampling_steps']} resampling steps")
-        if te.HB_NAME in pr:
-            q = pr[te.HB_NAME].params
-            lines.append(f"Hierarchical Bayes: z = {q['z']:.2f} (fleet prior {q['prior_z']:.2f}); the forecast still "
-                         f"leans {100 * q['prior_weight']:.0f}% on the fleet prior ({q['population_cells']} cells"
-                         f"{', temperature/current covariates' if q['covariates'] else ''})")
-        if te.ENS_NAME in pr:
-            wts = pr[te.ENS_NAME].params["weights"]
-            lines.append("Ensemble weights (backtest skill): " + ", ".join(f"{k.split(' · ')[0]} {v:.2f}"
-                                                                           for k, v in wts.items()))
-        if lines:
-            card("Prognostic model parameters", lines)
-    with b:
-        if res.ekf is not None:
-            sig = float(res.ekf.config.get("sigma_v", res.ekf.params.get("sigma_v", 0.02)))
-            show(fig_innovation(res.ekf, sig, P), key="cmp_innov", data=res.ekf.per_cycle)
-            if res.ekf.kind == "dual":
-                pc = res.ekf.per_cycle
-                st.caption(f"Degradation rate k: prior {res.ekf.params.get('k_prior', float('nan')):.2e} → "
-                           f"personalised {pc['k_ah'].iloc[-1]:.2e} per Ah · mean NIS/dof "
-                           f"{pc['NIS_norm'].mean():.2f} · runtime {res.ekf.runtime_s:.2f} s")
-        if res.pinn is not None:
-            show(fig_pinn_loss(res.pinn, P), key="cmp_loss", export=False)
-
-    if res.pinn is not None and getattr(res.pinn, "physics_kind", "lumped") == "mechanistic":
-        section("Degradation mechanisms identified by the PINN")
-        ph = res.pinn.physics
-        if res.pinn.mechanisms is not None:
-            show(fig_mechanisms(res.pinn.mechanisms, res.n0, ct_cell, P), key="pinn_mech",
-                 data=res.pinn.mechanisms)
-        shares = {k: ph.get(f"share_{k}_at_n0") for k in ("SEI", "plating", "LAM")}
-        dom = max((k for k in shares if shares[k] is not None), key=lambda k: shares[k], default=None)
-        kin = []
-        if "k_SEI_per_cycle" in ph:
-            kin.append(f"SEI: k = {ph['k_SEI_per_cycle']:.2e} per cycle, δ = {ph['delta_SEI']:.3f} "
-                       f"({'diffusion-limited, √n' if ph['delta_SEI'] < 0.02 else 'reaction-limited, near-linear'}); "
-                       f"{100 * ph['share_SEI_at_n0']:.0f}% of the loss at n₀")
-        if "k_plating_per_cycle" in ph:
-            kin.append(f"Plating: k = {ph['k_plating_per_cycle']:.2e}, LAM coupling κ = {ph['kappa_LAM_to_plating']:.2f}; "
-                       f"{100 * ph['share_plating_at_n0']:.0f}% of the loss")
-        if "k_LAM_per_cycle" in ph:
-            kin.append(f"LAM: k = {ph['k_LAM_per_cycle']:.2e}, acceleration ε = {ph['eps_LAM_acceleration']:.3f}; "
-                       f"{100 * ph['share_LAM_at_n0']:.0f}% of the loss")
-        card(f"Degradation kinetics (dominant at n₀: {dom or '—'})", kin)
-        card("Electrochemistry (Butler–Volmer, Arrhenius kinetics)", [
-            f"Exchange current i₀: {ph['i0_start_A']:.3f} A at start, {ph['i0_at_n0_A']:.3f} A at n₀; "
-            f"η_ct at 2 A = {ph['eta_ct_2A_n0_mV']:.0f} mV at n₀",
-            f"Mean open-circuit voltage Ū = {ph['U_bar_V']:.3f} V; fast polarisation R_x = {ph['R_x_mOhm']:.1f} mΩ",
-            f"SEI film resistance coupling ρ = {ph['rho_SEI']:.2f}"
-            + (f"; active-area loss coupling γ_LAM = {ph['gamma_ct_LAM']:.2f}" if "gamma_ct_LAM" in ph else ""),
-            f"Training time {res.pinn.train_seconds:.1f} s ({res.pinn.n_members} member(s))"])
-        if res.pinn.physics_table is not None:
-            st.markdown("**Identifiability across ensemble members** (coefficient of variation above 0.25 = not "
-                        "constrained by this cell's data)")
-            show_table(res.pinn.physics_table.style.format({"mean": "{:.4g}", "std": "{:.3g}", "cv": "{:.2f}"},
-                                                           na_rep="—"))
-    elif res.pinn is not None:
-        section("Identified electrochemical parameters (hybrid PINN)")
-        ph = res.pinn.physics
-        m_exp = ph["m_SEI_exponent"]
-        regime = ("self-limiting, SEI-like growth" if m_exp > 0.2 else
-                  "self-accelerating, knee-like" if m_exp < -0.2 else "near-linear in throughput")
-        ea_note = {"fixed": "fixed", "pooled": "pooled across cohort", "learned": "learned"}.get(res.pinn.ea_mode, "")
-        p1, p2 = st.columns(2, gap="medium")
-        with p1:
-            card("Degradation kinetics", [
-                f"Rate constant k = {ph['k_per_Ah']:.2e} per Ah",
-                f"Activation energy Eₐ = {ph['Ea_kJ_mol']:.1f} kJ mol⁻¹ ({ea_note})",
-                f"Fade exponent m = {m_exp:.2f} ({regime})",
-                f"Resistance coupling γ_int = {ph['gamma_int']:.2f}, γ_ct = {ph['gamma_ct']:.2f}"])
-        with p2:
-            card("Charge transfer (Butler–Volmer)", [
-                f"Exchange current i₀: {ph['i0_start_A']:.3f} A at start, {ph['i0_at_n0_A']:.3f} A at n₀",
-                f"Overpotential η_ct at 2 A: {ph['eta_ct_2A_start_mV']:.0f} mV to {ph['eta_ct_2A_n0_mV']:.0f} mV",
-                f"Lumped fast polarisation R_x = {ph['R_x_mOhm']:.1f} mΩ",
-                f"Training time {res.pinn.train_seconds:.1f} s ({res.pinn.n_members} member(s))"])
-        if res.pinn.physics_table is not None:
-            st.markdown("**Identifiability across ensemble members** (randomised physical initialisation; "
-                        "coefficient of variation above 0.25 = not constrained by this cell's data)")
-            show_table(res.pinn.physics_table.style.format({"mean": "{:.4g}", "std": "{:.3g}", "cv": "{:.2f}"},
-                                                           na_rep="—"))
-            st.caption("The ensemble band reflects optimisation / initialisation spread only (epistemic), "
-                       "not measurement noise, and is usually too narrow to be a calibrated interval.")
-
-
 def ablation_section() -> None:
     section("Does voltage feedback add information? Measurement ablation")
     st.markdown("The dual twin is re-run with measurement subsets. *Open loop* uses only the cohort prior; "
@@ -3835,7 +3514,7 @@ def cross_cell_section() -> None:
         fracs = c2.multiselect("Origins (fraction of life)", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7], default=[0.3, 0.5],
                                key="bench_fracs")
         pars = c3.multiselect("Paradigms", [p_ for p_ in te.BENCH_PARADIGMS if p_ != "PINN"],
-                              default=["ML", "Twin", "HB", "PF"],
+                              default=[p_ for p_ in ("ML", "Twin", "HB") if p_ in te.BENCH_PARADIGMS],
                               key="bench_pars", format_func={"ML": "ML surrogate", "Twin": "ECM twin (dual EKF)",
                                                              "PINN": "Hybrid PINN", "SemiEmp": "Semi-empirical",
                                                              "PF": "Particle filter", "HB": "Hierarchical Bayes",
@@ -4011,7 +3690,9 @@ def view_ops() -> None:
         t_max = s1.slider("Max cell temperature (°C)", 40, 60, 55)
         cold_rule = s2.toggle("Cold-temperature derating", value=True)
         cold_thr = s3.slider("Cold threshold (°C)", 0, 20, 10, disabled=not cold_rule)
-        soh_eol_ops = s4.slider("Replacement SOH", 0.60, 0.85, 0.70, 0.01)
+        soh_eol_ops = s4.slider("Replacement SOH (decision)", 0.60, 0.85, 0.70, 0.01,
+                                help="When the operator replaces the cell: a maintenance decision optimised in the "
+                                     "integrated study and the DP, not the physical end-of-life definition.")
         e1, e2, e3, e4 = st.columns(4)
         amb_mean = e1.slider("Mean ambient (°C)", 0, 35, 20)
         amb_amp = e2.slider("Seasonal ambient amplitude (°C)", 0, 20, 16)
@@ -4028,10 +3709,25 @@ def view_ops() -> None:
                         degradation_weight=float(weight), T_max_C=float(t_max),
                         cold_derate_below_C=float(cold_thr) if cold_rule else None, objective=objective,
                         energy_price_per_Wh=float(e_price))
-    phys = te.CellPhysics()
+    calib = st.toggle(f"Calibrate the plant on the selected battery ({cell})", value=True, key="ops_calib",
+                      help="Capacity, resistances and the battery's own fade rate from its data; activation energy, "
+                           "current exponent and cold multiplier from the cohort stress regression. Off = a generic "
+                           "18650 cell.")
+    if calib:
+        try:
+            phys, calib_tab = calibrated_plant_cached(ct, imp, DATA_KEY, cell)
+            with st.expander(f"Calibrated plant for {cell}", icon=":material/tune:"):
+                show_table(calib_tab.style.format({"Value": "{:.4g}"}))
+                st.caption("Mission 1–2 results feed Mission 3: the optimiser now plans for this battery's measured "
+                           "behaviour instead of a generic cell.")
+        except Exception as exc:
+            report_error("Plant calibration failed; using the generic cell", exc, debug)
+            phys = te.CellPhysics()
+    else:
+        phys = te.CellPhysics()
     if use_twin and ekf_saved:
         r = ekf_saved["res"]
-        phys = te.CellPhysics(k_ah=float(r.params["k_ah"]), R_int0=float(r.r_int0), R_ct0=float(r.r_ct0))
+        phys = replace(phys, k_ah=float(r.params["k_ah"]), R_int0=float(r.r_int0), R_ct0=float(r.r_ct0))
     plant = te.perturb_physics(phys, float(mismatch), np.random.default_rng(int(seed))) if mismatch > 0 else None
     ops_cfg = dict(policy=policy, econ=asdict(econ), phys=asdict(phys), plant=asdict(plant) if plant else None,
                    amb_mean=amb_mean, amb_amp=amb_amp, show_base=show_base)
@@ -4174,7 +3870,6 @@ def dp_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional[te.Cell
         st.caption("Run the integrated optimisation above to compare the DP with the best grid policy.")
 
 
-
 def scenario_section() -> None:
     section("What-if scenario planner")
     sf = stress_factors_cached(ct, DATA_KEY)
@@ -4311,7 +4006,7 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # Dispatch: only the active view runs
 # =============================================================================
 _VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_data, VIEWS[1]: view_replay, VIEWS[2]: view_models,
-                                           VIEWS[3]: view_ops}
+                                           VIEWS[3]: view_ops, VIEWS[4]: view_study}
 try:
     _VIEW_FN.get(view, view_data)()
 except Exception as exc:

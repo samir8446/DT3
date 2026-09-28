@@ -12,6 +12,7 @@ import os
 import sys
 
 import numpy as np
+from pathlib import Path
 import pandas as pd
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -131,7 +132,7 @@ def test_twin_forecast_band_and_rul_samples():
 # ------------------------------------------------------------------------ ML --
 def test_increment_ml_extrapolates_beyond_training_horizon():
     _, ct, _, _ = synthetic()
-    r = te.train_ml_forecast(ct, "S004", 36, "Random Forest", strategy="increment")
+    r = te.train_ml_forecast(ct, "S004", 36, "Extra Trees", strategy="increment")
     n_train_max = 90
     assert r.soh_pred[-1] < r.soh_pred[n_train_max - 1] - 0.01       # keeps fading past n = 90
     assert np.all(np.diff(r.soh_pred[36:]) <= 1e-12)                  # monotone forecast
@@ -249,7 +250,7 @@ def test_small_benchmark_runs():
 def test_compare_paradigms_end_to_end():
     store, ct, imp, _ = synthetic()
     res = te.compare_paradigms(store.cell_frame("S003"), ct, imp, "S003", 0.4, te.TwinParameters(),
-                               te.PINNConfig(epochs=80), "Ridge", conformal_cells=2, pinn_seeds=(0, 1))
+                               te.PINNConfig(epochs=80), "Bayesian Ridge", conformal_cells=2, pinn_seeds=(0, 1))
     assert not res.errors, res.errors
     assert set(res.bands) == set(res.predictions)
     assert te.TWIN_NAMES["dual"] in res.rul_samples
@@ -317,23 +318,6 @@ def test_stress_exposure_and_condition_regression():
 
 
 # ------------------------------------------------- v4.1: prognostic paradigms --
-def test_semi_empirical_recovers_linear_throughput_law():
-    _, ct, _, _ = synthetic()
-    f = te.semi_empirical_forecast(ct, "S004", 36, eol_ah=1.6)
-    assert 0.7 < f.params["z"] < 1.3                                        # synthetic fade is linear in Ah
-    fut = f.n_grid > 36
-    assert np.all(f.lo[fut] <= f.soh[fut] + 1e-12) and np.all(f.soh[fut] <= f.hi[fut] + 1e-12)
-    assert f.metrics.rmse < 0.02
-
-
-def test_particle_filter_forecast():
-    _, ct, _, _ = synthetic()
-    f = te.particle_filter_forecast(ct, "S004", 36, eol_ah=1.6, n_particles=1500)
-    assert f.params["prior_cells"] >= 3 and f.metrics.rmse < 0.04
-    assert f.rul_samples is not None and len(f.rul_samples) > 100
-    fut = f.n_grid > 36
-    assert np.all(f.lo[fut] <= f.hi[fut])
-
 
 def test_gaussian_process_surrogate():
     _, ct, _, _ = synthetic()
@@ -341,16 +325,7 @@ def test_gaussian_process_surrogate():
     assert np.isfinite(r.metrics.rmse) and r.metrics.rmse < 0.05
 
 
-def test_compare_paradigms_includes_new_paradigms_without_pinn():
-    store, ct, imp, _ = synthetic()
-    res = te.compare_paradigms(store.cell_frame("S003"), ct, imp, "S003", 0.4, te.TwinParameters(),
-                               te.PINNConfig(epochs=20), "Ridge", conformal_cells=0, run_pinn=False)
-    assert te.SEMI_NAME in res.predictions and te.PF_NAME in res.predictions
-    assert te.PINN_NAME not in res.predictions and te.PINN_NAME not in res.errors
-    assert {te.SEMI_NAME, te.PF_NAME} <= set(res.rul_samples)
 
-
-# --------------------------------------------------- v4.1: Mission 2 studies --
 def test_update_frequency_study_and_information_gain():
     store, ct, imp, _ = synthetic()
     soh_eol = te.soh_eol_for(float(ct[ct["Cell_ID"] == "S004"]["C_bol_Ah"].iloc[0]), 1.6)
@@ -395,12 +370,6 @@ def test_maintenance_hazard_and_integrated_study():
     r = study.iloc[0]
     assert abs(r["profit"] - (r["J_op"] - r["maintenance_cost"])) < 1e-6
 
-
-def test_benchmark_with_new_paradigms():
-    store, ct, imp, _ = synthetic()
-    cfg = te.BenchmarkConfig(fracs=(0.4,), paradigms=("SemiEmp", "PF"), eol_ah=1.6)
-    bench, _ = te.run_benchmark(store, ct, imp, cfg, cells=["S002"])
-    assert set(bench["paradigm"]) == {te.SEMI_NAME, te.PF_NAME} and bench["error"].isna().all()
 
 
 def test_cycle_index_dtype_from_foreign_parquet():
@@ -448,27 +417,26 @@ def test_robust_baseline_repairs_crashed_logging_segment():
 def test_model_registry_all_models_and_param_validation():
     X = np.random.default_rng(0).normal(size=(60, 3))
     y = X[:, 0] - 0.5 * X[:, 1] ** 2
-    assert 6 <= len(te.ML_MODELS) <= 10
+    assert set(te.ML_MODELS) == {"Extra Trees", "Hist. Gradient Boosting", "Gaussian Process", "Bayesian Ridge"}
     for name in te.ML_MODELS:
         m = te.make_model(name, 0, te.default_params(name)).fit(X, y)
         assert np.all(np.isfinite(m.predict(X))), name
     for bad in ({"n_estimators": 5}, {"nope": 1}):
         try:
-            te.validate_params("Random Forest", bad)
+            te.validate_params("Extra Trees", bad)
             raise AssertionError(f"accepted {bad}")
         except ValueError:
             pass
-    assert te.validate_params("MLP", {"hidden": "32, 16"})["hidden"] == "32,16"
 
 
 def test_ml_forecast_hyperparams_and_cross_battery():
     _, ct, _, _ = synthetic()
     f = te.train_ml_forecast(ct, "S004", 36, "Extra Trees", eol_ah=1.6, model_params={"n_estimators": 60})
     assert np.isfinite(f.metrics.accuracy) and f.metrics.accuracy > 95 and f.metrics.fade_skill > 0.5
-    x = te.train_ml_forecast(ct, "S004", 10, "Ridge", eol_ah=1.6, train_cells=["S005"])
+    x = te.train_ml_forecast(ct, "S004", 10, "Bayesian Ridge", eol_ah=1.6, train_cells=["S005"])
     assert np.isfinite(x.metrics.rmse)
     try:
-        te.train_ml_forecast(ct, "S004", 10, "Ridge", train_cells=["S004"])
+        te.train_ml_forecast(ct, "S004", 10, "Bayesian Ridge", train_cells=["S004"])
         raise AssertionError("target-only training list accepted")
     except ValueError:
         pass
@@ -478,14 +446,14 @@ def test_soh_estimator_splits_and_leakage_guard():
     _, ct, imp, _ = synthetic()
     for split, kw in (("random", {}), ("chronological", {}),
                       ("by_cell", {"train_cells": ["S001", "S002", "S003"], "test_cells": ["S004"]})):
-        r = te.train_soh_estimator(ct, imp, "Random Forest", split=split, test_frac=0.3,
+        r = te.train_soh_estimator(ct, imp, "Extra Trees", split=split, test_frac=0.3,
                                    params={"n_estimators": 60}, **kw)
         assert set(r.metrics.index) == {"train", "test"} and r.metrics.loc["test", "Cycles"] >= 3
         assert r.metrics.loc["test", "R²"] > 0 and len(r.importance) == len(r.features)
-    r = te.train_soh_estimator(ct, imp, "Ridge", split="by_cell", train_cells=["S001", "S002"], test_cells=["S006"])
+    r = te.train_soh_estimator(ct, imp, "Bayesian Ridge", split="by_cell", train_cells=["S001", "S002"], test_cells=["S006"])
     assert set(r.predictions.loc[r.predictions["set"] == "test", "Cell_ID"]) == {"S006"}
     try:
-        te.train_soh_estimator(ct, imp, "Ridge", features=["Capacity_Ah", "R_dc_ohm"])
+        te.train_soh_estimator(ct, imp, "Bayesian Ridge", features=["Capacity_Ah", "R_dc_ohm"])
         raise AssertionError("capacity leakage accepted")
     except ValueError:
         pass
@@ -589,21 +557,7 @@ def test_hierarchical_bayes_shrinks_with_data_and_is_calibrated():
     assert late.metrics.rmse < 0.02 and late.metrics.coverage >= 0.5
     pop = te.hierarchical_population(ct, exclude="S004")
     assert pop["available"] and pop["Sigma"].shape == (2, 2)
-    g = te.physics_gp_forecast(ct, "S004", 45, eol_ah=1.6)
-    assert np.isfinite(g.metrics.rmse) and g.metrics.rmse < 0.03
 
-
-def test_physics_particle_filter_and_ensemble():
-    store, ct, imp, _ = synthetic()
-    pf = te.particle_filter_forecast(ct, "S004", 36, eol_ah=1.6, n_particles=1500)
-    assert pf.name == te.PF_NAME and pf.metrics.rmse < 0.03 and pf.params["prior_cells"] >= 3
-    res = te.compare_paradigms(store.cell_frame("S004"), ct, imp, "S004", 0.4, te.TwinParameters(),
-                               te.PINNConfig(epochs=20), "Ridge", conformal_cells=0, run_pinn=False, eol_ah=1.6)
-    assert {te.HB_NAME, te.GP_NAME, te.ENS_NAME} <= set(res.predictions), res.errors
-    w = res.prognostics[te.ENS_NAME].params["weights"]
-    assert abs(sum(w.values()) - 1) < 1e-6 and len(w) >= 3
-    ens = res.metrics[te.ENS_NAME]
-    assert ens.rmse <= max(res.metrics[m].rmse for m in w) + 1e-9          # never worse than the worst member
 
 
 def test_pinn_half_cell_mode_coupling():
@@ -621,11 +575,11 @@ def test_pinn_half_cell_mode_coupling():
 
 def test_hyperparameter_tuning_is_leakage_free_and_never_worse_on_validation():
     _, ct, imp, _ = synthetic()
-    r = te.tune_ml_forecast(ct, "S004", 36, "Ridge", n_iter=4, n_val=2)
+    r = te.tune_ml_forecast(ct, "S004", 36, "Bayesian Ridge", n_iter=4, n_val=2)
     assert r.best_score <= r.default_score + 1e-12 and len(r.trials) == 4
     assert "S004" not in r.validation                                      # the target is never a validation cell
-    te.validate_params("Ridge", r.best_params)
-    e = te.tune_soh_estimator(ct, imp, "Ridge", n_iter=4, split="by_cell", train_cells=["S001", "S002", "S003", "S005"],
+    te.validate_params("Bayesian Ridge", r.best_params)
+    e = te.tune_soh_estimator(ct, imp, "Bayesian Ridge", n_iter=4, split="by_cell", train_cells=["S001", "S002", "S003", "S005"],
                               test_cells=["S004"])
     assert e.best_score <= e.default_score + 1e-12 and "grouped" in e.validation
     rng = np.random.default_rng(0)
@@ -670,7 +624,7 @@ def test_live_multi_model_beats_twin_on_a_knee_and_reweights():
     ekf = te.run_dual_twin(store.cell_frame(cell), ct, imp, cell, te.TwinParameters(),
                            te.DualTwinConfig(capacity_every=10))
     frames, track = te.live_multi_model(ct, cell, ekf, soh_eol)
-    assert {"twin", "pf", "trend", "hb", "ens"} <= set(frames[max(frames)].forecasts)
+    assert {"twin", "mech", "pf", "trend", "hb", "ens"} <= set(frames[max(frames)].forecasts)
     err = {}
     for n0, fr in frames.items():
         if 60 <= n0 <= g["n"].max() - 20 and n0 % 10 == 0:
@@ -746,6 +700,72 @@ def test_mechanistic_particle_filter_follows_operating_conditions():
     s.step(4.0, 2.0, 0.998)
     paths, mech = s.forecast(10, 4.0, 2.0, n_samples=50)
     assert paths.shape == (50, 10) and mech.shape == (10, 3) and (np.diff(mech, axis=0) >= -1e-12).all()
+
+
+def test_condition_groups_and_pulse_aware_twin():
+    m, imp, _ = te.make_synthetic_master(n_cells=4, n_cycles=40, ambients=(24, 4, 43, 24), currents=(2, 2, 2, 4), seed=0)
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    g = te.condition_groups(ct)
+    assert list(g.loc[["S001", "S002", "S003", "S004"], "Group"]) == ["Reference", "Cold", "Hot", "High current"]
+    assert (g["rest_frac"] < 0.2).all()
+    pulsed = ct.copy()
+    pulsed.loc[pulsed["Cell_ID"] == "S001", "rest_frac"] = 0.5
+    assert te.condition_groups(pulsed).loc["S001", "Group"] == "Pulsed load"
+    cfg = te.twin_config_for(pulsed, "S001")
+    assert not cfg.use_voltage and cfg.capacity_every > 0
+    assert te.twin_config_for(pulsed, "S002").use_voltage
+
+
+def test_cohort_validation_summary_tests_and_mechanism_checks():
+    m, imp, _ = te.make_synthetic_master(n_cells=6, n_cycles=90, ambients=(24, 4, 24, 4, 24, 43),
+                                         currents=(2, 2, 2, 2, 2, 2), seed=0, noise_v=0.01)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    val, mech = te.cohort_validation(store, ct, imp, 1.6, models=("mech", "pf", "trend"))
+    assert {"Cell_ID", "Group", "model", "rmse", "coverage", "accuracy"} <= set(val.columns)
+    assert set(val["model"]) >= {"mech", "pf", "trend", "ens"}
+    summ = te.cohort_summary(val)
+    assert "All batteries" in summ.index.get_level_values(0)
+    pt = te.paired_model_test(val, "ens", "trend")
+    assert "All batteries" in pt.index and 0 <= pt.loc["All batteries", "Wilcoxon p"] <= 1
+    chk = te.mechanism_checks(mech)
+    assert "Lithium plating dominates in the cold" in chk.index
+    cold = mech[mech["Group"] == "Cold"]["share_plating"].median()
+    ref = mech[mech["Group"] == "Reference"]["share_plating"].median()
+    assert cold > ref
+
+
+def test_plant_calibration_reproduces_the_cells_fade():
+    _, ct, imp, _ = synthetic()
+    q, tab = te.calibrate_plant(ct, imp, "S004")
+    assert {"C_bol_Ah", "R_int0", "R_ct0", "k_ah"} <= set(tab.index)
+    meta = te.cell_meta(ct)
+    g = ct[(ct["Cell_ID"] == "S004") & ~ct["outlier"]]
+    w = g[g["n"] <= 0.6 * g["n"].max()]
+    rate = np.polyfit(w["cum_Ah"] - w["cum_Ah"].iloc[0], 1 - w["SOH"], 1)[0]
+    model_rate = q.k_ah * float(te.degradation_stress(meta.loc["S004", "T_mean_C"], meta.loc["S004", "I_dis_A"], q))
+    assert abs(model_rate / rate - 1) < 1e-6
+
+
+def test_streaming_twin_and_service_registry():
+    import importlib
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    service = importlib.import_module("service")
+    _, ct, _, _ = synthetic()
+    reg = service.TwinRegistry()
+    g = ct[(ct["Cell_ID"] == "S006") & ~ct["outlier"]]
+    reg.register("S006", service.BatteryConfig(c_bol_Ah=float(g["C_bol_Ah"].iloc[0]), eol_soh=0.8))
+    for _, r in g.iterrows():
+        s = reg.ingest("S006", r["Capacity_Ah"], r["T_mean_C"], r["I_dis_A"])
+    assert s["status"] == "tracking" and s["battery_id"] == "S006"
+    assert abs(sum(s["weights"].values()) - 1) < 1e-9 and s["dominant_mechanism"] in te.MECH_NAMES
+    assert reg.fleet()[0]["battery_id"] == "S006"
+    try:
+        reg.ingest("S006", -1.0, 25.0, 2.0)
+        raise AssertionError("negative capacity accepted")
+    except ValueError:
+        pass
 
 
 if __name__ == "__main__":                            # minimal runner when pytest is absent

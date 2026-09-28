@@ -1,4 +1,4 @@
-# Battery digital twin & operando diagnostics (v4.9)
+# Battery digital twin & operando diagnostics (v5.0)
 
 ```bash
 pip install -r requirements.txt
@@ -9,10 +9,28 @@ python benchmark.py --synthetic --fracs 0.3 0.5 --paradigms ML Twin SemiEmp PF  
 docker build -t battery-twin . && docker run -p 8501:8501 -v twin-data:/data battery-twin
 ```
 
-Files: `twin_engine.py` (all computation, no UI), `app.py` (Streamlit views), `benchmark.py`
-(offline sweep → results file the app can load), `tests/` (56 tests incl. gradient checks and
+Files: `twin_engine.py` (all computation, no UI), `app.py` (Streamlit views), `study.py` (offline cohort
+study), `service.py` (streaming REST service), `benchmark.py`
+(offline sweep → results file the app can load), `tests/` (55 tests incl. gradient checks and
 synthetic-truth recovery). Set `TWIN_CACHE_DIR` to persist downloads and uploads; `GIT_COMMIT`
 is recorded in run manifests.
+
+## New in v5.0: study release
+
+- **Study results** view (and `study.py` CLI): runs the live multi-model twin on every usable battery, scores
+  20-cycle forecasts at 30 % and 50 % of life per operating-condition group (Reference, High current, Hot, Cold,
+  Pulsed load, Corrupted logging), paired Wilcoxon tests (live ensemble vs twin), mechanism-physics checks
+  (plating in the cold, SEI when hot, LAM under high current), cohort update-interval study, and states the
+  answer to each Mission question with its evidence; HTML report and CSV export.
+- NASA idiosyncrasies handled: square-wave cells detected (rest fraction) and run with a pulse-aware twin;
+  crashed-logging cells reported as their own group.
+- Mission 3 calibrated on real batteries: `calibrate_plant` sets the Operations plant from the battery's own
+  capacity, resistances and fade rate plus the cohort stress law; DP and grid studies plan for that battery.
+- Deployment path: `service.py` (REST, FastAPI optional) with a framework-free `TwinRegistry` around
+  `StreamingTwin` (per-cycle ingest -> SOH, RUL, dominant mechanism, alarms).
+- Clean-up: retired semi-empirical law, physics-mean GP, stacked ensemble, live PINN and four dominated ML
+  models (MLP, RF, Ridge, ElasticNet); removed dead UI code. The power-law particle filter was kept after the
+  tests showed it is the best live model on knee cells.
 
 ## New in v4.9: mechanism-aware live twin
 
