@@ -2287,7 +2287,7 @@ if store is None or ct is None:
 
 meta = te.cell_meta(ct)
 cells = list(meta.index)
-DATA_KEY = store.key
+DATA_KEY = f"{store.key}|engine-{te.ENGINE_VERSION}"   # engine upgrades invalidate every cached result
 
 
 def _cell_label(cid: str) -> str:
@@ -2709,6 +2709,16 @@ def status_section(scope: str, sel: List[str], fs: pd.DataFrame, ev: pd.DataFram
         selection_report(sel if scope != "fleet" else list(fs.index[:8]), fs, ev, lim)
 
 
+def _best_key(tab: pd.DataFrame, col: str, lowest: bool = False) -> Optional[str]:
+    """Index of the largest (or lowest) finite value in ``col``; None when empty or all NaN."""
+    if tab is None or not len(tab) or col not in tab:
+        return None
+    v = pd.to_numeric(tab[col], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+    if not len(v):
+        return None
+    return v.idxmin() if lowest else v.idxmax()
+
+
 def live_accuracy_cards(sk: pd.DataFrame, fr: Any, show_models: Sequence[str], reveal: bool,
                         eol_true: Optional[int]) -> None:
     models = [m for m in show_models if fr is not None and m in fr.forecasts]
@@ -2716,11 +2726,11 @@ def live_accuracy_cards(sk: pd.DataFrame, fr: Any, show_models: Sequence[str], r
         return
     st.markdown("**Live accuracy** · 5-cycle-ahead predictions scored so far (causal)")
     by = sk.set_index("key") if len(sk) else pd.DataFrame()
-    best = by["Accuracy (%)"].idxmax() if len(by) else None
+    best = _best_key(by, "Accuracy (%)")
     cols = st.columns(len(models))
     for c, m in zip(cols, models):
         name = te.LIVE_MODELS[m].split(" · ")[0]
-        if m in by.index:
+        if m in by.index and np.isfinite(by.loc[m, "Accuracy (%)"]):
             c.metric(("★ " if m == best else "") + name, f"{by.loc[m, 'Accuracy (%)']:.2f}%",
                      delta=f"RMSE {by.loc[m, 'RMSE (5-step ahead)']:.4f}", delta_color="off",
                      help=f"{int(by.loc[m, 'Predictions scored'])} predictions scored; bias "
@@ -2732,12 +2742,12 @@ def live_accuracy_cards(sk: pd.DataFrame, fr: Any, show_models: Sequence[str], r
         hind = te.live_forecast_accuracy(fr, good, soh_eol, eol_true)
         if len(hind):
             hb = hind.set_index("key")
-            best_h = hb["Accuracy (%)"].idxmax()
+            best_h = _best_key(hb, "Accuracy (%)")
             st.markdown(f"**Forecast accuracy against the actual future** · forecasts made at n = {fr.n}, scored on "
                         f"the {int(hb['Cycles scored'].max())} cycles that followed (hindsight)")
             cols = st.columns(len(models))
             for c, m in zip(cols, models):
-                if m in hb.index:
+                if m in hb.index and np.isfinite(hb.loc[m, "Accuracy (%)"]):
                     r = hb.loc[m]
                     eol_txt = (f"EOL error {r['EOL error (cycles)']:+.0f} cyc" if np.isfinite(r["EOL error (cycles)"])
                                else f"coverage {100 * r['Band coverage']:.0f}%")
@@ -3250,7 +3260,7 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
                          "R²": r.metrics.r2, "RMSE": r.metrics.rmse, "MAE": r.metrics.mae,
                          "Coverage": r.metrics.coverage, "RUL true": r.metrics.rul_true, "RUL pred": r.metrics.rul_pred,
                          "RUL error": r.metrics.rul_error, "Fit time (s)": r.fit_seconds} for r in res]).set_index("Model")
-    best = tbl["RMSE"].idxmin()
+    best = _best_key(tbl, "RMSE", lowest=True) or tbl.index[0]
     k = st.columns(4)
     k[0].metric("Best model", best)
     k[1].metric("Accuracy", fmt(tbl.loc[best, "Accuracy (%)"], ".2f", "%"))
@@ -3333,7 +3343,7 @@ def ml_estimation_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) 
                          "Train R²": r.metrics.loc["train", "R²"], "Train RMSE": r.metrics.loc["train", "RMSE"],
                          "Overfit gap (RMSE)": r.metrics.loc["test", "RMSE"] - r.metrics.loc["train", "RMSE"],
                          "Fit time (s)": r.fit_seconds} for m, r in res.items()]).set_index("Model")
-    best = tbl["Test RMSE"].idxmin()
+    best = _best_key(tbl, "Test RMSE", lowest=True) or tbl.index[0]
     k = st.columns(4)
     k[0].metric("Best model", best)
     k[1].metric("Test R²", fmt(tbl.loc[best, "Test R²"], ".3f"))
