@@ -417,7 +417,8 @@ def test_robust_baseline_repairs_crashed_logging_segment():
 def test_model_registry_all_models_and_param_validation():
     X = np.random.default_rng(0).normal(size=(60, 3))
     y = X[:, 0] - 0.5 * X[:, 1] ** 2
-    assert set(te.ML_MODELS) == {"Extra Trees", "Hist. Gradient Boosting", "Gaussian Process", "Bayesian Ridge"}
+    assert {"Decision Tree", "Random Forest", "Extra Trees", "Hist. Gradient Boosting", "Gaussian Process",
+            "Bayesian Ridge"} <= set(te.ML_MODELS)
     for name in te.ML_MODELS:
         m = te.make_model(name, 0, te.default_params(name)).fit(X, y)
         assert np.all(np.isfinite(m.predict(X))), name
@@ -498,7 +499,7 @@ def test_fleet_status_events_and_scenarios():
 
 def test_half_cell_fit_recovers_degradation_modes():
     rng = np.random.default_rng(0)
-    Cp, Cn, y0, x0 = 3.5, 2.7, 0.45, 0.85
+    Cp, Cn, y0, x0 = 4.0, 2.7, 0.50, 0.85                    # y_end = 0.975: inside the physical window
     q = np.linspace(0, 1.9, 150)
     f0 = te.fit_half_cell(q, te.full_cell_ocv(q, Cp, Cn, y0, x0, 0.04) + 0.002 * rng.standard_normal(len(q)))
     assert f0.rmse_mV < 3 and abs(f0.params["Cp_Ah"] - Cp) < 0.1 and abs(f0.params["x0"] - x0) < 0.02
@@ -766,6 +767,121 @@ def test_streaming_twin_and_service_registry():
         raise AssertionError("negative capacity accepted")
     except ValueError:
         pass
+
+
+# ---------------------------------------------------------------- v5.1 Part A: study correctness --
+def test_A1_groups_mixed_conditions_and_known_corrupted_ids():
+    m, imp, _ = te.make_synthetic_master(n_cells=4, n_cycles=40, ambients=(24, 43, 24, 24), seed=0)
+    m["Cell_ID"] = m["Cell_ID"].replace({"S004": "B0050"})
+    cyc = sorted(m.loc[m["Cell_ID"] == "S001", "Cycle_Index"].unique())
+    half = m["Cell_ID"].eq("S001") & m["Cycle_Index"].isin(cyc[len(cyc) // 2:])
+    m.loc[half, "Ambient_C"] = 44.0                                        # two ambient levels
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    g = te.condition_groups(ct)
+    assert g.loc["S001", "Group"] == "Mixed conditions" and "24" in g.loc["S001", "Ambient levels (°C)"]
+    assert g.loc["B0050", "Group"] == "Corrupted logging"
+    assert g.loc["S002", "Group"] == "Hot" and "Load levels (A)" in g.columns
+    ex = te.condition_groups(ct, mixed="exclude")
+    assert ex.loc["S001", "excluded"] and not ex.loc["S002", "excluded"]
+
+
+def test_A2_no_duplicate_forecasts_for_close_origins():
+    m, imp, _ = te.make_synthetic_master(n_cells=3, n_cycles=30, seed=0)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    g = ct[(ct["Cell_ID"] == "S001") & ~ct["outlier"]]
+    frames, _ = te.live_multi_model(ct, "S001", None, 0.8, models=("trend",))
+    rows = te._eval_frames(frames, g, (0.3, 0.32, 0.5), 20, 0.8)
+    keys = [(r["n0"], r["model"]) for r in rows]
+    assert len(keys) == len(set(keys)) and len({r["n0"] for r in rows}) == 2
+
+
+def test_A3_best_model_only_on_common_cells():
+    rows = []
+    for c in ("C1", "C2", "C3"):
+        rows.append({"Cell_ID": c, "Group": "Cold", "origin": 0.3, "n0": 10, "model": "a", "rmse": 0.02,
+                     "accuracy": 98.0, "coverage": 0.9, "rul_error": np.nan})
+    rows += [{"Cell_ID": "C1", "Group": "Cold", "origin": 0.3, "n0": 10, "model": "b", "rmse": 0.005,
+              "accuracy": 99.5, "coverage": 0.9, "rul_error": np.nan}]                  # b only on the easy cell
+    rows += [{"Cell_ID": c, "Group": "Cold", "origin": 0.3, "n0": 10, "model": "b", "rmse": 0.03,
+              "accuracy": 97.0, "coverage": 0.9, "rul_error": np.nan} for c in ()]
+    val = pd.DataFrame(rows)
+    s = te.cohort_summary(val)
+    cold = s.loc["Cold"]
+    assert cold.loc["b", "partial"] and cold.loc["b", "cell coverage"] == "1/3 cells"
+    bm = te.best_models(s)
+    assert bm.loc["Cold", "common cells"] == 1
+    # on the common cell b is better, but it must never be declared best without the flag being visible
+    assert "partial" in s.columns and s.loc[("Cold", "b"), "partial"]
+
+
+def test_A4_per_cell_pairing_and_underpowered_label():
+    rows = []
+    for c in range(6):
+        for o in (0.3, 0.5):
+            rows.append({"Cell_ID": f"C{c}", "Group": "Reference", "origin": o, "model": "ens", "rmse": 0.01 + 0.001 * c})
+            rows.append({"Cell_ID": f"C{c}", "Group": "Reference", "origin": o, "model": "twin", "rmse": 0.02 + 0.001 * c})
+    pt = te.paired_model_test(pd.DataFrame(rows), "ens", "twin")
+    assert pt.loc["All batteries", "cells"] == 6                            # not 12 (two origins per cell)
+    assert abs(te.min_achievable_p(2, 8) - 1 / 45) < 1e-12
+    mech = pd.DataFrame({"Cell_ID": list("abcd"), "Group": ["Cold", "Cold", "Reference", "Reference"],
+                         "share_plating": [0.8, 0.7, 0.1, 0.2], "share_SEI": [0.1, 0.2, 0.6, 0.5],
+                         "share_LAM": [0.1, 0.1, 0.3, 0.3], "mech_rmse": [0.01] * 4})
+    chk = te.mechanism_checks(mech)
+    assert chk.loc["Lithium plating dominates in the cold", "Verdict"].startswith("underpowered")
+
+
+def test_A5_single_dip_is_not_end_of_life():
+    n = np.arange(1, 41)
+    soh = np.linspace(1.0, 0.8, 40)
+    soh[10] = 0.65                                                            # one low-capacity outlier run
+    eol, status = te.eol_crossing(n, soh, 0.7)
+    assert eol is None and status == "EOL not reachable in data"
+    soh2 = np.concatenate([np.linspace(1.0, 0.72, 30), np.full(10, 0.68)])
+    eol2, status2 = te.eol_crossing(n, soh2, 0.7)
+    assert eol2 == 31 and status2 == "reached"
+
+
+# ------------------------------------------------------------------ learning ladder (v5.2) --
+def test_ladder_registry_levels_and_optional_boosting():
+    assert {"Decision Tree", "Random Forest"} <= set(te.ML_MODELS)
+    assert te.MODEL_SPECS["Decision Tree"].level == 1 and te.MODEL_SPECS["Hist. Gradient Boosting"].level == 3
+    for name, pkg in te.OPTIONAL_ML.items():
+        assert (name in te.ML_MODELS) == te._has(pkg)                 # optional libraries appear only if installed
+
+
+def test_baselines_are_valid_references():
+    _, ct, _, _ = synthetic()
+    p = te.baseline_forecast(ct, "S004", 36, "persistence", eol_ah=1.6)
+    t = te.baseline_forecast(ct, "S004", 36, "trend", eol_ah=1.6)
+    fut = p.n_grid > 36
+    assert np.allclose(np.diff(p.soh[fut]), 0)                         # persistence is flat
+    assert np.all(np.diff(t.soh[fut]) <= 1e-12)                        # trend never increases
+    assert t.metrics.rmse < p.metrics.rmse                             # a fading cell beats persistence
+
+
+def test_deep_sequence_models_train_and_forecast():
+    _, ct, _, _ = synthetic()
+    for kind in te.SEQ_MODELS:
+        f = te.seq_forecast(ct, "S004", 36, kind, eol_ah=1.6, epochs=40, n_members=1)
+        fut = f.n_grid > 36
+        assert np.all(np.isfinite(f.soh)) and np.all(np.diff(f.soh[fut]) <= 1e-12)
+        assert f.metrics.rmse < 0.1 and f.params["training windows"] > 100
+
+
+def test_spm_first_principles_physics_and_forecast():
+    p = te.SPMParams()
+    base = te.spm_discharge(p, 2.0, 25.0)
+    assert 3.6 < base["V"][0] < 4.3 and base["V"][-1] <= 2.7 + 0.05
+    assert np.all(np.diff(base["V"]) <= 1e-6)                          # discharge voltage decreases
+    lli = te.spm_discharge(p, 2.0, 25.0, lli=0.1)["capacity_Ah"]
+    assert lli < base["capacity_Ah"] - 0.1                             # lost lithium lowers capacity
+    assert te.spm_discharge(p, 4.0, 25.0)["capacity_Ah"] < base["capacity_Ah"]      # rate capability
+    assert te.spm_discharge(p, 2.0, 4.0)["capacity_Ah"] < base["capacity_Ah"]       # cold
+    assert abs(float(te.ocp_lco(0.42)) - float(te.ocp_lco(0.48))) < 1e-9            # pole clipped
+    _, ct, _, _ = synthetic()
+    f = te.spm_forecast(ct, "S004", 36, eol_ah=1.6)
+    assert f.metrics.rmse < 0.02 and f.params["SEI reaction term a (1/Ah)"] > 0
 
 
 if __name__ == "__main__":                            # minimal runner when pytest is absent

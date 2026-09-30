@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.0"
+REQUIRED_ENGINE = "5.1"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -317,6 +317,41 @@ div[data-baseweb="tab-highlight"] {{background: var(--bt-grad-warm) !important; 
 .stButton > button[kind="primary"]:hover {{filter: brightness(1.08); box-shadow: 0 6px 18px rgba(0,114,178,0.45);}}
 div[data-testid="stDataFrame"], div[data-testid="stTable"] {{border-radius: 12px; overflow: hidden;}}
 section[data-testid="stSidebar"] {{border-right: 1px solid var(--bt-border);}}
+/* ---------- explanations, recommendations, ladder, guide ---------- */
+.bt-explain {{margin: -2px 0 14px 0; padding: 9px 14px; border-radius: 10px; font-size: 0.88rem; line-height: 1.5;
+  background: var(--bt-accent-soft); border: 1px solid var(--bt-accent-line); color: inherit;}}
+.bt-explain-tag {{font-weight: 800; font-size: 0.72rem; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--bt-accent); margin-right: 6px;}}
+.bt-reco {{margin: 4px 0 14px 0; padding: 12px 16px; border-radius: 14px; border: 1px solid var(--bt-border);
+  background: linear-gradient(135deg, rgba(0,114,178,0.10), rgba(0,158,115,0.08)); box-shadow: var(--bt-shadow);
+  animation: bt-rise .5s ease both;}}
+.bt-reco-h {{font-weight: 800; font-size: 0.8rem; letter-spacing: 0.1em; text-transform: uppercase; opacity: 0.8;
+  margin-bottom: 6px;}}
+.bt-reco-item {{display: flex; gap: 10px; align-items: baseline; font-size: 0.93rem; line-height: 1.5; margin: 3px 0;}}
+.bt-reco-dot {{flex: none; width: 8px; height: 8px; border-radius: 50%; background: var(--bt-grad-warm);
+  box-shadow: 0 0 0 3px rgba(0,158,115,0.15); transform: translateY(-1px);}}
+.bt-ladder {{display: grid; grid-template-columns: repeat(6, 1fr); gap: 8px; margin: 6px 0 4px 0;}}
+.bt-step {{position: relative; padding: 10px 10px 9px 10px; border-radius: 12px; border: 1px solid var(--bt-border);
+  background: var(--bt-surface); transition: transform .15s ease, box-shadow .15s ease;}}
+.bt-step:hover {{transform: translateY(-2px); box-shadow: var(--bt-shadow);}}
+.bt-step-n {{display: inline-flex; width: 24px; height: 24px; border-radius: 7px; align-items: center; justify-content: center;
+  font-weight: 800; font-size: 0.8rem; color: #fff; background: #8C8C8C;}}
+.bt-step-done .bt-step-n {{background: var(--bt-grad);}}
+.bt-step-done::after {{content: "✓"; position: absolute; right: 10px; top: 8px; color: #009E73; font-weight: 900;}}
+.bt-step-t {{margin-top: 6px; font-size: 0.8rem; font-weight: 700; line-height: 1.25;}}
+.bt-guide {{padding: 10px 12px; border-radius: 12px; border: 1px solid var(--bt-border); background: var(--bt-surface);
+  margin-bottom: 10px;}}
+.bt-guide-h {{font-weight: 800; font-size: 0.82rem; margin-bottom: 6px;}}
+.bt-guide-bar {{height: 6px; border-radius: 99px; background: rgba(128,128,128,0.2); overflow: hidden; margin-bottom: 8px;}}
+.bt-guide-bar > div {{height: 100%; background: var(--bt-grad-warm); transition: width .6s ease;}}
+.bt-guide-row {{display: flex; gap: 8px; font-size: 0.82rem; opacity: 0.6; margin: 2px 0;}}
+.bt-guide-row.ok {{opacity: 1; font-weight: 650;}}
+.bt-guide-row.ok span {{color: #009E73;}}
+@keyframes bt-rise {{from {{opacity: 0; transform: translateY(6px);}} to {{opacity: 1; transform: none;}}}}
+div[data-testid="stPlotlyChart"], div[data-testid="stMetric"], .bt-card {{animation: bt-rise .45s ease both;}}
+.bt-section {{animation: bt-rise .4s ease both;}}
+@media (max-width: 900px) {{.bt-ladder {{grid-template-columns: repeat(3, 1fr);}}}}
+@media (prefers-reduced-motion: reduce) {{.bt-reco, .bt-section, div[data-testid="stPlotlyChart"], div[data-testid="stMetric"] {{animation: none;}}}}
 /* ---------- animated hero gradient ---------- */
 .bt-hero {{background-size: 220% 220%; animation: bt-flow 18s ease-in-out infinite;}}
 @keyframes bt-flow {{0% {{background-position: 0% 50%;}} 50% {{background-position: 100% 50%;}} 100% {{background-position: 0% 50%;}}}}
@@ -434,6 +469,73 @@ PLOT_CONFIG = {
 }
 
 
+EXPLAIN: Dict[str, str] = {
+    # diagnostics
+    "gauges": "Instrument cluster: the battery's state of health, quick remaining-life estimate, resistance growth and peak temperature, coloured by risk. Use it to judge at a glance whether this battery needs attention.",
+    "risk_matrix": "Each bubble is a battery: remaining life (x) against how fast it is degrading (y). Top-left means little life left and fading fast: act on those first.",
+    "fleet_map": "Treemap of the fleet grouped by ambient temperature; tile size = cycles run, colour = remaining health margin. It shows whether problems cluster under one operating condition.",
+    "fade_multi": "Capacity (or SOH) against cycle number for the selected batteries. It shows how fast each battery ages, where fade accelerates (★ knee) and where capacity recovers after rest (▲).",
+    "trace_multi": "Raw voltage, current and temperature inside the chosen discharges. Late-life cycles reach the cut-off voltage sooner and heat more: the physical signature of ageing.",
+    "cohort_": "SOH of the chosen batteries that share one ambient temperature. Comparing panels shows how temperature changes the ageing speed.",
+    "hi_rank": "Candidate health indicators scored on four criteria (link to SOH, monotonicity, same trend in every cell, similar end values). The top one is the best single measure of health (Mission 1).",
+    "hi_traj": "The best indicators of this battery normalised to their starting value, showing how each drifts as the battery ages.",
+    "hi_pca": "Principal component analysis of all indicators. If one component explains most of the variance, one parameter is enough to describe health; otherwise ageing is multi-dimensional.",
+    "ica": "Incremental capacity curves (dQ/dV). Peaks are electrode phase transitions; their shrinking and shifting reveal which ageing mechanism is active.",
+    "ica_peaks": "Position and height of the main ICA peak over life: height loss points to loss of active material, a downward shift to growing resistance.",
+    "dva": "Differential voltage curves (dV/dQ): the distance between peaks tracks the electrode that owns them, so shrinking spacing indicates active-material loss.",
+    "modes": "Indicative split of the capacity loss into lithium-inventory loss (LLI), active-material loss (LAM) and conductivity loss (CL) over life.",
+    "hc_modes": "Quantitative degradation modes from fitting electrode potentials to the discharge curve: lithium inventory lost and active material lost on each electrode.",
+    "hc_fits": "Measured pseudo-OCV curves against the fitted half-cell model, and the electrode potentials behind them: how well the physics explains the data.",
+    "stress": "Peak temperature, minimum voltage and cold-charging risk per cycle, with the literature thresholds. Exposure to these stressors explains faster ageing.",
+    # live twin
+    "rp_main": "The live twin sees the battery one discharge at a time. Each model forecasts the rest of life from what it has seen so far; grey circles (if revealed) are the future it has not seen.",
+    "rp_track": "Top: each model's predicted end of life converging as data arrive. Middle: how much the live ensemble trusts each model. Bottom: which degradation mechanism is consuming the capacity.",
+    "abl_fig": "The twin re-run with different measurement sets: the gap between open loop and voltage-only is the information the sensors add (Mission 2).",
+    "uf_fig": "Tracking accuracy when the twin is updated every m cycles: it shows how rarely the twin can be updated without losing accuracy (Mission 2).",
+    # models
+    "lad_base": "Level 1 references: 'nothing changes' (persistence) and 'the recent straight line continues' (linear trend). A model is only useful if it beats these.",
+    "lad_deep": "Level 4 deep sequence models (GRU, Transformer) read a window of past SOH values and predict the next cycle, repeatedly, to build the forecast.",
+    "lad_hybrid": "Level 5 hybrid models combine physics equations with learning: the mechanistic PINN obeys the degradation kinetics; hierarchical Bayes combines a physics law with fleet knowledge.",
+    "lad_spm": "Level 6 first-principles model: capacity follows from simulated discharges of a single-particle electrochemical model while SEI growth removes lithium.",
+    "lad_spm_curves": "Simulated discharge curves of the single-particle model: the effect of lost lithium, higher current and cold on voltage and delivered capacity.",
+    "lad_board": "All models run so far on this battery and forecast origin, from the simplest to the most advanced, scored on the same future cycles. The best is highlighted.",
+    "ml_fig": "Forecasts of the selected ML models from the forecast origin (dotted line), with their uncertainty bands, against the measured SOH.",
+    "ml_board": "Leaderboard of the ML models on the held-out cycles (fade skill: 1 = perfect, 0 = no better than assuming no further fade).",
+    "ml_parity": "Predicted against measured SOH on the test cycles: points on the diagonal are perfect predictions.",
+    "est_board": "SOH estimation from operando indicators: R² on the test set per model.",
+    "est_parity": "Estimated against measured SOH for the test cycles, coloured by battery.",
+    "est_traj": "Measured SOH (points) and the estimated SOH (line) of the test batteries over life.",
+    "est_imp": "How much each indicator matters: the error increase when its values are shuffled.",
+    "el_dq": "Change of the discharge curve between an early and a later cycle (ΔQ(V)), coloured by eventual life: large changes early predict a short life.",
+    "el_parity": "Cycle life predicted from the first cycles only against the actual life (leave-one-battery-out).",
+    "bench_": "Cross-battery benchmark: forecasts from several origins on several batteries, summarised with prognostic metrics.",
+    # operations
+    "ops_fig": "Simulated life under the chosen operating policy: currents chosen each cycle, SOH and cumulative profit.",
+    "mm_fig": "Robustness: the twin-aware policy's advantage when the real battery differs from the model.",
+    "om_heat": "Long-run profit rate for each operating policy and replacement threshold; the star is the best compliant combination (Mission 3).",
+    "om_trade": "Replacing early costs money; replacing late raises the risk of sudden failure. The optimum balances the two.",
+    "dp_fig": "Dynamic-programming policy: the best action (current or replace) for every state of health and season.",
+    "scen_fig": "What-if planner: projected fade under each operating scenario, from the stress law fitted on this cohort.",
+    # study
+    "st_hi": "Health-indicator ranking across the whole cohort (Mission 1).",
+    "st_mech": "Mechanism shares per condition group, one point per battery: plating should dominate in the cold, SEI when hot, LAM under high current.",
+    "st_models": "Median forecast error per condition group and model on real data, with interquartile bars (Mission 2).",
+}
+
+
+def note(text: str) -> None:
+    st.markdown(f'<div class="bt-explain"><span class="bt-explain-tag">What this shows</span> {html.escape(text)}</div>',
+                unsafe_allow_html=True)
+
+
+def explain(key: str) -> None:
+    """Small 'what this shows' paragraph under a chart or table (catalogue lookup, exact key or prefix)."""
+    text = EXPLAIN.get(key) or next((v for k, v in EXPLAIN.items() if k.endswith("_") and key.startswith(k)), None)
+    if text:
+        st.markdown(f'<div class="bt-explain"><span class="bt-explain-tag">What this shows</span> '
+                    f'{html.escape(text)}</div>', unsafe_allow_html=True)
+
+
 def show(fig: go.Figure, key: str, data: Optional[pd.DataFrame] = None, export: bool = True) -> None:
     """Render with Plotly styling intact (theme=None) across Streamlit versions, plus an
     export row: interactive HTML, SVG / PDF (when kaleido is installed) and the plotted data."""
@@ -448,6 +550,7 @@ def show(fig: go.Figure, key: str, data: Optional[pd.DataFrame] = None, export: 
             break
         except TypeError:
             continue
+    explain(key)
     if export:
         export_row(fig, key, data)
 
@@ -457,8 +560,10 @@ def show_selectable(fig: go.Figure, key: str) -> Optional[Any]:
     cfg = dict(PLOT_CONFIG, modeBarButtonsToRemove=["lasso2d"])
     for extra in ([dict(width="stretch")] if ST_VERSION >= (1, 50) else []) + [dict(use_container_width=True)]:
         try:
-            return st.plotly_chart(fig, theme=None, config=cfg, key=key, on_select="rerun",
-                                   selection_mode="points", **extra)
+            ev = st.plotly_chart(fig, theme=None, config=cfg, key=key, on_select="rerun",
+                                 selection_mode="points", **extra)
+            explain(key)
+            return ev
         except TypeError:
             continue
     show(fig, key, export=False)
@@ -486,7 +591,14 @@ def export_row(fig: go.Figure, key: str, data: Optional[pd.DataFrame]) -> None:
                      key=f"dl_csv_{key}")
 
 
-def show_table(data: Any) -> None:
+def show_table(data: Any, note: Optional[str] = None) -> None:
+    _show_table(data)
+    if note:
+        st.markdown(f'<div class="bt-explain"><span class="bt-explain-tag">What this shows</span> '
+                    f'{html.escape(note)}</div>', unsafe_allow_html=True)
+
+
+def _show_table(data: Any) -> None:
     if ST_VERSION >= (1, 50):
         try:
             st.dataframe(data, width="stretch")
@@ -2533,16 +2645,19 @@ def status_section(scope: str, sel: List[str], fs: pd.DataFrame, ev: pd.DataFram
         show(fig_fleet_map(fs, P), key="fleet_map", data=fs.reset_index())
         show(fig_risk_matrix(fs, P, cell), key="risk_matrix", data=fs.reset_index())
         triage_table(fs, "triage_all")
+        note("Every battery ranked worst-first: health margin bars, quick remaining life, fade speed and the alerts behind the risk level.")
     else:
         for c in sel:
             battery_status_card(c, fs, lim, c)
         if len(sel) > 1:
             triage_table(fs[fs.index.isin(sel)], "triage_sel")
+            note("Side-by-side status of the selected batteries: which one is closest to end of life and why.")
         show(fig_risk_matrix(fs, P, sel[0], sel), key="risk_matrix", data=fs.reset_index())
         st.caption("Selected batteries in colour, the rest of the fleet in grey. Quick RUL is a robust trend of the "
                    "last 20 cycles for triage; the Models view gives the full probabilistic RUL.")
     with st.expander("Event log", expanded=scope != "fleet", icon=":material/list_alt:"):
         event_log(ev, sel, "ev")
+        note("Chronological log of notable events (end of life, knees, over-temperature, cold charging, regeneration): when each battery's trouble started.")
     with st.expander("Report", icon=":material/description:"):
         st.caption("Self-contained HTML with interactive charts for the current selection (print to PDF from the "
                    "browser).")
@@ -2660,6 +2775,7 @@ def _study_answers(res: Dict[str, Any]) -> Dict[str, List[str]]:
 
 
 def view_study() -> None:
+    recommendations("study")
     section("Study results: answers to the Mission questions")
     st.markdown("Runs the live multi-model twin on **every usable battery** and scores each model's forecasts "
                 "(made at 30% and 50% of recorded life, over the next 20 cycles) per operating-condition group, "
@@ -2762,6 +2878,7 @@ def view_study() -> None:
 
 
 def view_replay() -> None:
+    recommendations("live")
     section(f"Live twin replay · {cell}")
     st.markdown("The recorded life of the battery is streamed one discharge at a time. At every step the dual "
                 "time-scale EKF assimilates only the partial-window voltage and load-step resistance of the new "
@@ -2959,8 +3076,86 @@ def half_cell_section() -> None:
                      "rather than trusting single values."])
 
 
+def _reco_items(view: str) -> List[Tuple[str, str]]:
+    ss = st.session_state
+    items: List[Tuple[str, str]] = []
+    try:
+        fs, _ = fleet_cached(ct, DATA_KEY, float(eol_ah), asdict(te.SafetyLimits()))
+        n_crit = int((fs["Risk"] == "Critical").sum()) if len(fs) else 0
+    except Exception:
+        n_crit = 0
+    grp = te.condition_groups(ct)["Group"].get(cell, "")
+    if view == "diag":
+        if n_crit and ss.get("diag_scope", "").endswith("Single battery"):
+            items.append(("priority_high", f"{n_crit} batteries are critical: switch the scope to *Selected batteries* "
+                                           "and press **Select most critical**."))
+        if not ss.get("hc") or ss["hc"][0] != cell:
+            items.append(("science", "Quantify the degradation modes of this battery: run **half-cell OCV fitting** below."))
+        if grp in ("Reference", ""):
+            items.append(("thermostat", "Compare this battery with a **cold (4 °C)** one in the cohort plot: plating shows as fast early fade."))
+        items.append(("play_circle", "Open the **Live twin** to watch the models learn this battery cycle by cycle."))
+    elif view == "live":
+        items.append(("visibility", "Switch on **Reveal future data** and pause at 30–50% of life to judge each forecast."))
+        if grp in ("Cold", "Hot", "High current", "Mixed conditions"):
+            items.append(("warning", f"This is a **{grp.lower()}** battery: watch the ensemble weights move away from the ECM twin."))
+        else:
+            items.append(("swap_horiz", "Pick a cold or hot battery in the control bar to see the mechanistic model take over."))
+    elif view == "models":
+        done = {e["level"] for e in ladder_entries(int(max(5, round(float(ss.get('ml_frac', 0.4)) * meta.loc[cell, 'cycles']))))}
+        nxt = next((lv for lv in LEVEL_INFO if lv not in done and lv not in (2, 3)), None)
+        if not done:
+            items.append(("flag", "Start with **Level 1 · Baselines**: every other model must beat the linear trend."))
+        elif nxt:
+            items.append(("trending_up", f"Next: **Level {nxt} · {LEVEL_INFO[nxt][0]}**, then compare in the leaderboard."))
+        if not ss.get("ml"):
+            items.append(("model_training", "In the ML workbench, press **Auto-tune** before judging the tree and boosting models."))
+        items.append(("fact_check", "One battery is an anecdote: confirm the ranking in the **cross-cell benchmark** or the Study results."))
+    elif view == "ops":
+        if not ss.get("ops_calib", True):
+            items.append(("tune", "Turn on **Calibrate the plant** so the optimisation plans for this real battery."))
+        if not ss.get("om"):
+            items.append(("insights", "Run the **integrated optimisation**, then **Solve DP** to see how close the simple policy is to optimal."))
+        items.append(("science", "Use the **what-if planner** to test a hotter or colder site before deploying."))
+    elif view == "study":
+        if not ss.get("study"):
+            items.append(("science", "Press **Run cohort study**: it produces the evidence for your results chapter."))
+        else:
+            items.append(("description", "Export the **study report** and check groups with few cells (labelled underpowered)."))
+    return items[:3]
+
+
+def recommendations(view: str) -> None:
+    items = _reco_items(view)
+    if not items:
+        return
+    cards = "".join(f'<div class="bt-reco-item"><span class="bt-reco-dot"></span>{_md_bold(t)}</div>' for _, t in items)
+    st.markdown(f'<div class="bt-reco"><div class="bt-reco-h">Recommended next steps</div>{cards}</div>',
+                unsafe_allow_html=True)
+
+
+def _md_bold(text: str) -> str:
+    t = html.escape(text)
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+    return re.sub(r"\*(.+?)\*", r"<i>\1</i>", t)
+
+
+def sidebar_guide() -> None:
+    ss = st.session_state
+    steps = [("Data loaded", True), ("Half-cell modes fitted", bool(ss.get("hc"))),
+             ("Live twin opened", bool(ss.get("ekf"))), ("Ladder models compared", bool(ss.get("ladder"))),
+             ("M3 optimisation run", bool(ss.get("om") or ss.get("dp"))), ("Cohort study run", bool(ss.get("study")))]
+    done = sum(ok for _, ok in steps)
+    rows = "".join(f'<div class="bt-guide-row{" ok" if ok else ""}"><span>{"✓" if ok else "○"}</span>{html.escape(t)}</div>'
+                   for t, ok in steps)
+    with st.sidebar:
+        st.markdown(f'<div class="bt-guide"><div class="bt-guide-h">Study progress · {done}/{len(steps)}</div>'
+                    f'<div class="bt-guide-bar"><div style="width:{100 * done / len(steps):.0f}%"></div></div>{rows}</div>',
+                    unsafe_allow_html=True)
+
+
 def view_data() -> None:
     global cell, ct_cell, eis_cell, c_bol, soh_eol
+    recommendations("diag")
     lim = asdict(te.SafetyLimits())
     fs, ev = fleet_cached(ct, DATA_KEY, float(eol_ah), lim)
     all_cells = list(meta.index)
@@ -3014,8 +3209,16 @@ def view_data() -> None:
     amb = meta["Ambient_C"].round(0)
     groups = sorted(amb.dropna().unique())
     only_sel = scope != "fleet" and st.toggle("Only groups containing the selection", value=False, key="grid_only")
+    show_cells = st.multiselect("Batteries to show (empty = all)", list(meta.index), default=[], key="grid_cells",
+                                format_func=lambda c: cell_label(c, meta),
+                                help="Choose which batteries appear in the temperature panels; panels without any "
+                                     "chosen battery are hidden.")
     for g in groups:
         members = list(amb[amb == g].index)
+        if show_cells:
+            members = [c for c in members if c in show_cells]
+            if not members:
+                continue
         if only_sel and not set(members) & set(grid_sel):
             continue
         show(fig_cohort_group(ct, meta, members, grid_sel, P, f"Ambient {g:.0f} °C · {len(members)} cells", norm_x),
@@ -3179,13 +3382,18 @@ R2_NOTE = ("**Reading the scores.** *Accuracy* = 100 × (1 − mean absolute per
 
 
 def ml_section() -> None:
-    section("Machine-learning workbench", icon=":material/model_training:")
+    section("Levels 1–3 · Machine-learning workbench (trees, forests, boosting)", icon=":material/model_training:")
     st.markdown("Two tasks, 8 curated models, every hyperparameter adjustable. **Forecast**: predict future SOH from the past "
                 "(prognosis). **Estimate**: infer the present SOH from operando indicators measured on the same cycle "
                 "(diagnosis, no capacity test needed).")
-    models = st.multiselect("Models", list(te.ML_MODELS), default=["Extra Trees", "Hist. Gradient Boosting",
-                                                                    "Gaussian Process", "Bayesian Ridge"],
-                            key="ml_models", help="Select any number; the leaderboard ranks them.")
+    models = st.multiselect("Models (L1 simple → L3 boosting)", sorted(te.ML_MODELS, key=lambda m: te.MODEL_SPECS[m].level),
+                            default=["Decision Tree", "Random Forest", "Extra Trees", "Hist. Gradient Boosting"],
+                            key="ml_models", format_func=lambda m: f"L{te.MODEL_SPECS[m].level} · {m}",
+                            help="Select any number; the leaderboard ranks them.")
+    missing_opt = [n for n in te.OPTIONAL_ML if n not in te.ML_MODELS]
+    if missing_opt:
+        st.caption("Also available once installed on the server: " + ", ".join(missing_opt) +
+                   " (add `xgboost` / `lightgbm` to requirements.txt).")
     params = hyperparam_editor(models, "hp")
     t_fc, t_est = st.tabs([":material/trending_down: Forecast future SOH", ":material/biotech: Estimate SOH from indicators"])
     with t_fc:
@@ -3244,8 +3452,8 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
                       format_func={"own": "This battery only (its early life)",
                                    "cohort": "This battery's early life + all other batteries",
                                    "cross": "Chosen batteries → predict this battery"}.get)
-    frac = c2.slider("Train fraction of this battery's life (rest = test)", 0.05, 0.9, 0.4, 0.05, key="ml_frac",
-                     help="Cycles up to this fraction are seen in training; all later cycles are the test set.")
+    frac = float(st.session_state.get("ml_frac", 0.4))
+    c2.markdown(f"**Forecast origin:** {100 * frac:.0f}% of life (set at the top of this view)")
     n0_ml = int(max(5, round(frac * meta.loc[cell, "cycles"])))
     n_test = int((ct_cell[~ct_cell["outlier"]]["n"] > n0_ml).sum())
     c2.caption(f"Train: cycles 1–{n0_ml} · Test: {n_test} later cycles")
@@ -3290,6 +3498,9 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
         st.warning("Settings changed since the last run; the results below use the previous settings.")
     res = saved["res"]
     n0s = saved["cfg"]["n0"]
+    for r in res:
+        ladder_add(f"ML · {r.model}", te.MODEL_SPECS[r.model].level if r.model in te.MODEL_SPECS else 2, n0s,
+                   r.n_grid, r.soh_pred, r.soh_lo, r.soh_hi, r.metrics)
     data = pd.concat([pd.DataFrame({"model": r.model, "n": r.n_grid, "soh": r.soh_pred,
                                     "lo": r.soh_lo if r.soh_lo is not None else np.nan,
                                     "hi": r.soh_hi if r.soh_hi is not None else np.nan}) for r in res])
@@ -3311,6 +3522,7 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
          "Coverage": "{:.2f}", "RUL true": "{:.0f}", "RUL pred": "{:.0f}", "RUL error": "{:+.0f}",
          "Fit time (s)": "{:.2f}"}, na_rep="—")
         .highlight_min(subset=["RMSE"], props="background-color: rgba(0,158,115,0.25); font-weight: 700;"))
+    note("Forecast scores of each ML model on the cycles after the origin: accuracy, fade skill, R², errors, band coverage and remaining-life error.")
     good = ct_cell[(~ct_cell["outlier"]) & (ct_cell["n"] > n0s)]
     par = pd.concat([pd.DataFrame({"model": r.model, "SOH": good["SOH"].to_numpy(),
                                    "SOH_pred": np.interp(good["n"], r.n_grid, r.soh_pred)}) for r in res])
@@ -3393,6 +3605,7 @@ def ml_estimation_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) 
                                  "Train R²": "{:.3f}", "Train RMSE": "{:.4f}", "Overfit gap (RMSE)": "{:+.4f}",
                                  "Fit time (s)": "{:.2f}"}, na_rep="—")
                .highlight_min(subset=["Test RMSE"], props="background-color: rgba(0,158,115,0.25); font-weight: 700;"))
+    note("Estimation scores on the test cycles and on the training cycles: a large gap between them means the model memorises instead of learning.")
     pick = st.selectbox("Inspect model", list(res), index=list(res).index(best), key="est_pick")
     r = res[pick]
     test = r.predictions[r.predictions["set"] == "test"]
@@ -3653,9 +3866,237 @@ def ml_methods_panel() -> None:
                     "Physics-based and mechanistic models (twin, particle filters, PINN) live in the Live twin view.")
 
 
+LEVEL_INFO = {
+    1: ("Baselines", "Persistence, linear trend, a single decision tree, Bayesian ridge: the references to beat."),
+    2: ("Classical ML", "Random Forest, Extra Trees, Gaussian Process: robust learners for small data."),
+    3: ("Boosting", "Histogram gradient boosting, XGBoost, LightGBM: strongest on tabular data."),
+    4: ("Deep learning", "GRU recurrent network and Transformer: learn from sequences of past SOH."),
+    5: ("Hybrid & physics-informed", "Mechanistic PINN and hierarchical Bayes: equations plus learning."),
+    6: ("First principles", "Single-particle electrochemical model with SEI growth: physics only, calibrated."),
+}
+LEVEL_COLORS = {1: "#8C8C8C", 2: "#0072B2", 3: "#009E73", 4: "#AA4499", 5: "#E69F00", 6: "#D55E00"}
+
+
+def ladder_add(name: str, level: int, n0: int, n_grid: np.ndarray, soh: np.ndarray, lo: Optional[np.ndarray],
+               hi: Optional[np.ndarray], metrics: Any) -> None:
+    store_ = st.session_state.setdefault("ladder", {})
+    store_[(cell, int(n0), name)] = {"name": name, "level": int(level), "n_grid": np.asarray(n_grid),
+                                     "soh": np.asarray(soh), "lo": None if lo is None else np.asarray(lo),
+                                     "hi": None if hi is None else np.asarray(hi), "m": metrics}
+
+
+def ladder_entries(n0: int) -> List[Dict[str, Any]]:
+    return sorted([v for (c, n, _), v in st.session_state.get("ladder", {}).items() if c == cell and n == n0],
+                  key=lambda v: (v["level"], v["name"]))
+
+
+def fig_ladder(entries: Sequence[Dict[str, Any]], n0: int, P: Palette, title: str) -> go.Figure:
+    good = ct_cell[~ct_cell["outlier"]]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=good["n"], y=good["SOH"], mode="markers", name="Measured SOH",
+                             marker=dict(color=P.measured, size=5, opacity=0.75), hovertemplate="%{y:.4f}<extra>measured</extra>"))
+    for i, e in enumerate(entries):
+        col = LEVEL_COLORS.get(e["level"], P.text)
+        sel = e["n_grid"] >= n0
+        if e["lo"] is not None and e["hi"] is not None and len(entries) <= 3:
+            add_band(fig, e["n_grid"][sel], e["lo"][sel], e["hi"][sel], col, f"{e['name']} band", group=e["name"], alpha=0.12)
+        fig.add_trace(go.Scatter(x=e["n_grid"][sel], y=e["soh"][sel], mode="lines", name=f"L{e['level']} · {e['name']}",
+                                 legendgroup=e["name"], line=dict(color=col, width=2.6, dash=DASHES[i % len(DASHES)]),
+                                 hovertemplate="%{y:.4f}<extra>" + html.escape(e["name"]) + "</extra>"))
+    fig.add_vline(x=n0, line_dash="dot", line_color=P.muted, annotation_text="forecast origin",
+                  annotation_font=dict(color=P.muted))
+    fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, annotation_text="End of life",
+                  annotation_font=dict(color=P.eol))
+    fig.update_xaxes(title_text="Discharge cycle n")
+    fig.update_yaxes(title_text="SOH (–)")
+    return style_fig(fig, P, 520, title)
+
+
+def _ladder_table(entries: Sequence[Dict[str, Any]]) -> pd.DataFrame:
+    rows = [{"Level": f"L{e['level']} · {LEVEL_INFO[e['level']][0]}", "Model": e["name"],
+             "Accuracy (%)": e["m"].accuracy, "RMSE": e["m"].rmse, "Fade skill": e["m"].fade_skill,
+             "Coverage": e["m"].coverage, "RUL error": e["m"].rul_error} for e in entries if e["m"] is not None]
+    return pd.DataFrame(rows)
+
+
+def ladder_level_block(level: int, entries: Sequence[Dict[str, Any]], key: str, n0: int) -> None:
+    mine = [e for e in entries if e["level"] == level]
+    if mine:
+        show(fig_ladder(mine, n0, P, f"Level {level} · {LEVEL_INFO[level][0]}"), key=key, export=False)
+        show_table(_ladder_table(mine).set_index("Model").style.format(
+            {"Accuracy (%)": "{:.2f}", "RMSE": "{:.4f}", "Fade skill": "{:.3f}", "Coverage": "{:.0%}",
+             "RUL error": "{:+.0f}"}, na_rep="—"))
+
+
+def ladder_intro(n0: int) -> None:
+    done = {e["level"] for e in ladder_entries(n0)}
+    steps = "".join(
+        f'<div class="bt-step{" bt-step-done" if lv in done else ""}"><div class="bt-step-n">{lv}</div>'
+        f'<div class="bt-step-t">{html.escape(LEVEL_INFO[lv][0])}</div></div>' for lv in LEVEL_INFO)
+    st.markdown(f'<div class="bt-ladder">{steps}</div>', unsafe_allow_html=True)
+    st.caption("Work top to bottom: every level adds one idea. A level is ticked once a model of that level has "
+               "been run for this battery and origin; the leaderboard at the end compares them all on the same "
+               "future cycles.")
+
+
+def ladder_baselines(n0: int) -> None:
+    section("Level 1 · Baselines: the references every model must beat")
+    st.markdown("Two forecasts that need no learning at all. If an advanced model cannot beat the **linear trend**, "
+                "its complexity is not paying off.")
+    if st.button("Run baselines", key="lad_b_go", icon=":material/play_arrow:", type="primary"):
+        for kind in ("persistence", "trend"):
+            try:
+                f = te.baseline_forecast(ct, cell, n0, kind, float(eol_ah))
+                ladder_add(f.name, 1, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics)
+            except Exception as exc:
+                st.warning(f"{kind}: {exc}")
+    ladder_level_block(1, ladder_entries(n0), "lad_base", n0)
+
+
+def ladder_deep(n0: int) -> None:
+    section("Level 4 · Deep learning: recurrent network and Transformer")
+    st.markdown("Sequence models read a window of past SOH values (plus temperature and current) and predict the next "
+                "cycle; feeding each prediction back builds the whole forecast. Three networks with different seeds "
+                "form a small ensemble for the band. They are trained on all other batteries and this battery's past.")
+    c = st.columns(4)
+    kinds = c[0].multiselect("Networks", list(te.SEQ_MODELS), default=list(te.SEQ_MODELS), key="lad_d_kinds")
+    L = c[1].select_slider("Window (cycles)", [5, 8, 10, 15, 20], value=10, key="lad_d_L")
+    ep = c[2].select_slider("Epochs", [100, 200, 300, 500], value=200, key="lad_d_ep")
+    mem = c[3].select_slider("Ensemble members", [1, 2, 3, 5], value=3, key="lad_d_mem")
+    if st.button(f"Train deep models (≈ {int(len(kinds) * mem * ep / 60) + 2} s)", key="lad_d_go",
+                 icon=":material/neurology:", type="primary", disabled=not kinds):
+        prog = st.progress(0.0)
+        for i, k in enumerate(kinds):
+            try:
+                f = te.seq_forecast(ct, cell, n0, k, float(eol_ah), L=int(L), epochs=int(ep), n_members=int(mem),
+                                    progress=lambda fr, m: prog.progress(min((i + fr) / len(kinds), 1.0), text=m))
+                ladder_add(k, 4, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics)
+            except Exception as exc:
+                st.warning(f"{k}: {exc}")
+        prog.empty()
+    ladder_level_block(4, ladder_entries(n0), "lad_deep", n0)
+    with st.expander("Why no large language model (LLM) forecaster?", icon=":material/help:"):
+        st.markdown("LLMs and time-series foundation models are trained on text or on millions of generic series; "
+                    "with ~30 batteries they add no physical knowledge and cannot be validated against it, and "
+                    "running them needs large downloads or paid APIs. They are useful *around* the twin instead: "
+                    "explaining results, drafting reports, or answering operator questions from the twin's outputs. "
+                    "The deep models here (GRU, Transformer) are the same architectures at a size these data can "
+                    "support.")
+
+
+def ladder_hybrid(n0: int) -> None:
+    section("Level 5 · Hybrid & physics-informed models")
+    st.markdown("**Mechanistic PINN**: a neural network trained to fit the data *and* obey the SEI, plating and "
+                "loss-of-active-material equations. **Hierarchical Bayes**: a physics fade law whose parameters "
+                "start from what the whole fleet taught us and are updated by this battery's data.")
+    c = st.columns(3)
+    run_p = c[0].toggle("Mechanistic PINN", value=True, key="lad_h_pinn")
+    ep = c[1].select_slider("PINN epochs", [500, 1000, 1500, 2500], value=1000, key="lad_h_ep")
+    run_hb = c[2].toggle("Hierarchical Bayes", value=True, key="lad_h_hb")
+    if st.button("Run hybrid models", key="lad_h_go", icon=":material/hub:", type="primary"):
+        with st.spinner("Training…"):
+            if run_p:
+                try:
+                    r = te.train_pinn(ct, imp, cell, n0, te.PINNConfig(epochs=int(ep), physics="mechanistic"), float(eol_ah))
+                    ladder_add("Mechanistic PINN", 5, n0, r.n_grid, r.soh, r.soh_lo, r.soh_hi, r.metrics)
+                except Exception as exc:
+                    st.warning(f"PINN: {exc}")
+            if run_hb:
+                try:
+                    f = te.hierarchical_bayes_forecast(ct, cell, n0, float(eol_ah))
+                    ladder_add("Hierarchical Bayes", 5, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics)
+                except Exception as exc:
+                    st.warning(f"Hierarchical Bayes: {exc}")
+    ladder_level_block(5, ladder_entries(n0), "lad_hybrid", n0)
+
+
+def fig_spm_curves(P: Palette) -> go.Figure:
+    p = te.SPMParams()
+    I = float(meta.loc[cell, "I_dis_A"])
+    T = float(meta.loc[cell, "T_mean_C"])
+    fig = go.Figure()
+    for name, kw, col, dash in (("New cell", dict(), P.accent, "solid"), ("10% lithium lost", dict(lli=0.10), "#E69F00", "dash"),
+                                ("20% lithium lost", dict(lli=0.20), "#D55E00", "dot"),
+                                ("2× current", dict(I_A=2 * I), "#AA4499", "dashdot"), ("Cold (4 °C)", dict(T_C=4.0), "#56B4E9", "longdash")):
+        args = dict(p=p, I_A=I, T_C=T)
+        args.update(kw)
+        r = te.spm_discharge(**args)
+        fig.add_trace(go.Scatter(x=r["q_Ah"], y=r["V"], mode="lines", name=f"{name} · {r['capacity_Ah']:.2f} Ah",
+                                 line=dict(color=col, width=2.6, dash=dash), hovertemplate="%{y:.3f} V<extra>" + name + "</extra>"))
+    fig.update_xaxes(title_text="Discharged capacity (Ah)")
+    fig.update_yaxes(title_text="Terminal voltage (V)")
+    return style_fig(fig, P, 470, f"Single-particle model: discharge at {I:.1f} A, {T:.0f} °C")
+
+
+def ladder_first_principles(n0: int) -> None:
+    section("Level 6 · First principles: single-particle electrochemical model")
+    st.markdown("Each electrode is one spherical particle: lithium diffuses inside it (Fick's law), crosses the "
+                "surface with Butler–Volmer kinetics, and the voltage is the difference of the LiCoO₂ and graphite "
+                "potentials minus the losses. Ageing is SEI growth consuming lithium, "
+                "LLI = a·Ah + b·√Ah (reaction- plus diffusion-limited), fitted to this battery's capacity history.")
+    show(fig_spm_curves(P), key="lad_spm_curves", export=False)
+    with st.expander("Governing equations", icon=":material/functions:"):
+        st.latex(r"\frac{\partial \theta}{\partial t} = \frac{D}{r^2}\frac{\partial}{\partial r}\left(r^2 \frac{\partial \theta}{\partial r}\right),"
+                 r"\qquad D\,\frac{\partial \theta}{\partial r}\Big|_{r=R} = \mp\frac{I}{3600\,C}\,\frac{R}{3}")
+        st.latex(r"V = U_p(\theta_{p,s}) - U_n(\theta_{n,s}) - \frac{2RT}{F}\left[\sinh^{-1}\frac{I}{2 i_{0,p}} + "
+                 r"\sinh^{-1}\frac{I}{2 i_{0,n}}\right] - I\,(R_\Omega + R_\mathrm{film}),\quad i_0 \propto \sqrt{\theta(1-\theta)}")
+        st.latex(r"\mathrm{LLI}(\mathrm{Ah}) = a\,\mathrm{Ah} + b\,\sqrt{\mathrm{Ah}},\qquad x_0 \rightarrow x_0 - \mathrm{LLI},"
+                 r"\qquad R_\mathrm{film} \propto \mathrm{LLI}")
+    if st.button("Run first-principles forecast", key="lad_s_go", icon=":material/science:", type="primary"):
+        try:
+            f = te.spm_forecast(ct, cell, n0, float(eol_ah))
+            ladder_add("SPM + SEI", 6, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics)
+            st.session_state["spm_params"] = f.params
+        except Exception as exc:
+            report_error("SPM forecast failed", exc, debug)
+    ladder_level_block(6, ladder_entries(n0), "lad_spm", n0)
+    if st.session_state.get("spm_params"):
+        show_table(pd.Series(st.session_state["spm_params"], name="Value").to_frame().style.format("{:.4g}"),
+                   note="Fitted SEI kinetics: a large reaction term means near-linear fade, a large diffusion term "
+                        "means fade that slows down as the SEI film thickens.")
+
+
+def ladder_leaderboard(n0: int) -> None:
+    section("Leaderboard: every level on the same battery and origin")
+    entries = ladder_entries(n0)
+    if not entries:
+        st.info("Run at least one level above; results appear here side by side.")
+        return
+    show(fig_ladder(entries, n0, P, f"All models from origin n₀ = {n0}"), key="lad_board", export=False)
+    tab = _ladder_table(entries).sort_values("RMSE")
+    best = tab.iloc[0]
+    k = st.columns(3)
+    k[0].metric("Best model", best["Model"], delta=best["Level"], delta_color="off")
+    k[1].metric("Accuracy", fmt(best["Accuracy (%)"], ".2f", "%"))
+    base = tab[tab["Model"] == "Baseline · linear trend"]
+    if len(base):
+        k[2].metric("Gain over linear trend", fmt(100 * (1 - best["RMSE"] / base["RMSE"].iloc[0]), ".0f", "%"),
+                    help="How much lower the best model's error is than the simplest credible baseline.")
+    show_table(tab.set_index("Model").style.format({"Accuracy (%)": "{:.2f}", "RMSE": "{:.4f}", "Fade skill": "{:.3f}",
+                                                    "Coverage": "{:.0%}", "RUL error": "{:+.0f}"}, na_rep="—")
+               .highlight_min(subset=["RMSE"], props="background-color: rgba(0,158,115,0.25); font-weight: 700;"),
+               note="Sorted by error on the same future cycles. Compare levels: more complexity is only worth it "
+                    "when it clearly beats the lower levels and keeps honest uncertainty (coverage near 90%).")
+    if st.button("Clear leaderboard for this battery", key="lad_clear", icon=":material/delete:"):
+        st.session_state["ladder"] = {k_: v for k_, v in st.session_state.get("ladder", {}).items() if k_[0] != cell}
+        st.rerun()
+
+
 def view_models() -> None:
+    recommendations("models")
+    section("Learning ladder: from simple references to first principles")
+    frac = st.slider("Forecast origin: fraction of this battery's life used for training (the rest is the test)",
+                     0.1, 0.9, 0.4, 0.05, key="ml_frac")
+    n0 = int(max(5, round(frac * meta.loc[cell, "cycles"])))
+    st.caption(f"Battery {cell}: training on cycles 1–{n0}, testing on the later cycles. Every level uses this origin.")
+    ladder_intro(n0)
     ml_methods_panel()
+    ladder_baselines(n0)
     ml_section()
+    ladder_deep(n0)
+    ladder_hybrid(n0)
+    ladder_first_principles(n0)
+    ladder_leaderboard(n0)
     early_life_section()
     cross_cell_section()
 
@@ -3664,6 +4105,7 @@ def view_models() -> None:
 # View 3: operations & optimal control
 # =============================================================================
 def view_ops() -> None:
+    recommendations("ops")
     section("Twin-aware operating strategy")
     st.markdown("The twin-aware policy predicts each available discharge current with the ECM and degradation "
                 "model, then picks the best objective value within the thermal and cold-weather limits. "
@@ -4005,6 +4447,7 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # =============================================================================
 # Dispatch: only the active view runs
 # =============================================================================
+sidebar_guide()
 _VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_data, VIEWS[1]: view_replay, VIEWS[2]: view_models,
                                            VIEWS[3]: view_ops, VIEWS[4]: view_study}
 try:
