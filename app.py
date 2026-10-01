@@ -379,6 +379,21 @@ div[data-testid="stPlotlyChart"], div[data-testid="stMetric"], .bt-card {{animat
 .bt-res-bar > div {{height: 100%; border-radius: 99px; animation: bt-grow 1.1s cubic-bezier(.2,.8,.2,1) both;
   transform-origin: left;}}
 @keyframes bt-grow {{from {{transform: scaleX(0);}} to {{transform: scaleX(1);}}}}
+.bt-grade {{flex: none; width: 58px; height: 58px; border-radius: 50%; border: 4px solid; display: flex; align-items: center;
+  justify-content: center; font-size: 1.7rem; font-weight: 900; animation: bt-pop .6s cubic-bezier(.2,1.6,.4,1) both;}}
+@keyframes bt-pop {{from {{transform: scale(0.4); opacity: 0;}} to {{transform: scale(1); opacity: 1;}}}}
+.bt-res-head {{gap: 14px;}}
+.bt-res-top {{display: flex; align-items: center; gap: 10px;}}
+.bt-res-sum {{font-size: 0.9rem; line-height: 1.5; margin: 10px 0 4px 0; padding: 8px 12px; border-radius: 10px;
+  background: var(--bt-accent-soft); border: 1px solid var(--bt-accent-line);}}
+.bt-tiles {{display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 12px;}}
+.bt-tile {{padding: 8px 6px; border-radius: 10px; text-align: center; border: 1px solid var(--bt-border);
+  background: rgba(128,128,128,0.06); animation: bt-rise .5s ease both;}}
+.bt-tile-v {{font-weight: 850; font-size: 0.98rem;}}
+.bt-tile-l {{font-size: 0.72rem; opacity: 0.7; margin-top: 2px;}}
+.bt-res-ev {{margin-top: 10px; font-size: 0.84rem; display: flex; flex-wrap: wrap; gap: 6px; align-items: center;}}
+.bt-sev-chip {{padding: 1px 8px; border-radius: 999px; border: 1px solid; font-size: 0.76rem; font-weight: 700;}}
+@media (max-width: 1100px) {{.bt-tiles {{grid-template-columns: repeat(2, 1fr);}}}}
 .bt-res-alerts {{margin-top: 12px; font-size: 0.82rem; line-height: 1.45; padding: 8px 10px; border-radius: 10px;
   background: rgba(213,94,0,0.08); border: 1px solid rgba(213,94,0,0.25);}}
 /* ---------- animated hero gradient ---------- */
@@ -500,7 +515,7 @@ PLOT_CONFIG = {
 
 EXPLAIN: Dict[str, str] = {
     # diagnostics
-    "bat3d": "3D model of the battery: the inner fill height is its state of health, the fill colour its risk level, the faint red space above the capacity already lost. Drag to rotate, scroll to zoom, ⟳ to spin; hover for details.",
+    "bat3d": "Animated battery: the electrolyte level is the state of health, its colour the risk level (green → red), the empty space above it the capacity already lost; glowing dots are lithium ions moving between the electrodes.",
     "gauges": "Instrument cluster: the battery's state of health, quick remaining-life estimate, resistance growth and peak temperature, coloured by risk. Use it to judge at a glance whether this battery needs attention.",
     "risk_matrix": "Each bubble is a battery: remaining life (x) against how fast it is degrading (y). Top-left means little life left and fading fast: act on those first.",
     "fleet_map": "Treemap of the fleet grouped by ambient temperature; tile size = cycles run, colour = remaining health margin. It shows whether problems cluster under one operating condition.",
@@ -1855,109 +1870,111 @@ def fig_mech_groups(mech: pd.DataFrame, P: Palette) -> go.Figure:
 
 
 # =============================================================================
-# 3D battery model (Plotly 3D: rotatable, zoomable, with an orbit animation)
+# Animated 3D battery (pure CSS 3D, runs by itself: no interaction, no external library)
 # =============================================================================
-def _shade(color: str, f: float) -> str:
-    """Darken (f < 1) or lighten (f > 1) a hex colour."""
+def _hex_rgb(color: str) -> Tuple[int, int, int]:
     c = color.lstrip("#")
-    r, g, b = (int(c[i:i + 2], 16) for i in (0, 2, 4))
-    if f <= 1:
-        r, g, b = (int(v * f) for v in (r, g, b))
-    else:
-        r, g, b = (int(v + (255 - v) * (f - 1)) for v in (r, g, b))
-    return f"#{min(r, 255):02x}{min(g, 255):02x}{min(b, 255):02x}"
+    return tuple(int(c[k:k + 2], 16) for k in (0, 2, 4))  # type: ignore[return-value]
 
 
-def _cyl_surface(x0: float, y0: float, r: float, z0: float, z1: float, color: str, opacity: float, name: str,
-                 n: int = 48, shade: bool = True, group: str = "") -> go.Surface:
-    th = np.linspace(0, 2 * np.pi, n)
-    z = np.array([z0, z1])
-    TH, Z = np.meshgrid(th, z)
-    X, Y = x0 + r * np.cos(TH), y0 + r * np.sin(TH)
-    # metallic shading: brightness varies with angle to the light
-    sc = (0.55 + 0.45 * np.cos(TH - 0.6)) if shade else np.ones_like(TH)
-    return go.Surface(x=X, y=Y, z=Z, surfacecolor=sc, colorscale=[[0, _shade(color, 0.45)], [1, _shade(color, 1.25)]],
-                      cmin=0, cmax=1, showscale=False, opacity=opacity, name=name, hoverinfo="skip",
-                      legendgroup=group, lighting=dict(ambient=0.55, diffuse=0.7, specular=0.6, roughness=0.35, fresnel=0.3),
-                      lightposition=dict(x=200, y=100, z=300))
+def _battery_css_block(uid: str, soh: float, color: str, R: int, H: int, n_faces: int = 32, ions: int = 10,
+                       spin_s: float = 16.0) -> str:
+    """HTML/CSS for one rotating 18650 cell: metal can (shaded panels), electrolyte fill at the SOH level in
+    the risk colour with a rippling surface, lithium ions moving between the electrodes, terminals."""
+    soh = float(np.clip(soh, 0.0, 1.0))
+    r, g, b = _hex_rgb(color)
+    w = 2 * R * math.tan(math.pi / n_faces) + 1.2
+    R2 = int(R * 0.86)
+    w2 = 2 * R2 * math.tan(math.pi / n_faces) + 1.2
+    hf = max(int(H * soh), 4)
+    faces, fill = [], []
+    for k in range(n_faces):
+        th = 360.0 * k / n_faces
+        light = 0.5 + 0.5 * math.cos(math.radians(th) - 0.7)
+        faces.append(f'<i class="f" style="width:{w:.1f}px;height:{H}px;margin-left:{-w / 2:.1f}px;'
+                     f'transform:rotateY({th:.2f}deg) translateZ({R}px);'
+                     f'background:linear-gradient(90deg,rgba(210,222,235,{0.10 + 0.22 * light:.3f}),'
+                     f'rgba(255,255,255,{0.06 + 0.30 * light ** 4:.3f}) 50%,rgba(150,165,180,{0.10 + 0.18 * light:.3f}))"></i>')
+        fill.append(f'<i class="f" style="width:{w2:.1f}px;height:{hf}px;top:{H - hf}px;margin-left:{-w2 / 2:.1f}px;'
+                    f'transform:rotateY({th:.2f}deg) translateZ({R2}px);'
+                    f'background:linear-gradient(180deg,rgba({r},{g},{b},{0.55 + 0.35 * light:.3f}),'
+                    f'rgba({int(r * 0.45)},{int(g * 0.45)},{int(b * 0.45)},{0.75 + 0.2 * light:.3f}))"></i>')
+    rng = np.random.default_rng(abs(hash(uid)) % 2 ** 32)
+    ion = []
+    for k in range(ions):
+        ang = rng.uniform(0, 360)
+        rad = rng.uniform(0.15, 0.75) * R2
+        delay = rng.uniform(0, 3.5)
+        dur = rng.uniform(2.4, 4.2)
+        ion.append(f'<b class="ion" style="--a:{ang:.0f}deg;--r:{rad:.0f}px;--top:{H - 6}px;--bot:{H - hf + 8}px;'
+                   f'animation-delay:-{delay:.2f}s;animation-duration:{dur:.2f}s"></b>')
+    return (f'<div class="cell" style="width:{2 * R + 40}px;height:{H + 70}px">'
+            f'<div class="halo" style="width:{2 * R + 60}px;background:radial-gradient(ellipse at center,'
+            f'rgba({r},{g},{b},0.55),rgba({r},{g},{b},0) 70%)"></div>'
+            f'<div class="cyl" style="width:{2 * R}px;height:{H}px;top:36px;animation-duration:{spin_s}s">'
+            + "".join(fill)
+            + f'<i class="disc liquid" style="width:{2 * R2}px;height:{2 * R2}px;left:{R - R2}px;top:{H - hf - R2}px;'
+              f'background:radial-gradient(circle at 40% 40%,rgba(255,255,255,0.55),rgba({r},{g},{b},0.9) 45%,'
+              f'rgba({int(r * 0.6)},{int(g * 0.6)},{int(b * 0.6)},0.95))"></i>'
+            + "".join(ion) + "".join(faces)
+            + f'<i class="disc" style="width:{2 * R}px;height:{2 * R}px;left:0;top:{-R}px;'
+              f'background:radial-gradient(circle,#eef3f8,#a9b8c6 70%,#7d8b99)"></i>'
+              f'<i class="disc term" style="width:{int(0.76 * R)}px;height:{int(0.76 * R)}px;left:{int(0.62 * R)}px;'
+              f'top:{-int(0.38 * R)}px"></i>'
+              f'<i class="disc" style="width:{2 * R}px;height:{2 * R}px;left:0;top:{H - R}px;'
+              f'background:radial-gradient(circle,#9aa8b6,#5f6d7b)"></i>'
+            + '</div></div>')
 
 
-def _disc(x0: float, y0: float, r: float, z: float, color: str, opacity: float, n: int = 40) -> go.Surface:
-    th = np.linspace(0, 2 * np.pi, n)
-    rr = np.array([0.0, r])
-    TH, RR = np.meshgrid(th, rr)
-    return go.Surface(x=x0 + RR * np.cos(TH), y=y0 + RR * np.sin(TH), z=np.full_like(TH, z),
-                      surfacecolor=np.ones_like(TH), colorscale=[[0, color], [1, color]], showscale=False,
-                      opacity=opacity, hoverinfo="skip", lighting=dict(ambient=0.7, diffuse=0.6, specular=0.4))
+BATTERY_CSS = """
+.wrap{display:flex;gap:18px;justify-content:center;align-items:flex-end;flex-wrap:wrap;font-family:Inter,'Segoe UI',sans-serif;}
+.unit{display:flex;flex-direction:column;align-items:center;}
+.cell{position:relative;perspective:900px;}
+.cyl{position:absolute;left:20px;transform-style:preserve-3d;animation:spin linear infinite;}
+.cyl .f{position:absolute;left:50%;top:0;display:block;backface-visibility:visible;}
+.disc{position:absolute;display:block;border-radius:50%;transform:rotateX(90deg);}
+.term{background:radial-gradient(circle,#ffffff,#cfd8e1 60%,#9aa8b6);box-shadow:0 0 8px rgba(255,255,255,0.6);}
+.liquid{animation:ripple 2.6s ease-in-out infinite;}
+.ion{position:absolute;left:50%;width:6px;height:6px;margin-left:-3px;border-radius:50%;background:#bff6ff;
+  box-shadow:0 0 8px 3px rgba(127,227,255,0.9);animation:ion linear infinite;display:block;}
+.halo{position:absolute;left:-10px;bottom:0;height:46px;border-radius:50%;animation:pulse 2.4s ease-in-out infinite;}
+@keyframes spin{from{transform:rotateX(-16deg) rotateY(0deg)}to{transform:rotateX(-16deg) rotateY(360deg)}}
+@keyframes ripple{0%,100%{transform:rotateX(90deg) scale(1)}50%{transform:rotateX(90deg) scale(0.94)}}
+@keyframes ion{0%{transform:rotateY(var(--a)) translateZ(var(--r)) translateY(var(--top));opacity:0}
+  15%{opacity:1}85%{opacity:1}100%{transform:rotateY(var(--a)) translateZ(var(--r)) translateY(var(--bot));opacity:0}}
+@keyframes pulse{0%,100%{opacity:0.55;transform:scaleX(0.92)}50%{opacity:1;transform:scaleX(1.05)}}
+.name{font-weight:850;font-size:var(--fs);letter-spacing:-0.02em;margin-top:4px;}
+.soh{font-weight:800;font-size:calc(var(--fs) * 0.75);}
+.sub{font-size:12px;opacity:0.75;margin-top:2px;text-align:center;}
+@media (prefers-reduced-motion: reduce){.cyl,.liquid,.ion,.halo{animation:none}}
+"""
 
 
-def fig_battery_3d(cells: Sequence[str], info: Dict[str, Dict[str, Any]], P: Palette, height: int = 560,
-                   title: Optional[str] = None, labels: bool = True) -> go.Figure:
-    """One or several 18650 cells in 3D. Inner fill height = state of health, fill colour = risk level,
-    faint red ghost = capacity already lost, jelly-roll spiral on top of the fill, labels in 3D."""
-    H, R, gap = 65.0, 9.0, 28.0
-    fig = go.Figure()
-    ann = []
-    for k, c in enumerate(cells):
-        x0 = k * gap
-        d = info.get(c, {})
-        soh = float(np.clip(d.get("soh", 1.0), 0.0, 1.05))
+def battery_anim_html(items: Sequence[Dict[str, Any]], text_color: str, big: bool) -> Tuple[str, int]:
+    R, H = (72, 240) if big else (40, 132)
+    units = []
+    for d in items:
         col = RISK_COLORS.get(d.get("risk", "Healthy"), "#009E73")
-        zf = H * min(soh, 1.0)
-        fig.add_trace(_cyl_surface(x0, 0, R * 0.86, 0, zf, col, 0.92, f"{c} SOH", group=c))
-        fig.add_trace(_disc(x0, 0, R * 0.86, zf, col, 0.95))
-        if zf < H - 0.5:
-            fig.add_trace(_cyl_surface(x0, 0, R * 0.86, zf, H, "#D55E00", 0.10, f"{c} lost", shade=False, group=c))
-        # electrode jelly roll on top of the fill
-        t = np.linspace(0, 6 * np.pi, 220)
-        rr = 0.6 + (R * 0.8 - 0.6) * t / t.max()
-        fig.add_trace(go.Scatter3d(x=x0 + rr * np.cos(t), y=rr * np.sin(t), z=np.full_like(t, zf + 0.25), mode="lines",
-                                   line=dict(color="rgba(255,255,255,0.75)", width=3), hoverinfo="skip", showlegend=False))
-        # can, terminals
-        fig.add_trace(_cyl_surface(x0, 0, R, 0, H, "#A9B8C6", 0.28, f"{c} can", group=c))
-        fig.add_trace(_cyl_surface(x0, 0, R * 0.38, H, H + 3.2, "#D9E2EA", 0.95, f"{c} + terminal", group=c))
-        fig.add_trace(_disc(x0, 0, R * 0.38, H + 3.2, "#EEF3F8", 1.0))
-        fig.add_trace(_disc(x0, 0, R, 0, "#7D8B99", 0.9))
-        # hover anchor with the résumé
-        fig.add_trace(go.Scatter3d(x=[x0], y=[0], z=[zf / 2 + 1], mode="markers", marker=dict(size=2, opacity=0.01),
-                                   showlegend=False, hovertemplate=d.get("hover", c) + "<extra></extra>"))
-        if labels:
-            ann.append(dict(x=x0, y=0, z=H + 13, text=f"<b>{c}</b>", showarrow=False,
-                            font=dict(size=16 if len(cells) == 1 else 13, color=P.text)))
-            ann.append(dict(x=x0, y=0, z=H + 7.5, text=f"SOH {100 * soh:.0f}%", showarrow=False,
-                            font=dict(size=12, color=col)))
-            if len(cells) == 1 and d.get("conditions"):
-                for j, line in enumerate(d["conditions"]):
-                    ann.append(dict(x=x0 + R + 3, y=-R, z=H * (0.85 - 0.16 * j), text=line, showarrow=True,
-                                    ax=70, ay=0, arrowcolor=P.muted, arrowwidth=1,
-                                    font=dict(size=12, color=P.text),
-                                    bgcolor="rgba(20,28,40,0.55)" if P.mode == "dark" else "rgba(255,255,255,0.8)",
-                                    bordercolor=P.grid, borderwidth=1, xanchor="left"))
-    span = max(len(cells) - 1, 0) * gap
-    eye = dict(x=1.55, y=-1.55, z=0.75) if len(cells) == 1 else dict(x=0.9, y=-1.9, z=0.8)
-    fig.update_layout(
-        height=height, margin=dict(l=0, r=0, t=50 if title else 10, b=0), paper_bgcolor="rgba(0,0,0,0)",
-        showlegend=False, title=dict(text=title, font=dict(size=16, color=P.text), x=0.01) if title else None,
-        scene=dict(xaxis=dict(visible=False, range=[-R - 4, span + R + (40 if len(cells) == 1 else 4)]),
-                   yaxis=dict(visible=False, range=[-R - 6, R + 6]), zaxis=dict(visible=False, range=[-2, H + 18]),
-                   aspectmode="data", bgcolor="rgba(0,0,0,0)", camera=dict(eye=eye), annotations=ann))
-    # orbit animation (button), the figure stays interactive
-    frames = []
-    for a in np.linspace(0, 2 * np.pi, 37)[:-1]:
-        r_ = math.hypot(eye["x"], eye["y"])
-        frames.append(go.Frame(layout=dict(scene=dict(camera=dict(eye=dict(x=r_ * math.cos(a - 0.785),
-                                                                            y=r_ * math.sin(a - 0.785), z=eye["z"]))))))
-    fig.frames = frames
-    fig.update_layout(updatemenus=[dict(
-        type="buttons", showactive=False, x=0.01, y=0.02, xanchor="left", yanchor="bottom",
-        bgcolor="rgba(20,28,40,0.7)" if P.mode == "dark" else "rgba(255,255,255,0.85)", bordercolor=P.grid,
-        font=dict(color=P.text),
-        buttons=[dict(label="⟳ Rotate", method="animate",
-                      args=[None, dict(frame=dict(duration=90, redraw=True), transition=dict(duration=0),
-                                       fromcurrent=True, mode="immediate")]),
-                 dict(label="■ Stop", method="animate",
-                      args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")])])])
-    return fig
+        units.append(f'<div class="unit">{_battery_css_block(d["id"], d["soh"], col, R, H)}'
+                     f'<div class="name" style="--fs:{24 if big else 15}px;color:{text_color}">{html.escape(d["id"])}</div>'
+                     f'<div class="soh" style="--fs:{24 if big else 15}px;color:{col}">SOH {100 * d["soh"]:.0f}%</div>'
+                     + (f'<div class="sub" style="color:{text_color}">{html.escape(d.get("sub", ""))}</div>' if d.get("sub") else "")
+                     + '</div>')
+    height = H + 70 + (92 if big else 70)
+    doc = (f'<html><head><style>body{{margin:0;background:transparent;overflow:hidden}}{BATTERY_CSS}</style></head>'
+           f'<body><div class="wrap">{"".join(units)}</div></body></html>')
+    return doc, height
+
+
+def render_battery_anim(items: Sequence[Dict[str, Any]], big: bool = True, key: str = "") -> None:
+    doc, height = battery_anim_html(items, P.text, big)
+    try:
+        import streamlit.components.v1 as components
+        components.html(doc, height=height, scrolling=False)
+    except Exception:                                   # fallback: same markup inline
+        st.markdown(doc.split("<body>")[1].split("</body>")[0].replace('<div class="wrap">', f'<style>{BATTERY_CSS}</style><div class="wrap">', 1),
+                    unsafe_allow_html=True)
+    explain("bat3d")
 
 
 def battery_info(c: str, fs: pd.DataFrame, groups: pd.DataFrame) -> Dict[str, Any]:
@@ -1973,54 +1990,110 @@ def battery_info(c: str, fs: pd.DataFrame, groups: pd.DataFrame) -> Dict[str, An
     return {"soh": soh, "risk": risk, "conditions": cond, "hover": hover, "group": grp, "row": row}
 
 
-def resume_card(c: str, inf: Dict[str, Any]) -> None:
-    """Animated performance résumé next to the 3D battery."""
+def _grade(row: Optional[pd.Series]) -> Tuple[str, str]:
+    if row is None:
+        return "–", "#8C8C8C"
+    margin, risk = float(row["Health margin"]), str(row["Risk"])
+    if risk == "Critical":
+        return "E", RISK_COLORS["Critical"]
+    if risk == "Warning":
+        return "D", RISK_COLORS["Warning"]
+    if risk == "Watch":
+        return "C", RISK_COLORS["Watch"]
+    return ("A", RISK_COLORS["Healthy"]) if margin > 0.5 else ("B", "#56B4E9")
+
+
+def resume_card(c: str, inf: Dict[str, Any], ev: Optional[pd.DataFrame] = None) -> None:
+    """General performance overview of one battery: grade, health, life, speed of ageing, stress, events, data."""
     m = meta.loc[c]
     row = inf["row"]
+    d = ct[ct["Cell_ID"] == c].sort_values("n")
+    good = d[~d["outlier"]]
 
-    def bar(label: str, val: float, frac: float, color: str, text: str) -> str:
+    def bar(label: str, frac: float, color: str, text: str) -> str:
         w = 100 * float(np.clip(frac, 0, 1))
         return (f'<div class="bt-res-row"><div class="bt-res-l">{label}</div><div class="bt-res-v">{text}</div>'
                 f'<div class="bt-res-bar"><div style="width:{w:.0f}%;background:{color}"></div></div></div>')
 
+    def tile(label: str, value: str) -> str:
+        return f'<div class="bt-tile"><div class="bt-tile-v">{value}</div><div class="bt-tile-l">{label}</div></div>'
+
     soh = inf["soh"]
     col = RISK_COLORS.get(inf["risk"], "#009E73")
+    grade, gcol = _grade(row)
     rul = float(row["Quick RUL"]) if row is not None else float("nan")
     rg = float(row["R growth (%)"]) if row is not None and np.isfinite(row["R growth (%)"]) else 0.0
     peak = float(row["Peak T (°C)"]) if row is not None else float("nan")
     fade = float(row["Fade per 100 cycles (%)"]) if row is not None else float("nan")
-    rows = [bar("State of health", soh, soh, col, f"{100 * soh:.1f}%"),
-            bar("Capacity", m["C_bol_Ah"] * soh, soh, "#0072B2", f"{m['C_bol_Ah'] * soh:.3f} / {m['C_bol_Ah']:.3f} Ah"),
-            bar("Quick remaining life", rul, min(rul / 200, 1) if np.isfinite(rul) else 1, col,
+    thr = float(good["cum_Ah"].max() - good["cum_Ah"].min()) if len(good) else float("nan")
+    eff = float(good["eff_energy"].median()) if "eff_energy" in good and good["eff_energy"].notna().any() else float("nan")
+    tmin = float(good["T_mean_C"].min()) if len(good) else float("nan")
+    n_regen = int(good["regen"].sum()) if "regen" in good else 0
+    n_out = int(d["outlier"].sum())
+    k = knee_cached(d, DATA_KEY, c)
+    evc = ev[ev["Cell_ID"] == c]["Severity"].value_counts() if ev is not None and len(ev) else pd.Series(dtype=int)
+    n_ev = int(evc.sum())
+    sev_chips = "".join(f'<span class="bt-sev-chip" style="border-color:{RISK_COLORS.get(sv, "#56B4E9")}">'
+                        f'{int(evc.get(sv, 0))} {sv.lower()}</span>' for sv in ("Critical", "Warning", "Watch", "Info"))
+    life_txt = ("past end of life" if np.isfinite(rul) and rul == 0 else f"{rul:.0f} cycles left" if np.isfinite(rul)
+                else "not declining")
+    summary = (f"{c} has delivered {thr:.0f} Ah over {int(m['cycles'])} cycles and keeps {100 * soh:.0f}% of its "
+               f"capacity ({life_txt}). " if np.isfinite(thr) else "")
+    summary += (f"Fade accelerated at cycle {k['knee_n']}. " if k.get("found") else "") + \
+               (f"{n_ev} logged events." if n_ev else "No logged events.")
+    rows = [bar("State of health", soh, col, f"{100 * soh:.1f}%"),
+            bar("Capacity now / new", soh, "#0072B2", f"{m['C_bol_Ah'] * soh:.3f} / {m['C_bol_Ah']:.3f} Ah"),
+            bar("Quick remaining life", min(rul / 200, 1) if np.isfinite(rul) else 1, col,
                 f"{rul:.0f} cycles" if np.isfinite(rul) else "not declining"),
-            bar("Fade speed", fade, min(fade / 10, 1) if np.isfinite(fade) else 0, "#E69F00",
+            bar("Fade speed", min(fade / 10, 1) if np.isfinite(fade) else 0, "#E69F00",
                 f"{fade:.2f} % / 100 cycles" if np.isfinite(fade) else "—"),
-            bar("Resistance growth", rg, min(max(rg, 0) / 150, 1), "#CC79A7", f"{rg:+.0f}%"),
-            bar("Peak temperature", peak, min(peak / 70, 1) if np.isfinite(peak) else 0, "#D55E00",
+            bar("Resistance growth", min(max(rg, 0) / 150, 1), "#CC79A7", f"{rg:+.0f}%"),
+            bar("Peak temperature", min(peak / 70, 1) if np.isfinite(peak) else 0, "#D55E00",
                 f"{peak:.1f} °C" if np.isfinite(peak) else "—")]
+    tiles = [tile("Cycles", f"{int(m['cycles'])}"), tile("Throughput", f"{thr:.0f} Ah" if np.isfinite(thr) else "—"),
+             tile("Energy efficiency", f"{100 * eff:.1f}%" if np.isfinite(eff) else "—"),
+             tile("Temperature range", f"{tmin:.0f}–{peak:.0f} °C" if np.isfinite(tmin) and np.isfinite(peak) else "—"),
+             tile("Knee point", f"n = {k['knee_n']}" if k.get("found") else "none"),
+             tile("Regeneration events", f"{n_regen}"), tile("Logged events", f"{n_ev}"),
+             tile("Excluded cycles", f"{n_out}")]
     alerts = str(row["Alerts"]) if row is not None else "—"
     st.markdown(
-        f'<div class="bt-resume"><div class="bt-res-head"><span class="bt-res-badge" style="background:{col}">'
+        f'<div class="bt-resume"><div class="bt-res-head"><div class="bt-grade" style="border-color:{gcol};color:{gcol}">'
+        f'{grade}</div><div><div class="bt-res-top"><span class="bt-res-badge" style="background:{col}">'
         f'{html.escape(inf["risk"].upper())}</span><span class="bt-res-name">{html.escape(c)}</span></div>'
-        f'<div class="bt-res-sub">{html.escape(" · ".join(inf["conditions"]))} · {int(m["cycles"])} cycles</div>'
-        + "".join(rows) + f'<div class="bt-res-alerts"><b>Alerts:</b> {html.escape(alerts)}</div></div>',
+        f'<div class="bt-res-sub">{html.escape(" · ".join(inf["conditions"]))}</div></div></div>'
+        f'<div class="bt-res-sum">{html.escape(summary)}</div>'
+        + "".join(rows) + f'<div class="bt-tiles">{"".join(tiles)}</div>'
+        f'<div class="bt-res-ev"><b>Event log:</b> {n_ev} events {sev_chips}</div>'
+        f'<div class="bt-res-alerts"><b>Alerts:</b> {html.escape(alerts)}</div></div>',
         unsafe_allow_html=True)
+    note("General performance overview: grade A (healthy, large margin) to E (critical), health and remaining "
+         "life, how fast it ages, the stress it has seen, how many events were logged and how many cycles were "
+         "excluded as invalid. Details follow in the sections below.")
 
 
-def battery_hero(scope: str, sel: Sequence[str], fs: pd.DataFrame) -> None:
+def battery_hero(scope: str, sel: Sequence[str], fs: pd.DataFrame, ev: Optional[pd.DataFrame] = None) -> None:
     groups = te.condition_groups(ct)
     if scope == "single":
         inf = battery_info(sel[0], fs, groups)
-        a, b = st.columns([3, 2], vertical_alignment="center")
+        m = meta.loc[sel[0]]
+        a, b = st.columns([2, 3], vertical_alignment="center")
         with a:
-            show(fig_battery_3d([sel[0]], {sel[0]: inf}, P, 560), key="bat3d", export=False)
+            render_battery_anim([{"id": sel[0], "soh": inf["soh"], "risk": inf["risk"],
+                                  "sub": f"{m['Ambient_C']:.0f} °C · {m['I_dis_A']:.1f} A · {inf['group']}"}], big=True)
         with b:
-            resume_card(sel[0], inf)
+            resume_card(sel[0], inf, ev)
     else:
         cells = list(sel)[:8] if scope == "selected" else list(fs.index[:8])
-        infos = {c: battery_info(c, fs, groups) for c in cells}
-        ttl = "Battery rack: selected batteries" if scope == "selected" else "Battery rack: the 8 highest-risk batteries"
-        show(fig_battery_3d(cells, infos, P, 520, ttl), key="bat3d", export=False)
+        items = []
+        for c in cells:
+            inf = battery_info(c, fs, groups)
+            n_ev = int((ev["Cell_ID"] == c).sum()) if ev is not None and len(ev) else 0
+            items.append({"id": c, "soh": inf["soh"], "risk": inf["risk"],
+                          "sub": f"{meta.loc[c, 'Ambient_C']:.0f} °C · {meta.loc[c, 'I_dis_A']:.1f} A · {n_ev} events"})
+        st.markdown("**Battery rack: " + ("selected batteries" if scope == "selected" else "the 8 highest-risk batteries")
+                    + "**")
+        render_battery_anim(items, big=False)
 
 
 # =============================================================================
@@ -3134,7 +3207,7 @@ def view_replay() -> None:
         st.session_state[key_p] = False
     speed = c[4].select_slider("Cycles per frame", [1, 2, 3, 5, 10], value=2, key="rp_speed")
     interval = c[5].select_slider("Frame interval (s)", [0.4, 0.7, 1.0, 1.5], value=0.7, key="rp_int")
-    st.toggle("Show the 3D battery draining with the replay", value=True, key="rp_3d")
+    st.toggle("Show the animated battery draining with the replay", value=True, key="rp_3d")
     reveal = c[6].toggle("Reveal future data", value=False, key="rp_reveal",
                          help="Show the cycles the twin has not seen yet, to judge the forecast.")
     good = ct_cell[~ct_cell["outlier"]]
@@ -3179,14 +3252,11 @@ def view_replay() -> None:
         sk = te.live_skill_table(track[track["n"] <= n])
         acc_map = dict(zip(sk["key"], sk["Accuracy (%)"])) if len(sk) else {}
         if st.session_state.get("rp_3d", True):
-            ens_soh = float(fr.forecasts["ens"][0][0]) if fr is not None and "ens" in fr.forecasts else float(row["SOH"])
             rul_now = (fr.rul.get("ens") or (np.nan,))[0] if fr is not None else np.nan
             risk_now = ("Critical" if row["SOH"] <= soh_eol or (np.isfinite(rul_now) and rul_now < 15) else
                         "Warning" if np.isfinite(rul_now) and rul_now < 50 else "Healthy")
-            inf = {"soh": float(row["SOH"]), "risk": risk_now,
-                   "hover": f"<b>{cell}</b> · cycle {n}<br>twin SOH {row['SOH']:.3f} · next {ens_soh:.3f}"}
-            show(fig_battery_3d([cell], {cell: inf}, P, 340, f"{cell} at cycle {n}", labels=True), key="rp_3dfig",
-                 export=False)
+            render_battery_anim([{"id": cell, "soh": float(row["SOH"]), "risk": risk_now,
+                                  "sub": f"cycle {n} · twin estimate"}], big=False)
         show(fig_live_main(ct_cell, pc, fr, n, soh_eol, P, reveal, n_max, show_models, acc_map), key="rp_main",
              export=False)
         live_accuracy_cards(sk, fr, show_models, reveal, eol_true)
@@ -3398,7 +3468,7 @@ def view_data() -> None:
         sel = all_cells
     st.session_state["_diag_sel"] = sel
 
-    battery_hero(scope, sel, fs)
+    battery_hero(scope, sel, fs, ev)
 
     section("Health status")
     status_section(scope, sel, fs, ev, lim)
