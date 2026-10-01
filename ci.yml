@@ -1,0 +1,40 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check . --exit-zero
+      - run: python -m py_compile twin_engine.py app.py benchmark.py
+      - run: pytest --ignore=tests/test_ui_screenshots.py
+      - name: Synthetic benchmark smoke run
+        run: python benchmark.py --synthetic --fracs 0.4 --paradigms ML Twin --out results/ci.parquet
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-${{ matrix.python }}
+          path: results/
+
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt playwright && playwright install --with-deps chromium
+      - run: pytest tests/test_ui_screenshots.py -q
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ui-screenshots
+          path: results/screenshots/

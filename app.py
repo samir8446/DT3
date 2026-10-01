@@ -72,7 +72,7 @@ DATA_DIR = APP_DIR / "data"
 RESULTS_DIR = APP_DIR / "results"
 MASTER_NAME, IMP_NAME = "battery_master_data.parquet", "impedance_ground_truth.parquet"
 POLICIES = ["Twin-Aware", "Fixed 1 A", "Fixed 2 A", "Fixed 4 A"]
-VIEWS = [":material/monitoring: Diagnostics", ":material/play_circle: Live twin",
+VIEWS = [":material/home: Home", ":material/monitoring: Diagnostics", ":material/play_circle: Live twin",
          ":material/psychology: Models & forecasting", ":material/tune: Operations & control",
          ":material/fact_check: Study results"]
 SANS = "Inter, 'Source Sans Pro', 'Helvetica Neue', Arial, sans-serif"
@@ -127,9 +127,9 @@ class Palette:
     currents: Tuple[Tuple[float, str], ...]
     series: Tuple[str, ...]
     ica_range: Tuple[float, float]
-    semi: str = "#009E73"
+    semi: str = "#332288"
     pf: str = "#F0E442"
-    mode_colors: Tuple[str, ...] = ("#56B4E9", "#E69F00", "#009E73", "#CC79A7", "#D55E00")
+    mode_colors: Tuple[str, ...] = ("#56B4E9", "#CC79A7", "#332288", "#AA4499", "#6699CC")
 
     def current_color(self, amps: float) -> str:
         return dict(self.currents).get(float(amps), self.muted)
@@ -139,9 +139,10 @@ class Palette:
 DASHES = ("solid", "dash", "dot", "dashdot", "longdash", "longdashdot")
 SYMBOLS = ("circle", "square", "diamond", "triangle-up", "cross", "star")
 # 24 distinguishable, colour-blind-considerate hues (Okabe-Ito + Paul Tol bright/muted/vibrant)
-CELL_COLORS = ("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00", "#56B4E9", "#882255", "#117733",
-               "#DDCC77", "#332288", "#AA4499", "#44AA99", "#999933", "#EE7733", "#0077BB", "#CC3311",
-               "#33BBEE", "#EE3377", "#228833", "#4477AA", "#AA3377", "#66CCEE", "#BBBB00", "#7F3C8D")
+CELL_COLORS = ("#0072B2", "#CC79A7", "#56B4E9", "#882255", "#332288", "#AA4499", "#6699CC", "#7F3C8D",
+               "#3969AC", "#B07AA1", "#4E79A7", "#9C755F", "#76B7B2", "#BAB0AC", "#5D69B1", "#A5AA99",
+               "#8E6C8A", "#2F8AC4", "#99C945", "#764E9F", "#ED645A", "#CC61B0", "#24796C", "#DAA51B")[:20]
+# risk colours (green / yellow / orange / red) are reserved for risk; categories use the hues above
 CELL_SYMBOLS = ("circle", "square", "diamond", "triangle-up", "triangle-down", "star", "hexagon", "pentagon",
                 "cross", "x", "star-triangle-up", "hourglass")
 
@@ -168,8 +169,8 @@ DARK = Palette(
     legend_bg="rgba(11,18,32,0.90)", legend_border="#64748b",
     accent="#56B4E9", measured="#f8fafc", cohort="rgba(148,163,184,0.38)",
     ekf="#56B4E9", pinn="#CC79A7", eis="#E69F00", eol="#D55E00",
-    r_int="#E69F00", r_ct="#009E73",
-    currents=((1.0, "#56B4E9"), (2.0, "#009E73"), (4.0, "#D55E00")),
+    r_int="#CC79A7", r_ct="#56B4E9",
+    currents=((1.0, "#56B4E9"), (2.0, "#CC79A7"), (4.0, "#AA4499")),
     series=("#E69F00", "#009E73", "#F0E442", "#D55E00", "#CC79A7"),
     ica_range=(0.15, 0.95),
 )
@@ -181,12 +182,12 @@ LIGHT = Palette(
     legend_bg="rgba(255,255,255,0.95)", legend_border="#94a3b8",
     accent="#0072B2", measured="#111827", cohort="rgba(100,116,139,0.35)",
     ekf="#0072B2", pinn="#CC79A7", eis="#E69F00", eol="#D55E00",
-    r_int="#E69F00", r_ct="#009E73",
-    currents=((1.0, "#0072B2"), (2.0, "#009E73"), (4.0, "#D55E00")),
+    r_int="#AA4499", r_ct="#0072B2",
+    currents=((1.0, "#0072B2"), (2.0, "#AA4499"), (4.0, "#882255")),
     # yellow (#F0E442) has too little contrast on white; use black-ish grey instead.
     series=("#E69F00", "#009E73", "#D55E00", "#56B4E9", "#555555"),
     ica_range=(0.0, 0.82),
-    pf="#555555", mode_colors=("#0072B2", "#E69F00", "#009E73", "#CC79A7", "#D55E00"),
+    pf="#555555", mode_colors=("#0072B2", "#CC79A7", "#332288", "#AA4499", "#6699CC"),
 )
 
 # Publication style: opaque white background, serif type, black axes (journal figures).
@@ -352,6 +353,24 @@ div[data-testid="stPlotlyChart"], div[data-testid="stMetric"], .bt-card {{animat
 .bt-section {{animation: bt-rise .4s ease both;}}
 @media (max-width: 900px) {{.bt-ladder {{grid-template-columns: repeat(3, 1fr);}}}}
 @media (prefers-reduced-motion: reduce) {{.bt-reco, .bt-section, div[data-testid="stPlotlyChart"], div[data-testid="stMetric"] {{animation: none;}}}}
+/* ---------- context bar, compact explanations, empty states, home ---------- */
+.bt-context {{position: sticky; top: 2.9rem; z-index: 50; display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center;
+  padding: 8px 14px; margin: 6px 0 12px 0; border-radius: 12px; border: 1px solid var(--bt-border);
+  background: color-mix(in srgb, var(--bt-surface) 70%, transparent); backdrop-filter: blur(8px); font-size: 0.85rem;}}
+.bt-context i {{font-style: normal; opacity: 0.6; margin-right: 4px; font-size: 0.75rem; text-transform: uppercase;
+  letter-spacing: 0.06em;}}
+.bt-context-hint {{margin-left: auto; font-size: 0.72rem; opacity: 0.55;}}
+.bt-explain-mini {{display: inline-block; margin: -4px 0 10px 0; font-size: 0.75rem; opacity: 0.6; cursor: help;
+  border-bottom: 1px dotted currentColor;}}
+.bt-empty {{display: flex; gap: 10px; align-items: center; padding: 14px 16px; margin: 6px 0 14px 0; border-radius: 12px;
+  border: 1px dashed var(--bt-border); font-size: 0.9rem; opacity: 0.85; background: rgba(128,128,128,0.04);}}
+.bt-empty-i {{font-size: 1.1rem; color: var(--bt-accent);}}
+.bt-qs {{min-height: 118px; padding: 14px; border-radius: 14px; border: 1px solid var(--bt-border); background: var(--bt-surface);
+  box-shadow: var(--bt-shadow); margin-bottom: 6px; animation: bt-rise .5s ease both; transition: transform .15s ease;}}
+.bt-qs:hover {{transform: translateY(-3px);}}
+.bt-qs-t {{font-weight: 850; margin-bottom: 6px;}} .bt-qs-d {{font-size: 0.83rem; opacity: 0.8; line-height: 1.45;}}
+@media (max-width: 1100px) {{.bt-context-hint {{display: none;}} .bt-qs {{min-height: 0;}}}}
+@media (max-width: 760px) {{.bt-podium {{grid-template-columns: 1fr;}} .bt-pod {{order: 0 !important;}}}}
 /* ---------- podium & mission strip ---------- */
 .bt-podium {{display: grid; grid-template-columns: 1fr 1.15fr 1fr; gap: 10px; align-items: end; margin: 8px 0 14px 0;}}
 .bt-pod {{text-align: center; padding: 14px 10px; border-radius: 14px; border: 1px solid var(--bt-border);
@@ -569,8 +588,20 @@ EXPLAIN: Dict[str, str] = {
 }
 
 
+def _explain_html(text: str) -> str:
+    if st.session_state.get("ui_explain", True):
+        return (f'<div class="bt-explain"><span class="bt-explain-tag">What this shows</span> '
+                f'{html.escape(text)}</div>')
+    return f'<div class="bt-explain-mini" title="{html.escape(text, quote=True)}">ⓘ What this shows</div>'
+
+
 def note(text: str) -> None:
-    st.markdown(f'<div class="bt-explain"><span class="bt-explain-tag">What this shows</span> {html.escape(text)}</div>',
+    st.markdown(_explain_html(text), unsafe_allow_html=True)
+
+
+def placeholder(text: str, icon: str = "hourglass_empty") -> None:
+    """Consistent empty state for sections that have not been run yet."""
+    st.markdown(f'<div class="bt-empty"><span class="bt-empty-i">▷</span>{html.escape(text)}</div>',
                 unsafe_allow_html=True)
 
 
@@ -578,8 +609,7 @@ def explain(key: str) -> None:
     """Small 'what this shows' paragraph under a chart or table (catalogue lookup, exact key or prefix)."""
     text = EXPLAIN.get(key) or next((v for k, v in EXPLAIN.items() if k.endswith("_") and key.startswith(k)), None)
     if text:
-        st.markdown(f'<div class="bt-explain"><span class="bt-explain-tag">What this shows</span> '
-                    f'{html.escape(text)}</div>', unsafe_allow_html=True)
+        st.markdown(_explain_html(text), unsafe_allow_html=True)
 
 
 def show(fig: go.Figure, key: str, data: Optional[pd.DataFrame] = None, export: bool = True) -> None:
@@ -597,7 +627,7 @@ def show(fig: go.Figure, key: str, data: Optional[pd.DataFrame] = None, export: 
         except TypeError:
             continue
     explain(key)
-    if export:
+    if export and st.session_state.get("ui_export", False):
         export_row(fig, key, data)
 
 
@@ -618,7 +648,7 @@ def show_selectable(fig: go.Figure, key: str) -> Optional[Any]:
 
 def export_row(fig: go.Figure, key: str, data: Optional[pd.DataFrame]) -> None:
     holder = getattr(st, "popover", None)
-    ctx = holder("Export", use_container_width=False) if holder else st.expander("Export")
+    ctx = holder("⋯ Export", use_container_width=False) if holder else st.expander("⋯ Export")
     with ctx:
         download("Interactive HTML", fig.to_html(include_plotlyjs="cdn", full_html=True), f"{key}.html",
                  "text/html", key=f"dl_html_{key}")
@@ -640,8 +670,7 @@ def export_row(fig: go.Figure, key: str, data: Optional[pd.DataFrame]) -> None:
 def show_table(data: Any, note: Optional[str] = None) -> None:
     _show_table(data)
     if note:
-        st.markdown(f'<div class="bt-explain"><span class="bt-explain-tag">What this shows</span> '
-                    f'{html.escape(note)}</div>', unsafe_allow_html=True)
+        st.markdown(_explain_html(note), unsafe_allow_html=True)
 
 
 def _show_table(data: Any) -> None:
@@ -816,7 +845,7 @@ def fig_cohort_group(ct_all: pd.DataFrame, meta: pd.DataFrame, group_cells: Sequ
             opacity=1.0 if (is_t or not highlight) else 0.75,
             hovertemplate=f"<b>{cid}</b> n=%{{x}}: SOH %{{y:.3f}}<extra></extra>"))
     fig.update_xaxes(title_text="Fraction of recorded life" if normalise_x else "Discharge cycle n")
-    fig.update_yaxes(title_text="SOH (–)")
+    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%")
     return style_fig(fig, P, 470, title, hovermode="closest")
 
 
@@ -885,12 +914,12 @@ def fig_fade_compare(ct_all: pd.DataFrame, meta: pd.DataFrame, cells: Sequence[s
             ys += d[y].tolist() + [None]
         fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines", name="Other cells", line=dict(color=P.cohort, width=1),
                                  hoverinfo="skip", opacity=0.7))
-    for cid in cells:
+    for k_, cid in enumerate(cells):
         d = d_all[d_all["Cell_ID"] == cid].sort_values("n")
         good = d[~d["outlier"]]
         col, sym = cell_style(cid, allc)
         fig.add_trace(go.Scatter(x=good[xcol], y=good[y], mode="lines+markers", name=cell_label(cid, meta),
-                                 legendgroup=cid, customdata=np.column_stack([good["n"], [cid] * len(good)]),
+                                 legendgroup=cid, showlegend=k_ < 8 or len(cells) <= 10, customdata=np.column_stack([good["n"], [cid] * len(good)]),
                                  line=dict(color=col, width=2.8), marker=dict(symbol=sym, size=6, color=col),
                                  hovertemplate=f"<b>{cid}</b> n=%{{customdata[0]}}: %{{y:.4f}}<extra></extra>"))
         rg = good[good["regen"]]
@@ -921,7 +950,7 @@ def fig_fade_compare(ct_all: pd.DataFrame, meta: pd.DataFrame, cells: Sequence[s
                              marker=dict(color="rgba(0,0,0,0)"), hoverinfo="skip"))
     fig.update_xaxes(title_text={"n": "Discharge cycle n", "Ah": "Cumulative throughput (Ah)",
                                  "frac": "Fraction of recorded life"}[x_mode])
-    fig.update_yaxes(title_text="State of health SOH (–)" if y == "SOH" else "Capacity (Ah)")
+    fig.update_yaxes(title_text="State of health (%)", tickformat=".0%" if y == "SOH" else "Capacity (Ah)")
     ttl = (f"Capacity fade, {cells[0]}" if len(cells) == 1 else f"Capacity fade: {len(cells)} batteries compared")
     return style_fig(fig, P, 560, ttl, hovermode="closest")
 
@@ -974,19 +1003,19 @@ def fig_ml(results: List[te.MLForecast], ct_cell: pd.DataFrame, n0: int, soh_eol
                      n_from=n0, group=r.model, alpha=0.12)
     fig.add_trace(go.Scatter(x=good["n"], y=good["SOH"], mode="markers", name="Measured SOH",
                              marker=dict(color=P.measured, size=6, opacity=0.85),
-                             hovertemplate="%{y:.4f}<extra></extra>"))
+                             hovertemplate="%{y:.2%}<extra></extra>"))
     for i, r in enumerate(results):
         col, sym = model_style(r.model)
         dash = DASHES[i % len(DASHES)]
         fig.add_trace(go.Scatter(x=r.n_grid, y=r.soh_pred, mode="lines+markers", name=r.model, legendgroup=r.model,
                                  line=dict(color=col, width=2.6, dash=dash),
                                  marker=dict(symbol=sym, size=7, maxdisplayed=10),
-                                 hovertemplate="%{y:.4f}<extra></extra>"))
+                                 hovertemplate="%{y:.2%}<extra></extra>"))
     n_max = max(float(r.n_grid.max()) for r in results)
     _forecast_frame(fig, n0, n_max, soh_eol, P)
     _origin_label(fig, n0, P)
     fig.update_xaxes(title_text="Discharge cycle n")
-    fig.update_yaxes(title_text="State of health SOH (–)")
+    fig.update_yaxes(title_text="State of health (%)", tickformat=".0%")
     return style_fig(fig, P, 520, "ML surrogate SOH forecasts with cross-cell conformal bands")
 
 
@@ -1053,7 +1082,7 @@ def fig_est_traj(pred: pd.DataFrame, P: Palette, model: str, all_cells: Sequence
                                  legendgroup=cid, line=dict(color=col, width=2.6),
                                  hovertemplate=f"{cid} estimated %{{y:.4f}}<extra></extra>"))
     fig.update_xaxes(title_text="Discharge cycle n")
-    fig.update_yaxes(title_text="SOH (–)")
+    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%")
     return style_fig(fig, P, 520, f"{model}: SOH estimated from operando indicators on the test cycles")
 
 
@@ -1066,26 +1095,26 @@ def fig_compare(res: te.ComparisonResult, P: Palette) -> go.Figure:
     m = res.measured
     fig.add_trace(go.Scatter(x=m["n"], y=m["SOH"], mode="markers", name="Measured SOH",
                              marker=dict(color=P.measured, size=6, opacity=0.85),
-                             hovertemplate="%{y:.4f}<extra></extra>"))
+                             hovertemplate="%{y:.2%}<extra></extra>"))
     if res.ekf is not None:
         e = res.ekf.per_cycle.dropna(subset=["SOH"])
         add_band(fig, e["n"], e["SOH"] - 2 * e["SOH_std"], e["SOH"] + 2 * e["SOH_std"], P.ekf,
                  "Observer ±2σ", group="obs", alpha=0.10)
         fig.add_trace(go.Scatter(x=e["n"], y=e["SOH"], mode="lines", name="Observer causal estimate",
                                  legendgroup="obs", line=dict(color=P.ekf, width=1.8, dash="dot"),
-                                 hovertemplate="%{y:.4f}<extra></extra>"))
+                                 hovertemplate="%{y:.2%}<extra></extra>"))
     for i, (name, (n_g, p_g)) in enumerate(res.predictions.items()):
         col, dash, sym = paradigm_style(name, P, i)
         mask = n_g >= res.n0
         fig.add_trace(go.Scatter(x=n_g[mask], y=p_g[mask], mode="lines+markers", name=f"{name} forecast",
                                  legendgroup=name, line=dict(color=col, width=3, dash=dash),
                                  marker=dict(symbol=sym, size=8, maxdisplayed=8),
-                                 hovertemplate="%{y:.4f}<extra></extra>"))
+                                 hovertemplate="%{y:.2%}<extra></extra>"))
     n_max = max(float(n.max()) for n, _ in res.predictions.values()) if res.predictions else float(m["n"].max())
     _forecast_frame(fig, res.n0, n_max, res.soh_eol, P)
     _origin_label(fig, res.n0, P)
     fig.update_xaxes(title_text="Discharge cycle n")
-    fig.update_yaxes(title_text="State of health SOH (–)")
+    fig.update_yaxes(title_text="State of health (%)", tickformat=".0%")
     return style_fig(fig, P, 560, f"Forecast benchmark on {res.cell_id} with uncertainty bands")
 
 
@@ -1094,13 +1123,13 @@ def fig_ablation(results: Dict[str, te.EKFResult], ct_cell: pd.DataFrame, P: Pal
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=good["n"], y=good["SOH"], mode="markers", name="Measured SOH",
                              marker=dict(color=P.measured, size=5, opacity=0.8),
-                             hovertemplate="%{y:.4f}<extra></extra>"))
+                             hovertemplate="%{y:.2%}<extra></extra>"))
     cols = (P.eol, P.eis, P.r_ct, P.ekf)
     for i, (name, r) in enumerate(results.items()):
         e = r.per_cycle
         fig.add_trace(go.Scatter(x=e["n"], y=e["SOH"], mode="lines", name=name,
                                  line=dict(color=cols[i % len(cols)], width=2.4, dash=DASHES[i % len(DASHES)]),
-                                 hovertemplate="%{y:.4f}<extra></extra>"))
+                                 hovertemplate="%{y:.2%}<extra></extra>"))
     fig.update_xaxes(title_text="Discharge cycle n")
     fig.update_yaxes(title_text="Causal SOH estimate (–)")
     return style_fig(fig, P, 460, "Measurement ablation: what each signal adds to the observer")
@@ -1168,7 +1197,7 @@ def fig_horizon(cov: pd.DataFrame, level: float, P: Palette) -> go.Figure:
         fig.add_trace(go.Scatter(x=d["h_bin"], y=d["rmse"], mode="lines+markers", name=par, legendgroup=par,
                                  showlegend=not d["coverage"].notna().any(),
                                  line=dict(color=col, dash=dash, width=2.4), marker=dict(symbol=sym, size=8),
-                                 hovertemplate="%{y:.4f}<extra></extra>"), row=2, col=1)
+                                 hovertemplate="%{y:.2%}<extra></extra>"), row=2, col=1)
     fig.add_hline(y=level, line_dash="dash", line_color=P.eol, row=1, col=1,
                   annotation_text=f"nominal {int(level * 100)}%", annotation_font=dict(color=P.eol, size=11))
     fig.update_yaxes(title_text="Empirical coverage", range=[0, 1.05], row=1, col=1)
@@ -1206,7 +1235,7 @@ def fig_policy(df: pd.DataFrame, policy: str, baselines: Dict[str, pd.DataFrame]
         else:
             style = dict(color=P.current_color(float(name.split()[1])), width=1.8, dash=DASHES[1 + j % 4])
         fig.add_trace(go.Scatter(x=d["cycle"], y=d["SOH"], mode="lines", name=name, line=style,
-                                 legendgroup=name, hovertemplate="%{y:.4f}<extra></extra>"), row=2, col=1)
+                                 legendgroup=name, hovertemplate="%{y:.2%}<extra></extra>"), row=2, col=1)
         fig.add_trace(go.Scatter(x=d["cycle"], y=d["cum_profit"], mode="lines", name=name, line=style,
                                  legendgroup=name, showlegend=False,
                                  hovertemplate="%{y:.1f}<extra></extra>"), row=3, col=1)
@@ -1215,7 +1244,7 @@ def fig_policy(df: pd.DataFrame, policy: str, baselines: Dict[str, pd.DataFrame]
     style_fig(fig, P, 820, f"Lifecycle simulation: {policy} policy")
     fig.update_yaxes(title_text="Current (A)", tickvals=[1, 2, 4], row=1, col=1, secondary_y=False)
     fig.update_yaxes(title_text="Ambient (°C)", row=1, col=1, secondary_y=True, showgrid=False, mirror=False)
-    fig.update_yaxes(title_text="SOH (–)", row=2, col=1)
+    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%", row=2, col=1)
     fig.update_yaxes(title_text="Profit (CU)", row=3, col=1)
     return fig
 
@@ -1372,24 +1401,24 @@ def fig_update_freq(tab: pd.DataFrame, results: Dict[int, te.EKFResult], ct_cell
     good = ct_cell[~ct_cell["outlier"]]
     fig.add_trace(go.Scatter(x=good["n"], y=good["SOH"], mode="markers", name="Measured SOH",
                              marker=dict(color=P.measured, size=5, opacity=0.8),
-                             hovertemplate="%{y:.4f}<extra></extra>"), row=1, col=1)
+                             hovertemplate="%{y:.2%}<extra></extra>"), row=1, col=1)
     for i, (m, r) in enumerate(results.items()):
         e = r.per_cycle
         fig.add_trace(go.Scatter(x=e["n"], y=e["SOH"], mode="lines", name=f"every {m} cycle(s)",
                                  line=dict(color=P.series[i % len(P.series)], width=2, dash=DASHES[i % len(DASHES)]),
-                                 hovertemplate="%{y:.4f}<extra>every " + str(m) + "</extra>"), row=1, col=1)
+                                 hovertemplate="%{y:.2%}<extra>every " + str(m) + "</extra>"), row=1, col=1)
     x = tab["Updates per 100 cycles"]
     fig.add_trace(go.Scatter(x=x, y=tab["Tracking RMSE"], mode="lines+markers+text", name="Tracking RMSE",
                              text=[f"m={m}" for m in tab.index], textposition="top center",
                              textfont=dict(color=P.muted, size=11),
                              line=dict(color=P.ekf, width=2.4), marker=dict(size=9),
-                             hovertemplate="%{y:.4f}<extra>tracking RMSE</extra>"), row=2, col=1)
+                             hovertemplate="%{y:.2%}<extra>tracking RMSE</extra>"), row=2, col=1)
     fig.add_trace(go.Scatter(x=x, y=tab["Forecast RMSE"], mode="lines+markers", name="Forecast RMSE from n₀",
                              line=dict(color=P.pinn, width=2.4, dash="dash"), marker=dict(symbol="diamond", size=9),
-                             hovertemplate="%{y:.4f}<extra>forecast RMSE</extra>"), row=2, col=1)
+                             hovertemplate="%{y:.2%}<extra>forecast RMSE</extra>"), row=2, col=1)
     fig.update_xaxes(title_text="Discharge cycle n", row=1, col=1)
     fig.update_xaxes(title_text="Measurement updates per 100 cycles", type="log", row=2, col=1)
-    fig.update_yaxes(title_text="SOH (–)", row=1, col=1)
+    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%", row=1, col=1)
     fig.update_yaxes(title_text="SOH RMSE", row=2, col=1)
     return style_fig(fig, P, 840, "How often should the twin update?")
 
@@ -1432,7 +1461,7 @@ def fig_om_tradeoff(study: pd.DataFrame, P: Palette) -> go.Figure:
         style = dict(color=col, width=1.6 if is_fixed else 2.6, dash="dot" if is_fixed else DASHES[i % len(DASHES)])
         fig.add_trace(go.Scatter(x=d["threshold"], y=d["rate"], mode="lines+markers", name=pol, legendgroup=pol,
                                  line=style, marker=dict(symbol=SYMBOLS[i % len(SYMBOLS)], size=7),
-                                 hovertemplate="%{y:.4f} CU/h<extra>" + html.escape(pol) + "</extra>"), row=1, col=1)
+                                 hovertemplate="%{y:.2%} CU/h<extra>" + html.escape(pol) + "</extra>"), row=1, col=1)
         fig.add_trace(go.Scatter(x=d["threshold"], y=d["p_failure"], mode="lines+markers", name=pol, legendgroup=pol,
                                  showlegend=False, line=style, marker=dict(symbol=SYMBOLS[i % len(SYMBOLS)], size=7),
                                  hovertemplate="%{y:.2f}<extra>" + html.escape(pol) + "</extra>"), row=2, col=1)
@@ -1574,7 +1603,7 @@ def fig_scenarios(sp: pd.DataFrame, soh_eol: float, P: Palette) -> go.Figure:
     fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, annotation_text="End of life",
                   annotation_font=dict(color=P.eol))
     fig.update_xaxes(title_text="Cycle n")
-    fig.update_yaxes(title_text="Projected SOH (–)")
+    fig.update_yaxes(title_text="Projected SOH (%)", tickformat=".0%")
     return style_fig(fig, P, 520, "What-if: projected fade for each operating scenario (cohort stress-factor law)")
 
 
@@ -1607,11 +1636,11 @@ def build_report_html(title: str, sections: List[Tuple[str, Any]]) -> str:
 # =============================================================================
 
 
-LIVE_COLORS = {"twin": "#0072B2", "mech": "#D55E00", "pf": "#E69F00", "trend": "#009E73",
+LIVE_COLORS = {"twin": "#0072B2", "mech": "#882255", "pf": "#CC79A7", "trend": "#332288",
                "hb": "#CC79A7", "ens": None}
 LIVE_DASH = {"twin": "dash", "mech": "solid", "pf": "dot", "trend": "dashdot", "hb": "longdash",
              "ens": "solid"}
-MECH_COLORS = {"SEI": "#0072B2", "plating": "#56B4E9", "LAM": "#E69F00"}
+MECH_COLORS = {"SEI": "#0072B2", "plating": "#56B4E9", "LAM": "#AA4499"}
 
 
 def _live_color(m: str, P: Palette) -> str:
@@ -1633,11 +1662,11 @@ def fig_live_main(ct_cell: pd.DataFrame, pc: pd.DataFrame, fr: Any, n: int, soh_
     if reveal and len(future):
         fig.add_trace(go.Scatter(x=future["n"], y=future["SOH"], mode="markers", name="Future (hidden from models)",
                                  marker=dict(color=P.muted, size=5, opacity=0.35, symbol="circle-open"),
-                                 hovertemplate="%{y:.4f}<extra>future</extra>"))
+                                 hovertemplate="%{y:.2%}<extra>future</extra>"))
     fig.add_trace(go.Scatter(x=seen["n"], y=seen["SOH"], mode="markers", name="Measured so far",
-                             marker=dict(color=P.measured, size=6), hovertemplate="%{y:.4f}<extra>measured</extra>"))
+                             marker=dict(color=P.measured, size=6), hovertemplate="%{y:.2%}<extra>measured</extra>"))
     fig.add_trace(go.Scatter(x=est["n"], y=est["SOH"], mode="lines", name="Twin estimate (causal)", legendgroup="est",
-                             line=dict(color=P.ekf, width=2.6), hovertemplate="%{y:.4f}<extra>twin</extra>"))
+                             line=dict(color=P.ekf, width=2.6), hovertemplate="%{y:.2%}<extra>twin</extra>"))
     if fr is not None:
         for m in show_models:
             if m not in fr.forecasts:
@@ -1649,14 +1678,14 @@ def fig_live_main(ct_cell: pd.DataFrame, pc: pd.DataFrame, fr: Any, n: int, soh_
                 + (f" · w = {w:.2f}" if w is not None and m != "ens" else "")
             fig.add_trace(go.Scatter(x=fr.n_grid, y=med, mode="lines", name=label, legendgroup=m,
                                      line=dict(color=_live_color(m, P), width=4 if m == "ens" else 2.2, dash=LIVE_DASH[m]),
-                                     hovertemplate="%{y:.4f}<extra>" + html.escape(te.LIVE_MODELS[m]) + "</extra>"))
+                                     hovertemplate="%{y:.2%}<extra>" + html.escape(te.LIVE_MODELS[m]) + "</extra>"))
     fig.add_vline(x=n, line_color=P.ekf, line_width=1.5, line_dash="dot",
                   annotation_text=f"now: n = {n}", annotation_font=dict(color=P.ekf, size=12))
     fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, annotation_text="End of life",
                   annotation_font=dict(color=P.eol))
     lo_y = min(float(good["SOH"].min()), soh_eol) - 0.04
     fig.update_xaxes(title_text="Discharge cycle n", range=[0, n_max])
-    fig.update_yaxes(title_text="State of health SOH (–)", range=[lo_y, 1.04])
+    fig.update_yaxes(title_text="State of health (%)", tickformat=".0%", range=[lo_y, 1.04])
     return style_fig(fig, P, 560, "Live multi-model twin: every model assimilates one discharge at a time",
                      hovermode="x unified")
 
@@ -1722,15 +1751,15 @@ def fig_dp_policy(dp: te.DPResult, P: Palette) -> go.Figure:
                              colorbar=dict(tickvals=list(range(len(labels))), ticktext=labels, thickness=14, len=0.7,
                                            y=0.64, tickfont=dict(color=P.text)),
                              customdata=np.array(labels)[idx],
-                             hovertemplate="season cycle %{x:.0f} · SOH %{y:.3f}<br>%{customdata}<extra></extra>"),
+                             hovertemplate="season cycle %{x:.0f} · SOH %{y:.1%}<br>%{customdata}<extra></extra>"),
                   row=1, col=1)
     fig.add_trace(go.Scatter(x=dp.phases, y=dp.replace_boundary, mode="lines+markers", name="Replacement boundary",
                              line=dict(color=P.text, width=2.5, dash="dash"), marker=dict(size=6),
-                             hovertemplate="replace below SOH %{y:.3f}<extra></extra>"), row=1, col=1)
+                             hovertemplate="replace below SOH %{y:.1%}<extra></extra>"), row=1, col=1)
     fig.add_trace(go.Scatter(x=dp.phases, y=dp.T_amb, mode="lines+markers", name="Ambient", showlegend=False,
                              line=dict(color=P.eis, width=2.5), hovertemplate="%{y:.1f} °C<extra></extra>"),
                   row=2, col=1)
-    fig.update_yaxes(title_text="SOH (–)", row=1, col=1)
+    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%", row=1, col=1)
     fig.update_yaxes(title_text="°C", row=2, col=1)
     fig.update_xaxes(title_text="Cycle within the seasonal period", row=2, col=1)
     return style_fig(fig, P, 700, f"Dynamic-programming policy · optimal long-run profit rate ρ* = {dp.rho:.4f} CU/h",
@@ -1845,10 +1874,10 @@ def fig_cohort_models(summary: pd.DataFrame, P: Palette) -> go.Figure:
             error_y=dict(type="data", symmetric=False, array=(dm["IQR high"] - dm["median RMSE"]).clip(lower=0),
                          arrayminus=(dm["median RMSE"] - dm["IQR low"]).clip(lower=0), color=P.muted, thickness=1),
             customdata=np.column_stack([dm["cells"].fillna(0), dm["coverage"]]),
-            hovertemplate="%{x}<br>median RMSE %{y:.4f}<br>%{customdata[0]:.0f} cells · coverage %{customdata[1]:.0%}"
+            hovertemplate="%{x}<br>median RMSE %{y:.2%}<br>%{customdata[0]:.0f} cells · coverage %{customdata[1]:.0%}"
                           "<extra>" + html.escape(te.LIVE_MODELS[m]) + "</extra>"))
     fig.update_layout(barmode="group", bargap=0.2)
-    fig.update_yaxes(title_text="Median 20-cycle forecast RMSE (SOH)")
+    fig.update_yaxes(title_text="Median 20-cycle forecast RMSE (SOH points)", tickformat=".1%")
     fig.update_xaxes(title_text=None)
     return style_fig(fig, P, 520, "Forecast error by operating condition and model (bars: interquartile range)",
                      hovermode="closest")
@@ -2553,7 +2582,7 @@ _n_crit = int((_fs_bar["Risk"] == "Critical").sum()) if len(_fs_bar) else 0
 _n_warn = int((_fs_bar["Risk"] == "Warning").sum()) if len(_fs_bar) else 0
 st.markdown(
     '<div class="bt-statusbar">'
-    '<span class="bt-live"><span class="bt-dot"></span>TWIN ONLINE</span>'
+    '<span class="bt-live"><span class="bt-dot"></span>REPLAY MODE · RECORDED DATA</span>'
     f'<span>ENGINE <b>v{te.ENGINE_VERSION}</b></span>'
     f'<span>SOURCE <b>{"SYNTHETIC DEMO" if st.session_state.get("demo") else "TELEMETRY"}</b></span>'
     f'<span>FLEET <b>{len(meta)}</b> CELLS · <b>{int(ct["n"].count())}</b> CYCLES</span>'
@@ -2563,6 +2592,16 @@ st.markdown(
     '</div>', unsafe_allow_html=True)
 view = nav(VIEWS, key="view")
 st.session_state["_sec_n"] = 0
+_scope_lbl = str(st.session_state.get("diag_scope", "Single battery")).split(": ")[-1].split(" ", 1)[-1]
+_sch = {"within": "within a battery", "across": "across batteries"}.get(st.session_state.get("sch_mode", "within"), "")
+st.markdown(
+    '<div class="bt-context">'
+    f'<span><i>Battery</i> <b>{html.escape(cell_label(cell, meta))}</b></span>'
+    f'<span><i>Scope</i> <b>{html.escape(_scope_lbl)}</b></span>'
+    f'<span><i>End of life</i> <b>{float(eol_ah):.2f} Ah</b></span>'
+    f'<span><i>Training</i> <b>{html.escape(_sch)}</b></span>'
+    '<span class="bt-context-hint">change the battery and EOL in the control bar above; other pickers are local to their section</span>'
+    '</div>', unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -2800,6 +2839,20 @@ def risk_banner(row: pd.Series, cell_id: str) -> None:
                 unsafe_allow_html=True)
 
 
+DIAG_TABS = [":material/space_dashboard: Overview", ":material/trending_down: Ageing",
+             ":material/science: Electrochemistry", ":material/warning: Stress & safety"]
+
+
+def sub_nav(key: str, options: Sequence[str]) -> str:
+    """Secondary navigation inside a view; only the chosen tab is computed (fast pages)."""
+    st.session_state.setdefault(key, options[0])
+    try:
+        v = st.segmented_control("Section", list(options), key=key, label_visibility="collapsed")
+    except Exception:
+        v = st.radio("Section", list(options), key=key, horizontal=True, label_visibility="collapsed")
+    return v or options[0]
+
+
 DIAG_SCOPES = ("single", "selected", "fleet")
 DIAG_SCOPE_LABEL = {"single": ":material/battery_full: Single battery",
                     "selected": ":material/stacks: Selected batteries",
@@ -2920,9 +2973,9 @@ def status_section(scope: str, sel: List[str], fs: pd.DataFrame, ev: pd.DataFram
         triage_table(fs, "triage_all")
         note("Every battery ranked worst-first: health margin bars, quick remaining life, fade speed and the alerts behind the risk level.")
     else:
-        for c in sel:
-            battery_status_card(c, fs, lim, c)
-        if len(sel) > 1:
+        if len(sel) > 1:                    # single scope: the résumé card above already shows these numbers
+            for c in sel:
+                battery_status_card(c, fs, lim, c)
             triage_table(fs[fs.index.isin(sel)], "triage_sel")
             note("Side-by-side status of the selected batteries: which one is closest to end of life and why.")
         show(fig_risk_matrix(fs, P, sel[0], sel), key="risk_matrix", data=fs.reset_index())
@@ -3424,18 +3477,100 @@ def _md_bold(text: str) -> str:
     return re.sub(r"\*(.+?)\*", r"<i>\1</i>", t)
 
 
+def goto(view_label: str) -> None:
+    st.session_state["view"] = view_label
+
+
+GLOSSARY = {
+    "SOH": "State of health: present capacity divided by the capacity when new (100% = new).",
+    "EOL": "End of life: the capacity at which the battery is considered worn out (default 1.4 Ah).",
+    "RUL": "Remaining useful life: cycles left until end of life.",
+    "LLI": "Loss of lithium inventory: cyclable lithium trapped in side reactions (SEI growth, plating).",
+    "LAM": "Loss of active material: electrode material that no longer stores lithium (cracking, dissolution).",
+    "CL": "Conductivity loss: rising internal resistance (power fade).",
+    "SEI": "Solid-electrolyte interphase: the film on graphite whose growth consumes lithium.",
+    "EKF": "Extended Kalman filter: blends model predictions with measurements to update the twin.",
+    "NIS": "Normalised innovation squared: about 1 when the filter's uncertainty is honest.",
+    "ICA / DVA": "Incremental capacity (dQ/dV) and differential voltage (dV/dQ): curves whose peaks reveal ageing mechanisms.",
+    "n₀": "Forecast origin: the last cycle a model may see before forecasting.",
+    "Fade skill": "1 − error / error of assuming no further fade: 1 perfect, 0 useless, < 0 worse than doing nothing.",
+    "Coverage": "Share of measurements falling inside a model's uncertainty band (should be close to the band level).",
+    "PINN": "Physics-informed neural network: trained to fit data and obey physical equations.",
+    "SPM": "Single-particle model: first-principles electrochemical model with one particle per electrode.",
+}
+
+
 def sidebar_guide() -> None:
     ss = st.session_state
-    steps = [("Data loaded", True), ("Half-cell modes fitted", bool(ss.get("hc"))),
-             ("Live twin opened", bool(ss.get("ekf"))), ("Ladder models compared", bool(ss.get("ladder"))),
-             ("M3 optimisation run", bool(ss.get("om") or ss.get("dp"))), ("Cohort study run", bool(ss.get("study")))]
-    done = sum(ok for _, ok in steps)
-    rows = "".join(f'<div class="bt-guide-row{" ok" if ok else ""}"><span>{"✓" if ok else "○"}</span>{html.escape(t)}</div>'
-                   for t, ok in steps)
+    steps = [("Data loaded", True, VIEWS[1]), ("Half-cell modes fitted", bool(ss.get("hc")), VIEWS[1]),
+             ("Live twin opened", bool(ss.get("ekf")), VIEWS[2]), ("Ladder models compared", bool(ss.get("ladder")), VIEWS[3]),
+             ("M3 optimisation run", bool(ss.get("om") or ss.get("dp")), VIEWS[4]),
+             ("Cohort study run", bool(ss.get("study")), VIEWS[5])]
+    done = sum(ok for _, ok, _ in steps)
     with st.sidebar:
         st.markdown(f'<div class="bt-guide"><div class="bt-guide-h">Study progress · {done}/{len(steps)}</div>'
-                    f'<div class="bt-guide-bar"><div style="width:{100 * done / len(steps):.0f}%"></div></div>{rows}</div>',
+                    f'<div class="bt-guide-bar"><div style="width:{100 * done / len(steps):.0f}%"></div></div></div>',
                     unsafe_allow_html=True)
+        for k, (t, ok, view_label) in enumerate(steps):
+            st.button(("✓ " if ok else "○ ") + t, key=f"guide_{k}", on_click=goto, args=(view_label,),
+                      use_container_width=True, type="secondary", help="Go to the view where this step is done.")
+        st.markdown("**Display**")
+        st.toggle("Show explanations", value=True, key="ui_explain",
+                  help="Off: explanations shrink to an ⓘ you can hover.")
+        st.toggle("Export menus on charts", value=False, key="ui_export",
+                  help="HTML / SVG / CSV export under each chart (off = faster, cleaner pages).")
+        with st.expander("Glossary", icon=":material/menu_book:"):
+            for k_, v in GLOSSARY.items():
+                st.markdown(f"**{k_}**: {v}")
+
+
+def view_home() -> None:
+    section("Welcome: self-updating digital twin of Li-ion batteries")
+    fs, ev = fleet_cached(ct, DATA_KEY, float(eol_ah), asdict(te.SafetyLimits()))
+    groups = te.condition_groups(ct)
+    k = st.columns(5)
+    k[0].metric("Batteries", len(meta))
+    k[1].metric("Discharge cycles", f"{int(ct['n'].count()):,}")
+    k[2].metric("Condition groups", groups["Group"].nunique())
+    k[3].metric("Critical batteries", int((fs["Risk"] == "Critical").sum()) if len(fs) else 0)
+    k[4].metric("Logged events", len(ev))
+    reps = []
+    for g in te.GROUP_ORDER:
+        members = groups[groups["Group"] == g]
+        if len(members):
+            c = members.sort_values("cycles", ascending=False).index[0]
+            inf = battery_info(c, fs, groups)
+            reps.append({"id": c, "soh": inf["soh"], "risk": inf["risk"], "sub": g})
+    if reps:
+        st.markdown("**One battery per operating condition**")
+        render_battery_anim(reps[:7], big=False)
+    study = st.session_state.get("study")
+    status = {"M1 · Health & mechanisms": "answered" if study else "open",
+              "M2 · Self-updating twin": "answered" if study and study["res"].get("update") is not None else
+              ("partly answered" if study else "open"),
+              "M3 · Operation & maintenance": "answered" if (st.session_state.get("dp") or st.session_state.get("om"))
+              else "open"}
+    chips = "".join(f'<div class="bt-mchip bt-m-{v.split()[0]}"><b>{m}</b> {html.escape(v)}</div>' for m, v in status.items())
+    st.markdown(f'<div class="bt-mstrip">{chips}</div>', unsafe_allow_html=True)
+    section("Where to start")
+    cards = [("Diagnostics", VIEWS[1], "See one battery in 3D, its health, ageing, mechanisms and stress."),
+             ("Live twin", VIEWS[2], "Replay a battery cycle by cycle and watch the models learn and forecast."),
+             ("Models & forecasting", VIEWS[3], "Climb the learning ladder from baselines to first principles."),
+             ("Operations & control", VIEWS[4], "Optimise operation and replacement for a calibrated battery."),
+             ("Study results", VIEWS[5], "Run the cohort study and get the answers to the three Missions.")]
+    cols = st.columns(len(cards))
+    for c_, (t, v, d) in zip(cols, cards):
+        with c_:
+            st.markdown(f'<div class="bt-qs"><div class="bt-qs-t">{html.escape(t)}</div>'
+                        f'<div class="bt-qs-d">{html.escape(d)}</div></div>', unsafe_allow_html=True)
+            st.button("Open", key=f"home_{t}", on_click=goto, args=(v,), use_container_width=True, type="primary")
+    with st.expander("How to use the app in 5 steps", expanded=False, icon=":material/route:"):
+        st.markdown("1. **Choose a battery** and the end-of-life capacity in the control bar.\n"
+                    "2. **Diagnostics → Overview**: health, grade and events; then *Ageing*, *Electrochemistry*, "
+                    "*Stress & safety*.\n"
+                    "3. **Live twin**: press Play, reveal the future, compare the live models.\n"
+                    "4. **Models & forecasting**: pick a training scheme and run the ladder levels; read the leaderboard.\n"
+                    "5. **Operations & control** for Mission 3, then **Study results** for the cohort-wide evidence.")
 
 
 def view_data() -> None:
@@ -3468,79 +3603,85 @@ def view_data() -> None:
         sel = all_cells
     st.session_state["_diag_sel"] = sel
 
-    battery_hero(scope, sel, fs, ev)
-
-    section("Health status")
-    status_section(scope, sel, fs, ev, lim)
-
-    bad = {c: e for c, e in cell_errors.items()}
-    with st.expander(f"Data quality · {len(bad)} skipped cell(s)", icon=":material/fact_check:"):
-        for c in sel[:8]:
-            issues = validation_cached(store, DATA_KEY, c)
-            n_out = int(ct[(ct["Cell_ID"] == c)]["outlier"].sum())
-            (st.warning if issues else st.success)(
-                f"{c}: {len(issues)} telemetry issue(s), {n_out} excluded cycle(s)"
-                + ("" if not issues else " · " + "; ".join(issues[:3])))
-        if len(sel) > 8:
-            st.caption("Per-cell checks are listed for the first eight batteries.")
-        if bad:
-            show_table(pd.DataFrame({"Cell": list(bad), "Reason": list(bad.values())}).set_index("Cell"))
-
-    section("Capacity fade: compare batteries")
-    fade_explorer()
-
-    section("Cohort by ambient temperature")
-    norm_x = st.toggle("Normalise x to fraction of recorded life", value=False, key="grid_norm",
-                       help="Aligns cells with very different cycle counts.")
-    grid_sel = sel if scope != "fleet" else [cell]
-    amb = meta["Ambient_C"].round(0)
-    groups = sorted(amb.dropna().unique())
-    only_sel = scope != "fleet" and st.toggle("Only groups containing the selection", value=False, key="grid_only")
-    show_cells = st.multiselect("Batteries to show (empty = all)", list(meta.index), default=[], key="grid_cells",
-                                format_func=lambda c: cell_label(c, meta),
-                                help="Choose which batteries appear in the temperature panels; panels without any "
-                                     "chosen battery are hidden.")
-    for g in groups:
-        members = list(amb[amb == g].index)
-        if show_cells:
-            members = [c for c in members if c in show_cells]
-            if not members:
-                continue
-        if only_sel and not set(members) & set(grid_sel):
-            continue
-        show(fig_cohort_group(ct, meta, members, grid_sel, P, f"Ambient {g:.0f} °C · {len(members)} cells", norm_x),
-             key=f"cohort_{int(g)}",
-             data=ct.loc[~ct["outlier"] & ct["Cell_ID"].isin(members), ["Cell_ID", "n", "SOH"]])
-    with st.expander("Mission 1 · How do operating conditions influence degradation?", expanded=False):
-        condition_effects_section()
-
-    if len(sel) > 1:
-        st.markdown("---")
-        focus = st.selectbox("Focus battery for the detailed analyses below", sel,
+    tab = sub_nav("diag_tab", DIAG_TABS)
+    if len(sel) > 1 and tab != DIAG_TABS[0]:
+        focus = st.selectbox("Focus battery for single-battery analyses on this tab", sel,
                              index=sel.index(cell) if cell in sel else 0, key="diag_focus",
                              format_func=lambda c: cell_label(c, meta),
                              help="Indicator trajectories, ICA / DVA, degradation modes, half-cell fitting and the "
-                                  "stress timeline analyse one battery at a time.")
+                                  "stress timeline analyse one battery at a time (local to this tab).")
+    else:
+        focus = cell
+
+    if tab == DIAG_TABS[0]:                                  # ---------------- Overview
+        battery_hero(scope, sel, fs, ev)
+        section("Health status")
+        status_section(scope, sel, fs, ev, lim)
+        bad = {c: e for c, e in cell_errors.items()}
+        with st.expander(f"Data quality · {len(bad)} skipped cell(s)", icon=":material/fact_check:"):
+            for c in sel[:8]:
+                issues = validation_cached(store, DATA_KEY, c)
+                n_out = int(ct[(ct["Cell_ID"] == c)]["outlier"].sum())
+                (st.warning if issues else st.success)(
+                    f"{c}: {len(issues)} telemetry issue(s), {n_out} excluded cycle(s)"
+                    + ("" if not issues else " · " + "; ".join(issues[:3])))
+            if len(sel) > 8:
+                st.caption("Per-cell checks are listed for the first eight batteries.")
+            if bad:
+                show_table(pd.DataFrame({"Cell": list(bad), "Reason": list(bad.values())}).set_index("Cell"))
+        return
+
+    if focus != cell:                                        # analyses below follow the focus battery
         cell = focus
         ct_cell = ct[ct["Cell_ID"] == cell].sort_values("n")
         eis_cell = te.valid_eis(imp, cell)
         c_bol = float(meta.loc[cell, "C_bol_Ah"])
         soh_eol = te.soh_eol_for(c_bol, eol_ah)
 
-    section("Mission 1 · Which parameter best represents health?")
-    health_indicator_section()
-
-    section("Incremental capacity analysis (dQ/dV)")
-    ica_section()
-
-    section("Degradation modes: LLI · LAM · conductivity loss")
-    modes_section()
-
-    section("Quantitative mode analysis: half-cell OCV fitting")
-    half_cell_section()
-
-    section("Operating stress and safety exposure")
-    stress_section()
+    if tab == DIAG_TABS[1]:                                  # ---------------- Ageing
+        section("Capacity fade: compare batteries")
+        fade_explorer()
+        section("Cohort by ambient temperature")
+        c1, c2 = st.columns(2)
+        norm_x = c1.toggle("Normalise x to fraction of recorded life", value=False, key="grid_norm",
+                           help="Aligns cells with very different cycle counts.")
+        grid_sel = sel if scope != "fleet" else [cell]
+        amb = meta["Ambient_C"].round(0)
+        groups = sorted(amb.dropna().unique())
+        only_sel = scope != "fleet" and c2.toggle("Only groups containing the selection", value=False, key="grid_only")
+        show_cells = st.multiselect("Batteries to show (empty = all) · local to this section", list(meta.index),
+                                    default=[], key="grid_cells", format_func=lambda c: cell_label(c, meta),
+                                    help="Choose which batteries appear in the temperature panels; panels without "
+                                         "any chosen battery are hidden.")
+        for g in groups:
+            members = list(amb[amb == g].index)
+            if show_cells:
+                members = [c for c in members if c in show_cells]
+                if not members:
+                    continue
+            if only_sel and not set(members) & set(grid_sel):
+                continue
+            with st.expander(f"Ambient {g:.0f} °C · {len(members)} cells", expanded=True,
+                             icon=":material/thermostat:"):
+                show(fig_cohort_group(ct, meta, members, grid_sel, P, f"Ambient {g:.0f} °C · {len(members)} cells",
+                                      norm_x), key=f"cohort_{int(g)}",
+                     data=ct.loc[~ct["outlier"] & ct["Cell_ID"].isin(members), ["Cell_ID", "n", "SOH"]])
+        with st.expander("Mission 1 · How do operating conditions influence degradation?", expanded=False):
+            condition_effects_section()
+        section("Mission 1 · Which parameter best represents health?")
+        health_indicator_section()
+    elif tab == DIAG_TABS[2]:                                # ---------------- Electrochemistry
+        with st.expander("Incremental capacity analysis (dQ/dV)", expanded=True, icon=":material/show_chart:"):
+            ica_section()
+        with st.expander("Degradation modes: LLI · LAM · conductivity loss", expanded=False, icon=":material/layers:"):
+            modes_section()
+        with st.expander("Quantitative mode analysis: half-cell OCV fitting", expanded=False, icon=":material/science:"):
+            half_cell_section()
+    else:                                                    # ---------------- Stress & safety
+        section("Operating stress and safety exposure")
+        stress_section()
+        with st.expander("Mission 1 · How do operating conditions influence degradation?", expanded=False):
+            condition_effects_section()
 
 
 # =============================================================================
@@ -3784,6 +3925,7 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
         saved = dict(saved, res=saved["by_target"][show_t], cfg=dict(saved["cfg"], cell=show_t, n0=sc["n0"][show_t]))
     saved = st.session_state.get("ml")
     if not (saved and saved["res"]):
+        placeholder("Press 'Train and forecast': each selected model's forecast, leaderboard and parity plot appear here.")
         return
     if saved["cfg"]["cell"] != show_t:
         st.info("The stored forecasts belong to another battery or scheme. Train again to update them.")
@@ -4168,7 +4310,7 @@ LEVEL_INFO = {
     5: ("Hybrid & physics-informed", "Mechanistic PINN and hierarchical Bayes: equations plus learning."),
     6: ("First principles", "Single-particle electrochemical model with SEI growth: physics only, calibrated."),
 }
-LEVEL_COLORS = {1: "#8C8C8C", 2: "#0072B2", 3: "#009E73", 4: "#AA4499", 5: "#E69F00", 6: "#D55E00"}
+LEVEL_COLORS = {1: "#8C8C8C", 2: "#0072B2", 3: "#332288", 4: "#AA4499", 5: "#56B4E9", 6: "#882255"}
 
 
 def scheme() -> Dict[str, Any]:
@@ -4248,7 +4390,7 @@ def fig_ladder(entries: Sequence[Dict[str, Any]], n0: int, P: Palette, title: st
     eol_t = te.soh_eol_for(float(meta.loc[t, "C_bol_Ah"]), float(eol_ah))
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=ctt["n"], y=ctt["SOH"], mode="markers", name=f"Measured SOH · {t}",
-                             marker=dict(color=P.measured, size=5, opacity=0.75), hovertemplate="%{y:.4f}<extra>measured</extra>"))
+                             marker=dict(color=P.measured, size=5, opacity=0.75), hovertemplate="%{y:.2%}<extra>measured</extra>"))
     for i, e in enumerate(entries):
         col = LEVEL_COLORS.get(e["level"], P.text)
         sel = e["n_grid"] >= n0
@@ -4256,13 +4398,13 @@ def fig_ladder(entries: Sequence[Dict[str, Any]], n0: int, P: Palette, title: st
             add_band(fig, e["n_grid"][sel], e["lo"][sel], e["hi"][sel], col, f"{e['name']} band", group=e["name"], alpha=0.12)
         fig.add_trace(go.Scatter(x=e["n_grid"][sel], y=e["soh"][sel], mode="lines", name=f"L{e['level']} · {e['name']}",
                                  legendgroup=e["name"], line=dict(color=col, width=2.6, dash=DASHES[i % len(DASHES)]),
-                                 hovertemplate="%{y:.4f}<extra>" + html.escape(e["name"]) + "</extra>"))
+                                 hovertemplate="%{y:.2%}<extra>" + html.escape(e["name"]) + "</extra>"))
     fig.add_vline(x=n0, line_dash="dot", line_color=P.muted, annotation_text="training | test",
                   annotation_font=dict(color=P.muted))
     fig.add_hline(y=eol_t, line_dash="dash", line_color=P.eol, annotation_text="End of life",
                   annotation_font=dict(color=P.eol))
     fig.update_xaxes(title_text="Discharge cycle n")
-    fig.update_yaxes(title_text="SOH (–)")
+    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%")
     return style_fig(fig, P, 520, f"{title} · {t}")
 
 
@@ -4288,6 +4430,10 @@ def ladder_level_block(level: int, key: str) -> None:
     sc = scheme()
     shown = [e for e in ladder_entries() if e["level"] == level]
     allt = [e for e in all_target_entries() if e["level"] == level]
+    if not allt:
+        placeholder(f"Press the button above to run Level {level} · {LEVEL_INFO[level][0]} on the test "
+                    f"battery(ies); the forecast chart and scores will appear here.")
+        return
     if shown:
         show(fig_ladder(shown, sc["n0"][sc["show"]], P, f"Level {level} · {LEVEL_INFO[level][0]}"), key=key, export=False)
     if allt:
@@ -4836,8 +4982,8 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # Dispatch: only the active view runs
 # =============================================================================
 sidebar_guide()
-_VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_data, VIEWS[1]: view_replay, VIEWS[2]: view_models,
-                                           VIEWS[3]: view_ops, VIEWS[4]: view_study}
+_VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_home, VIEWS[1]: view_data, VIEWS[2]: view_replay,
+                                           VIEWS[3]: view_models, VIEWS[4]: view_ops, VIEWS[5]: view_study}
 try:
     _VIEW_FN.get(view, view_data)()
 except Exception as exc:
