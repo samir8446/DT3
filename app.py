@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.1"
+REQUIRED_ENGINE = "5.2"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -3101,7 +3101,7 @@ def _reco_items(view: str) -> List[Tuple[str, str]]:
         else:
             items.append(("swap_horiz", "Pick a cold or hot battery in the control bar to see the mechanistic model take over."))
     elif view == "models":
-        done = {e["level"] for e in ladder_entries(int(max(5, round(float(ss.get('ml_frac', 0.4)) * meta.loc[cell, 'cycles']))))}
+        done = {e["level"] for e in ladder_entries()}
         nxt = next((lv for lv in LEVEL_INFO if lv not in done and lv not in (2, 3)), None)
         if not done:
             items.append(("flag", "Start with **Level 1 · Baselines**: every other model must beat the linear trend."))
@@ -3446,65 +3446,72 @@ def tuning_block(task: str, models: Sequence[str], params: Dict[str, Dict[str, A
 
 
 def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) -> None:
-    all_cells = list(meta.index)
-    c1, c2 = st.columns([2, 2])
-    source = c1.radio("Training data", ["own", "cohort", "cross"], key="ml_source",
-                      format_func={"own": "This battery only (its early life)",
-                                   "cohort": "This battery's early life + all other batteries",
-                                   "cross": "Chosen batteries → predict this battery"}.get)
-    frac = float(st.session_state.get("ml_frac", 0.4))
-    c2.markdown(f"**Forecast origin:** {100 * frac:.0f}% of life (set at the top of this view)")
-    n0_ml = int(max(5, round(frac * meta.loc[cell, "cycles"])))
-    n_test = int((ct_cell[~ct_cell["outlier"]]["n"] > n0_ml).sum())
-    c2.caption(f"Train: cycles 1–{n0_ml} · Test: {n_test} later cycles")
-    train_cells: Optional[Tuple[str, ...]] = None
-    if source == "cross":
-        others = [c for c in all_cells if c != cell]
-        near = te.calibration_partners(meta, cell, 3) if hasattr(te, "calibration_partners") else others[:3]
-        train_cells = tuple(st.multiselect("Train on these batteries", others, default=[c for c in near if c in others],
-                                           key="ml_train_cells", format_func=lambda c: cell_label(c, meta)))
+    sc = scheme()
+    show_t = sc["show"]
+    n0_show = sc["n0"][show_t]
+    if sc["mode"] == "within":
+        source = "cohort" if sc["use_cohort"] else "own"
+        st.markdown(f"**Training scheme:** within {show_t}: cycles 1–{n0_show} for training"
+                    + (", plus the other batteries' full histories" if sc["use_cohort"] else " only")
+                    + " (change it at the top of this view).")
+    else:
+        source = "cross"
+        st.markdown(f"**Training scheme:** across batteries: learn from {len(sc['train'])} batteries, forecast "
+                    f"{len(sc['targets'])} test battery(ies) (change it at the top of this view).")
+    train_cells: Optional[Tuple[str, ...]] = tuple(sc["train"]) if source == "cross" else None
     d1, d2, d3 = st.columns(3)
     strategy = "increment"
     d1.markdown("**Fade-rate model**  \n*dSOH/dn = g(SOH, conditions, early-life features)*, integrated forward")
     conf = d2.slider("Conformal calibration cells (0 = no band)", 0, 8, 3, key="ml_conf")
     level = d3.select_slider("Band level", [0.8, 0.9, 0.95], value=0.9, key="ml_level")
     use_pop = source == "cohort"
-    params = tuning_block(f"fc_{cell}_{n0_ml}_{source}", models, params,
-                          lambda m, k: te.tune_ml_forecast(ct, cell, n0_ml, m, n_iter=k,
+    params = tuning_block(f"fc_{show_t}_{n0_show}_{source}", models, params,
+                          lambda m, k: te.tune_ml_forecast(ct, show_t, n0_show, m, n_iter=k,
                                                            use_population=source != "own", train_cells=train_cells))
-    ml_cfg = dict(cell=cell, n0=n0_ml, models=tuple(models), source=source, train_cells=train_cells,
-                  eol_ah=float(eol_ah), strategy=strategy, conformal_cells=conf, band_level=level,
-                  params={m: params.get(m) for m in models})
+    ml_cfg = dict(cell=show_t, n0=n0_show, targets=tuple(sc["targets"]), models=tuple(models), source=source,
+                  train_cells=train_cells, eol_ah=float(eol_ah), strategy=strategy, conformal_cells=conf,
+                  band_level=level, params={m: params.get(m) for m in models})
     ready = bool(models) and (source != "cross" or bool(train_cells))
-    if st.button("Train and forecast", type="primary", key="ml_go", disabled=not ready, icon=":material/play_arrow:"):
+    n_runs = len(models) * len(sc["targets"])
+    if st.button(f"Train and forecast ({n_runs} run{'s' if n_runs > 1 else ''})", type="primary", key="ml_go",
+                 disabled=not ready, icon=":material/play_arrow:"):
         prog = st.progress(0.0)
-        out: List[te.MLForecast] = []
-        for i, mname in enumerate(models):
-            prog.progress(i / max(len(models), 1), text=f"Training {mname}…")
-            try:
-                out.append(ml_cached(ct, DATA_KEY, cell, n0_ml, mname, use_pop, float(eol_ah), strategy, conf, level,
-                                     json.dumps(params.get(mname, {}), sort_keys=True), train_cells))
-            except Exception as exc:
-                st.warning(f"{mname}: {exc}")
+        by_target: Dict[str, List[te.MLForecast]] = {}
+        k_ = 0
+        for t in sc["targets"]:
+            for mname in models:
+                prog.progress(k_ / max(n_runs, 1), text=f"Training {mname} for {t}…")
+                k_ += 1
+                try:
+                    r = ml_cached(ct, DATA_KEY, t, sc["n0"][t], mname, use_pop, float(eol_ah), strategy, conf, level,
+                                  json.dumps(params.get(mname, {}), sort_keys=True), train_cells)
+                    by_target.setdefault(t, []).append(r)
+                    ladder_add(f"ML · {mname}", te.MODEL_SPECS[mname].level if mname in te.MODEL_SPECS else 2,
+                               sc["n0"][t], r.n_grid, r.soh_pred, r.soh_lo, r.soh_hi, r.metrics, t)
+                except Exception as exc:
+                    st.warning(f"{mname} on {t}: {exc}")
         prog.empty()
-        st.session_state["ml"] = {"cfg": ml_cfg, "res": out}
+        st.session_state["ml"] = {"cfg": ml_cfg, "res": by_target.get(show_t, []), "by_target": by_target}
+    saved = st.session_state.get("ml")
+    if saved and saved.get("by_target") and show_t in saved["by_target"] and saved["cfg"]["cell"] != show_t:
+        saved = dict(saved, res=saved["by_target"][show_t], cfg=dict(saved["cfg"], cell=show_t, n0=sc["n0"][show_t]))
     saved = st.session_state.get("ml")
     if not (saved and saved["res"]):
         return
-    if saved["cfg"]["cell"] != cell:
-        st.info("The stored forecasts belong to another battery. Train again to update them.")
+    if saved["cfg"]["cell"] != show_t:
+        st.info("The stored forecasts belong to another battery or scheme. Train again to update them.")
         return
-    if saved["cfg"] != ml_cfg:
+    if {k: v for k, v in saved["cfg"].items() if k not in ("cell", "n0")} != \
+            {k: v for k, v in ml_cfg.items() if k not in ("cell", "n0")}:
         st.warning("Settings changed since the last run; the results below use the previous settings.")
     res = saved["res"]
     n0s = saved["cfg"]["n0"]
-    for r in res:
-        ladder_add(f"ML · {r.model}", te.MODEL_SPECS[r.model].level if r.model in te.MODEL_SPECS else 2, n0s,
-                   r.n_grid, r.soh_pred, r.soh_lo, r.soh_hi, r.metrics)
+    ct_show = ct[ct["Cell_ID"] == show_t].sort_values("n")
+    eol_show = te.soh_eol_for(float(meta.loc[show_t, "C_bol_Ah"]), float(eol_ah))
     data = pd.concat([pd.DataFrame({"model": r.model, "n": r.n_grid, "soh": r.soh_pred,
                                     "lo": r.soh_lo if r.soh_lo is not None else np.nan,
                                     "hi": r.soh_hi if r.soh_hi is not None else np.nan}) for r in res])
-    show(fig_ml(res, ct_cell, n0s, soh_eol, P), key="ml_fig", data=data)
+    show(fig_ml(res, ct_show, n0s, eol_show, P), key="ml_fig", data=data)
     tbl = pd.DataFrame([{"Model": r.model, "Accuracy (%)": r.metrics.accuracy, "Fade skill": r.metrics.fade_skill,
                          "R²": r.metrics.r2, "RMSE": r.metrics.rmse, "MAE": r.metrics.mae,
                          "Coverage": r.metrics.coverage, "RUL true": r.metrics.rul_true, "RUL pred": r.metrics.rul_pred,
@@ -3523,7 +3530,7 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
          "Fit time (s)": "{:.2f}"}, na_rep="—")
         .highlight_min(subset=["RMSE"], props="background-color: rgba(0,158,115,0.25); font-weight: 700;"))
     note("Forecast scores of each ML model on the cycles after the origin: accuracy, fade skill, R², errors, band coverage and remaining-life error.")
-    good = ct_cell[(~ct_cell["outlier"]) & (ct_cell["n"] > n0s)]
+    good = ct_show[(~ct_show["outlier"]) & (ct_show["n"] > n0s)]
     par = pd.concat([pd.DataFrame({"model": r.model, "SOH": good["SOH"].to_numpy(),
                                    "SOH_pred": np.interp(good["n"], r.n_grid, r.soh_pred)}) for r in res])
     if len(par):
@@ -3877,23 +3884,83 @@ LEVEL_INFO = {
 LEVEL_COLORS = {1: "#8C8C8C", 2: "#0072B2", 3: "#009E73", 4: "#AA4499", 5: "#E69F00", 6: "#D55E00"}
 
 
+def scheme() -> Dict[str, Any]:
+    return st.session_state.get("_scheme") or {"mode": "within", "targets": [cell], "train": None,
+                                               "n0": {cell: int(max(5, round(0.4 * meta.loc[cell, "cycles"])))},
+                                               "use_cohort": True, "show": cell}
+
+
+def scheme_controls() -> Dict[str, Any]:
+    """One training scheme for every level of the ladder."""
+    all_cells = list(meta.index)
+    mode = st.radio("Training scheme", ["within", "across"], horizontal=True, key="sch_mode",
+                    format_func={"within": ":material/call_split: Within a battery: train on its first part, test on the rest",
+                                 "across": ":material/swap_horiz: Across batteries: train on some batteries, predict others"}.get)
+    if mode == "within":
+        c1, c2 = st.columns([3, 2])
+        frac = c1.slider("Training part of the battery's life (the rest is the test)", 0.1, 0.9, 0.4, 0.05, key="ml_frac")
+        use_cohort = c2.toggle("Models may also learn from the other batteries' full histories", value=True,
+                               key="sch_cohort", help="Off = strictly this battery only (fewer data, harder for ML).")
+        n0 = int(max(5, round(frac * meta.loc[cell, "cycles"])))
+        sc = {"mode": "within", "targets": [cell], "train": None if use_cohort else [], "use_cohort": use_cohort,
+              "n0": {cell: n0}, "show": cell, "frac": frac}
+        st.caption(f"Battery {cell}: training on cycles 1–{n0}, testing on cycles {n0 + 1}–{int(meta.loc[cell, 'cycles'])}.")
+    else:
+        c1, c2 = st.columns(2)
+        near = te.calibration_partners(meta, cell, 4)
+        train = c1.multiselect("Training batteries", [c for c in all_cells], default=[c for c in near if c != cell],
+                               key="sch_train", format_func=lambda c: cell_label(c, meta))
+        test = c2.multiselect("Test batteries (one or more)", [c for c in all_cells if c not in train],
+                              default=[cell] if cell not in train else [], key="sch_test",
+                              format_func=lambda c: cell_label(c, meta))
+        frac = st.slider("Start of each test battery the models may see (the rest is forecast)", 0.05, 0.6, 0.15, 0.05,
+                         key="sch_seen", help="Models need a few cycles of the new battery to know its current state.")
+        n0 = {t: int(max(10, round(frac * meta.loc[t, "cycles"]))) for t in test}
+        show_t = st.selectbox("Battery to display in the charts", test or [cell], key="sch_show",
+                              format_func=lambda c: cell_label(c, meta)) if test else cell
+        sc = {"mode": "across", "targets": test, "train": train, "use_cohort": False, "n0": n0, "show": show_t,
+              "frac": frac}
+        if not train or not test:
+            st.warning("Choose at least one training and one test battery.")
+        else:
+            st.caption(f"Learning from {len(train)} batteries, forecasting {len(test)}: each test battery is seen for its "
+                       f"first {100 * frac:.0f}% of life. Baselines, the PINN and the first-principles model only need "
+                       "the test battery itself; the other levels learn from the training batteries.")
+    st.session_state["_scheme"] = sc
+    return sc
+
+
 def ladder_add(name: str, level: int, n0: int, n_grid: np.ndarray, soh: np.ndarray, lo: Optional[np.ndarray],
-               hi: Optional[np.ndarray], metrics: Any) -> None:
+               hi: Optional[np.ndarray], metrics: Any, target: Optional[str] = None) -> None:
     store_ = st.session_state.setdefault("ladder", {})
-    store_[(cell, int(n0), name)] = {"name": name, "level": int(level), "n_grid": np.asarray(n_grid),
-                                     "soh": np.asarray(soh), "lo": None if lo is None else np.asarray(lo),
-                                     "hi": None if hi is None else np.asarray(hi), "m": metrics}
+    store_[(target or cell, int(n0), name)] = {"name": name, "level": int(level), "n_grid": np.asarray(n_grid),
+                                               "soh": np.asarray(soh), "lo": None if lo is None else np.asarray(lo),
+                                               "hi": None if hi is None else np.asarray(hi), "m": metrics,
+                                               "target": target or cell}
 
 
-def ladder_entries(n0: int) -> List[Dict[str, Any]]:
-    return sorted([v for (c, n, _), v in st.session_state.get("ladder", {}).items() if c == cell and n == n0],
+def ladder_entries(n0: Optional[int] = None, target: Optional[str] = None) -> List[Dict[str, Any]]:
+    sc = scheme()
+    t = target or sc["show"]
+    n = n0 if n0 is not None else sc["n0"].get(t)
+    return sorted([v for (c, nn, _), v in st.session_state.get("ladder", {}).items() if c == t and nn == n],
                   key=lambda v: (v["level"], v["name"]))
 
 
-def fig_ladder(entries: Sequence[Dict[str, Any]], n0: int, P: Palette, title: str) -> go.Figure:
-    good = ct_cell[~ct_cell["outlier"]]
+def all_target_entries() -> List[Dict[str, Any]]:
+    sc = scheme()
+    out = []
+    for t in sc["targets"]:
+        out += ladder_entries(sc["n0"][t], t)
+    return out
+
+
+def fig_ladder(entries: Sequence[Dict[str, Any]], n0: int, P: Palette, title: str, target: Optional[str] = None) -> go.Figure:
+    t = target or scheme()["show"]
+    ctt = ct[(ct["Cell_ID"] == t) & ~ct["outlier"]]
+    eol_t = te.soh_eol_for(float(meta.loc[t, "C_bol_Ah"]), float(eol_ah))
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=good["n"], y=good["SOH"], mode="markers", name="Measured SOH",
+    fig.add_trace(go.Scatter(x=ctt["n"], y=ctt["SOH"], mode="markers", name=f"Measured SOH · {t}",
                              marker=dict(color=P.measured, size=5, opacity=0.75), hovertemplate="%{y:.4f}<extra>measured</extra>"))
     for i, e in enumerate(entries):
         col = LEVEL_COLORS.get(e["level"], P.text)
@@ -3903,57 +3970,83 @@ def fig_ladder(entries: Sequence[Dict[str, Any]], n0: int, P: Palette, title: st
         fig.add_trace(go.Scatter(x=e["n_grid"][sel], y=e["soh"][sel], mode="lines", name=f"L{e['level']} · {e['name']}",
                                  legendgroup=e["name"], line=dict(color=col, width=2.6, dash=DASHES[i % len(DASHES)]),
                                  hovertemplate="%{y:.4f}<extra>" + html.escape(e["name"]) + "</extra>"))
-    fig.add_vline(x=n0, line_dash="dot", line_color=P.muted, annotation_text="forecast origin",
+    fig.add_vline(x=n0, line_dash="dot", line_color=P.muted, annotation_text="training | test",
                   annotation_font=dict(color=P.muted))
-    fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, annotation_text="End of life",
+    fig.add_hline(y=eol_t, line_dash="dash", line_color=P.eol, annotation_text="End of life",
                   annotation_font=dict(color=P.eol))
     fig.update_xaxes(title_text="Discharge cycle n")
     fig.update_yaxes(title_text="SOH (–)")
-    return style_fig(fig, P, 520, title)
+    return style_fig(fig, P, 520, f"{title} · {t}")
 
 
 def _ladder_table(entries: Sequence[Dict[str, Any]]) -> pd.DataFrame:
-    rows = [{"Level": f"L{e['level']} · {LEVEL_INFO[e['level']][0]}", "Model": e["name"],
+    """Per model: metrics averaged over the test batteries (one row per model)."""
+    rows = [{"Level": f"L{e['level']} · {LEVEL_INFO[e['level']][0]}", "Model": e["name"], "Battery": e["target"],
              "Accuracy (%)": e["m"].accuracy, "RMSE": e["m"].rmse, "Fade skill": e["m"].fade_skill,
              "Coverage": e["m"].coverage, "RUL error": e["m"].rul_error} for e in entries if e["m"] is not None]
-    return pd.DataFrame(rows)
+    d = pd.DataFrame(rows)
+    if d.empty:
+        return d
+    agg = d.groupby(["Level", "Model"], as_index=False).agg(
+        **{"Test batteries": ("Battery", "nunique"), "Accuracy (%)": ("Accuracy (%)", "mean"), "RMSE": ("RMSE", "mean"),
+           "Fade skill": ("Fade skill", "mean"), "Coverage": ("Coverage", "mean"),
+           "RUL error": ("RUL error", lambda x: float(np.nanmean(np.abs(x))) if x.notna().any() else np.nan)})
+    return agg
 
 
-def ladder_level_block(level: int, entries: Sequence[Dict[str, Any]], key: str, n0: int) -> None:
-    mine = [e for e in entries if e["level"] == level]
-    if mine:
-        show(fig_ladder(mine, n0, P, f"Level {level} · {LEVEL_INFO[level][0]}"), key=key, export=False)
-        show_table(_ladder_table(mine).set_index("Model").style.format(
-            {"Accuracy (%)": "{:.2f}", "RMSE": "{:.4f}", "Fade skill": "{:.3f}", "Coverage": "{:.0%}",
-             "RUL error": "{:+.0f}"}, na_rep="—"))
+TABLE_FMT = {"Accuracy (%)": "{:.2f}", "RMSE": "{:.4f}", "Fade skill": "{:.3f}", "Coverage": "{:.0%}", "RUL error": "{:.0f}"}
 
 
-def ladder_intro(n0: int) -> None:
-    done = {e["level"] for e in ladder_entries(n0)}
+def ladder_level_block(level: int, key: str) -> None:
+    sc = scheme()
+    shown = [e for e in ladder_entries() if e["level"] == level]
+    allt = [e for e in all_target_entries() if e["level"] == level]
+    if shown:
+        show(fig_ladder(shown, sc["n0"][sc["show"]], P, f"Level {level} · {LEVEL_INFO[level][0]}"), key=key, export=False)
+    if allt:
+        multi = len(sc["targets"]) > 1
+        show_table(_ladder_table(allt).set_index("Model").style.format(TABLE_FMT, na_rep="—"),
+                   note=("Scores averaged over the test batteries (RUL error = mean absolute error in cycles)." if multi else
+                         "Scores on the test cycles of this battery."))
+
+
+def _run_targets(fn: Callable[[str, int], Any], label: str) -> None:
+    """Run a forecaster for every test battery of the current scheme, with progress and per-battery errors."""
+    sc = scheme()
+    prog = st.progress(0.0)
+    for i, t in enumerate(sc["targets"]):
+        prog.progress(i / max(len(sc["targets"]), 1), text=f"{label}: {t}")
+        try:
+            fn(t, sc["n0"][t])
+        except Exception as exc:
+            st.warning(f"{label} on {t}: {exc}")
+    prog.empty()
+
+
+def ladder_intro() -> None:
+    done = {e["level"] for e in ladder_entries()}
     steps = "".join(
         f'<div class="bt-step{" bt-step-done" if lv in done else ""}"><div class="bt-step-n">{lv}</div>'
         f'<div class="bt-step-t">{html.escape(LEVEL_INFO[lv][0])}</div></div>' for lv in LEVEL_INFO)
     st.markdown(f'<div class="bt-ladder">{steps}</div>', unsafe_allow_html=True)
-    st.caption("Work top to bottom: every level adds one idea. A level is ticked once a model of that level has "
-               "been run for this battery and origin; the leaderboard at the end compares them all on the same "
-               "future cycles.")
+    st.caption("Work top to bottom: every level adds one idea. A level is ticked once one of its models has run on the "
+               "displayed battery; the leaderboard at the end compares them all on the same test cycles.")
 
 
-def ladder_baselines(n0: int) -> None:
+def ladder_baselines() -> None:
     section("Level 1 · Baselines: the references every model must beat")
     st.markdown("Two forecasts that need no learning at all. If an advanced model cannot beat the **linear trend**, "
                 "its complexity is not paying off.")
     if st.button("Run baselines", key="lad_b_go", icon=":material/play_arrow:", type="primary"):
-        for kind in ("persistence", "trend"):
-            try:
-                f = te.baseline_forecast(ct, cell, n0, kind, float(eol_ah))
-                ladder_add(f.name, 1, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics)
-            except Exception as exc:
-                st.warning(f"{kind}: {exc}")
-    ladder_level_block(1, ladder_entries(n0), "lad_base", n0)
+        def run(t, n0):
+            for kind in ("persistence", "trend"):
+                f = te.baseline_forecast(ct, t, n0, kind, float(eol_ah))
+                ladder_add(f.name, 1, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+        _run_targets(run, "Baselines")
+    ladder_level_block(1, "lad_base")
 
 
-def ladder_deep(n0: int) -> None:
+def ladder_deep() -> None:
     section("Level 4 · Deep learning: recurrent network and Transformer")
     st.markdown("Sequence models read a window of past SOH values (plus temperature and current) and predict the next "
                 "cycle; feeding each prediction back builds the whole forecast. Three networks with different seeds "
@@ -3963,18 +4056,16 @@ def ladder_deep(n0: int) -> None:
     L = c[1].select_slider("Window (cycles)", [5, 8, 10, 15, 20], value=10, key="lad_d_L")
     ep = c[2].select_slider("Epochs", [100, 200, 300, 500], value=200, key="lad_d_ep")
     mem = c[3].select_slider("Ensemble members", [1, 2, 3, 5], value=3, key="lad_d_mem")
-    if st.button(f"Train deep models (≈ {int(len(kinds) * mem * ep / 60) + 2} s)", key="lad_d_go",
+    if st.button(f"Train deep models (≈ {int(len(kinds) * mem * ep / 60 * max(len(scheme()['targets']), 1)) + 2} s)", key="lad_d_go",
                  icon=":material/neurology:", type="primary", disabled=not kinds):
-        prog = st.progress(0.0)
-        for i, k in enumerate(kinds):
-            try:
-                f = te.seq_forecast(ct, cell, n0, k, float(eol_ah), L=int(L), epochs=int(ep), n_members=int(mem),
-                                    progress=lambda fr, m: prog.progress(min((i + fr) / len(kinds), 1.0), text=m))
-                ladder_add(k, 4, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics)
-            except Exception as exc:
-                st.warning(f"{k}: {exc}")
-        prog.empty()
-    ladder_level_block(4, ladder_entries(n0), "lad_deep", n0)
+        sc = scheme()
+        def run(t, n0):
+            for k in kinds:
+                f = te.seq_forecast(ct, t, n0, k, float(eol_ah), L=int(L), epochs=int(ep), n_members=int(mem),
+                                    train_cells=sc["train"])
+                ladder_add(k, 4, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+        _run_targets(run, "Deep models")
+    ladder_level_block(4, "lad_deep")
     with st.expander("Why no large language model (LLM) forecaster?", icon=":material/help:"):
         st.markdown("LLMs and time-series foundation models are trained on text or on millions of generic series; "
                     "with ~30 batteries they add no physical knowledge and cannot be validated against it, and "
@@ -3984,7 +4075,7 @@ def ladder_deep(n0: int) -> None:
                     "support.")
 
 
-def ladder_hybrid(n0: int) -> None:
+def ladder_hybrid() -> None:
     section("Level 5 · Hybrid & physics-informed models")
     st.markdown("**Mechanistic PINN**: a neural network trained to fit the data *and* obey the SEI, plating and "
                 "loss-of-active-material equations. **Hierarchical Bayes**: a physics fade law whose parameters "
@@ -3994,20 +4085,17 @@ def ladder_hybrid(n0: int) -> None:
     ep = c[1].select_slider("PINN epochs", [500, 1000, 1500, 2500], value=1000, key="lad_h_ep")
     run_hb = c[2].toggle("Hierarchical Bayes", value=True, key="lad_h_hb")
     if st.button("Run hybrid models", key="lad_h_go", icon=":material/hub:", type="primary"):
-        with st.spinner("Training…"):
+        sc = scheme()
+        def run(t, n0):
             if run_p:
-                try:
-                    r = te.train_pinn(ct, imp, cell, n0, te.PINNConfig(epochs=int(ep), physics="mechanistic"), float(eol_ah))
-                    ladder_add("Mechanistic PINN", 5, n0, r.n_grid, r.soh, r.soh_lo, r.soh_hi, r.metrics)
-                except Exception as exc:
-                    st.warning(f"PINN: {exc}")
+                r = te.train_pinn(ct, imp, t, n0, te.PINNConfig(epochs=int(ep), physics="mechanistic"), float(eol_ah))
+                ladder_add("Mechanistic PINN", 5, n0, r.n_grid, r.soh, r.soh_lo, r.soh_hi, r.metrics, t)
             if run_hb:
-                try:
-                    f = te.hierarchical_bayes_forecast(ct, cell, n0, float(eol_ah))
-                    ladder_add("Hierarchical Bayes", 5, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics)
-                except Exception as exc:
-                    st.warning(f"Hierarchical Bayes: {exc}")
-    ladder_level_block(5, ladder_entries(n0), "lad_hybrid", n0)
+                pop = sc["train"] if sc["mode"] == "across" else None
+                f = te.hierarchical_bayes_forecast(ct, t, n0, float(eol_ah), train_cells=pop)
+                ladder_add("Hierarchical Bayes", 5, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+        _run_targets(run, "Hybrid models")
+    ladder_level_block(5, "lad_hybrid")
 
 
 def fig_spm_curves(P: Palette) -> go.Figure:
@@ -4028,7 +4116,7 @@ def fig_spm_curves(P: Palette) -> go.Figure:
     return style_fig(fig, P, 470, f"Single-particle model: discharge at {I:.1f} A, {T:.0f} °C")
 
 
-def ladder_first_principles(n0: int) -> None:
+def ladder_first_principles() -> None:
     section("Level 6 · First principles: single-particle electrochemical model")
     st.markdown("Each electrode is one spherical particle: lithium diffuses inside it (Fick's law), crosses the "
                 "surface with Butler–Volmer kinetics, and the voltage is the difference of the LiCoO₂ and graphite "
@@ -4043,60 +4131,67 @@ def ladder_first_principles(n0: int) -> None:
         st.latex(r"\mathrm{LLI}(\mathrm{Ah}) = a\,\mathrm{Ah} + b\,\sqrt{\mathrm{Ah}},\qquad x_0 \rightarrow x_0 - \mathrm{LLI},"
                  r"\qquad R_\mathrm{film} \propto \mathrm{LLI}")
     if st.button("Run first-principles forecast", key="lad_s_go", icon=":material/science:", type="primary"):
-        try:
-            f = te.spm_forecast(ct, cell, n0, float(eol_ah))
-            ladder_add("SPM + SEI", 6, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics)
+        def run(t, n0):
+            f = te.spm_forecast(ct, t, n0, float(eol_ah))
+            ladder_add("SPM + SEI", 6, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
             st.session_state["spm_params"] = f.params
-        except Exception as exc:
-            report_error("SPM forecast failed", exc, debug)
-    ladder_level_block(6, ladder_entries(n0), "lad_spm", n0)
+        _run_targets(run, "First-principles model")
+    ladder_level_block(6, "lad_spm")
     if st.session_state.get("spm_params"):
         show_table(pd.Series(st.session_state["spm_params"], name="Value").to_frame().style.format("{:.4g}"),
                    note="Fitted SEI kinetics: a large reaction term means near-linear fade, a large diffusion term "
                         "means fade that slows down as the SEI film thickens.")
 
 
-def ladder_leaderboard(n0: int) -> None:
-    section("Leaderboard: every level on the same battery and origin")
-    entries = ladder_entries(n0)
-    if not entries:
+def ladder_leaderboard() -> None:
+    section("Leaderboard: every level on the same test cycles")
+    sc = scheme()
+    shown = ladder_entries()
+    allt = all_target_entries()
+    if not allt:
         st.info("Run at least one level above; results appear here side by side.")
         return
-    show(fig_ladder(entries, n0, P, f"All models from origin n₀ = {n0}"), key="lad_board", export=False)
-    tab = _ladder_table(entries).sort_values("RMSE")
+    if shown:
+        show(fig_ladder(shown, sc["n0"][sc["show"]], P, "All models"), key="lad_board", export=False)
+    tab = _ladder_table(allt).sort_values("RMSE")
     best = tab.iloc[0]
     k = st.columns(3)
     k[0].metric("Best model", best["Model"], delta=best["Level"], delta_color="off")
-    k[1].metric("Accuracy", fmt(best["Accuracy (%)"], ".2f", "%"))
+    k[1].metric("Mean accuracy", fmt(best["Accuracy (%)"], ".2f", "%"),
+                help=f"Averaged over {int(best['Test batteries'])} test battery(ies).")
     base = tab[tab["Model"] == "Baseline · linear trend"]
     if len(base):
         k[2].metric("Gain over linear trend", fmt(100 * (1 - best["RMSE"] / base["RMSE"].iloc[0]), ".0f", "%"),
                     help="How much lower the best model's error is than the simplest credible baseline.")
-    show_table(tab.set_index("Model").style.format({"Accuracy (%)": "{:.2f}", "RMSE": "{:.4f}", "Fade skill": "{:.3f}",
-                                                    "Coverage": "{:.0%}", "RUL error": "{:+.0f}"}, na_rep="—")
+    incomplete = tab[tab["Test batteries"] < len(sc["targets"])]
+    show_table(tab.set_index("Model").style.format(TABLE_FMT, na_rep="—")
                .highlight_min(subset=["RMSE"], props="background-color: rgba(0,158,115,0.25); font-weight: 700;"),
-               note="Sorted by error on the same future cycles. Compare levels: more complexity is only worth it "
-                    "when it clearly beats the lower levels and keeps honest uncertainty (coverage near 90%).")
-    if st.button("Clear leaderboard for this battery", key="lad_clear", icon=":material/delete:"):
-        st.session_state["ladder"] = {k_: v for k_, v in st.session_state.get("ladder", {}).items() if k_[0] != cell}
+               note="Sorted by error on the test cycles" + (" and averaged over the test batteries" if len(sc["targets"]) > 1
+                                                             else "") + ". More complexity is only worth it when it "
+                    "clearly beats the lower levels and keeps honest uncertainty (coverage near 90%).")
+    if len(incomplete):
+        st.warning("Not all models ran on every test battery: " + ", ".join(
+            f"{m} ({int(n)}/{len(sc['targets'])})" for m, n in zip(incomplete["Model"], incomplete["Test batteries"])) +
+                   ". Compare them with care.")
+    if st.button("Clear leaderboard", key="lad_clear", icon=":material/delete:"):
+        st.session_state["ladder"] = {}
         st.rerun()
 
 
 def view_models() -> None:
     recommendations("models")
     section("Learning ladder: from simple references to first principles")
-    frac = st.slider("Forecast origin: fraction of this battery's life used for training (the rest is the test)",
-                     0.1, 0.9, 0.4, 0.05, key="ml_frac")
-    n0 = int(max(5, round(frac * meta.loc[cell, "cycles"])))
-    st.caption(f"Battery {cell}: training on cycles 1–{n0}, testing on the later cycles. Every level uses this origin.")
-    ladder_intro(n0)
+    sc = scheme_controls()
+    if not sc["targets"]:
+        return
+    ladder_intro()
     ml_methods_panel()
-    ladder_baselines(n0)
+    ladder_baselines()
     ml_section()
-    ladder_deep(n0)
-    ladder_hybrid(n0)
-    ladder_first_principles(n0)
-    ladder_leaderboard(n0)
+    ladder_deep()
+    ladder_hybrid()
+    ladder_first_principles()
+    ladder_leaderboard()
     early_life_section()
     cross_cell_section()
 

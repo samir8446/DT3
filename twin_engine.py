@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.1.0"
+ENGINE_VERSION = "5.2.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -5193,16 +5193,17 @@ def _cell_covariates(meta: pd.DataFrame, cells: Sequence[str], T_ref_C: float = 
 
 
 def hierarchical_population(ct: pd.DataFrame, exclude: Optional[str] = None, min_cycles: int = 15,
-                            covariates: bool = True) -> Dict[str, Any]:
+                            covariates: bool = True, cells: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     """Population layer: fit (a, z) to every other cell, then regress them on operating covariates
     (Arrhenius 1/T term, log current) - the prior mean for a cell with given conditions - and
     estimate the between-cell covariance by the method of moments (sample covariance of the
     residuals minus the mean within-cell estimation covariance, floored)."""
     good = ct[~ct["outlier"]]
     meta = cell_meta(ct)
+    allowed = set(cells) if cells is not None else None          # restrict the population to these batteries
     fits, covs, cells, resid_sd = [], [], [], []
     for c, d in good.groupby("Cell_ID"):
-        if c == exclude or len(d) < min_cycles:
+        if c == exclude or len(d) < min_cycles or (allowed is not None and c not in allowed):
             continue
         d = d.sort_values("n")
         ah = d["cum_Ah"].to_numpy(float) - float(d["cum_Ah"].iloc[0])
@@ -5239,15 +5240,15 @@ def hierarchical_population(ct: pd.DataFrame, exclude: Optional[str] = None, min
             "fits": F, "sigma_obs": float(np.median(resid_sd)), "covariates": use_cov}
 
 
-def _hb_posterior(ct: pd.DataFrame, cell_id: str, n0: int) -> Dict[str, Any]:
+def _hb_posterior(ct: pd.DataFrame, cell_id: str, n0: int, train_cells: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     good_all = ct[~ct["outlier"]]
     good = good_all[good_all["Cell_ID"] == cell_id].sort_values("n")
     obs = good[good["n"] <= n0]
     if len(obs) < 5:
         raise ValueError("Hierarchical Bayes: too few observations before n0.")
-    pop = hierarchical_population(ct, exclude=cell_id)
+    pop = hierarchical_population(ct, exclude=cell_id, cells=train_cells)
     if not pop["available"]:
-        raise ValueError("Hierarchical Bayes: fewer than three cohort cells with measurable fade.")
+        raise ValueError("Hierarchical Bayes: fewer than three training cells with measurable fade.")
     meta = cell_meta(ct)
     x = _cell_covariates(meta, [cell_id])[:, pop["keep"]]
     mu = (x @ pop["G"])[0]
@@ -5265,7 +5266,8 @@ def _hb_posterior(ct: pd.DataFrame, cell_id: str, n0: int) -> Dict[str, Any]:
 
 def hierarchical_bayes_forecast(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float = DEFAULT_EOL_AH,
                                 level: float = 0.9, n_samples: int = 600, horizon_factor: float = 1.5,
-                                seed: int = 0, alpha: float = 0.2) -> ProgForecast:
+                                seed: int = 0, alpha: float = 0.2,
+                                train_cells: Optional[Sequence[str]] = None) -> ProgForecast:
     """Hierarchical (partially pooled) Bayesian degradation model.
         Cell level:        SOH = s0 [1 - e^a (Ah/100)^z] + noise
         Population level:  (a, z) ~ N(G x_cell, Sigma),  x = [1, 1/T_ref - 1/T, ln(I/2)]
@@ -5273,7 +5275,7 @@ def hierarchical_bayes_forecast(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah:
     (Laplace posterior). Early on the forecast is the fleet's expectation for these operating
     conditions; as data arrive it becomes this battery's own law - the self-updating idea in
     Bayesian form. 'prior_weight' reports how much the forecast still leans on the fleet."""
-    P = _hb_posterior(ct, cell_id, n0)
+    P = _hb_posterior(ct, cell_id, n0, train_cells)
     rng = np.random.default_rng(seed)
     th = rng.multivariate_normal(P["theta"], P["cov"] + 1e-12 * np.eye(3), size=n_samples)
     th[:, 2] = np.clip(th[:, 2], 0.3, 3.0)
@@ -6376,14 +6378,15 @@ class _SeqNet:
 def seq_forecast(ct: pd.DataFrame, cell_id: str, n0: int, kind: str = SEQ_MODELS[0], eol_ah: float = DEFAULT_EOL_AH,
                  L: int = 10, epochs: int = 250, hidden: int = 16, lr: float = 3e-3, n_members: int = 3,
                  horizon_factor: float = 1.5, seed: int = 0, level: float = 0.9,
-                 progress: ProgressFn = None) -> ProgForecast:
+                 progress: ProgressFn = None, train_cells: Optional[Sequence[str]] = None) -> ProgForecast:
     """Level-4 deep sequence forecaster (GRU or Transformer). Trained on windows from all other batteries
     plus this battery's history up to n0, then rolled out autoregressively (each predicted SOH is fed back
     as input). A small deep ensemble (different seeds) gives the band. Honest note: with ~30 batteries deep
     sequence models are data-starved; compare them with the Level 1-3 models on the leaderboard."""
     meta = cell_meta(ct)
     good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
-    X, C, Y = _seq_windows(ct, list(meta.index), {cell_id: n0}, L)
+    pool = [c for c in (train_cells if train_cells is not None else meta.index) if c != cell_id and c in meta.index]
+    X, C, Y = _seq_windows(ct, pool + [cell_id], {cell_id: n0}, L)
     if len(X) < 50:
         raise ValueError("sequence model: too few training windows")
     hist = good[good["n"] <= n0]

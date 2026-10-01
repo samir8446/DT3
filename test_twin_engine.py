@@ -884,6 +884,20 @@ def test_spm_first_principles_physics_and_forecast():
     assert f.metrics.rmse < 0.02 and f.params["SEI reaction term a (1/Ah)"] > 0
 
 
+def test_training_scheme_options_for_population_and_sequence_models():
+    _, ct, _, _ = synthetic()
+    full = te.hierarchical_population(ct, exclude="S004")
+    sub = te.hierarchical_population(ct, exclude="S004", cells=["S001", "S002", "S003"])
+    assert full["available"] and full["n_cells"] == 5
+    assert sub["available"] and set(sub["cells"]) == {"S001", "S002", "S003"}
+    assert not te.hierarchical_population(ct, exclude="S004", cells=["S001"])["available"]
+    f = te.hierarchical_bayes_forecast(ct, "S004", 30, 1.6, train_cells=["S001", "S002", "S003"])
+    assert np.isfinite(f.metrics.rmse)
+    a = te.seq_forecast(ct, "S004", 36, te.SEQ_MODELS[0], 1.6, epochs=20, n_members=1, train_cells=["S001"])
+    b = te.seq_forecast(ct, "S004", 36, te.SEQ_MODELS[0], 1.6, epochs=20, n_members=1)
+    assert a.params["training windows"] < b.params["training windows"]      # fewer training batteries -> fewer windows
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

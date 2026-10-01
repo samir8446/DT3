@@ -1,4 +1,4 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.2)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
@@ -17,7 +17,7 @@ remaining life and optimise operation and maintenance.
 ```bash
 pip install -r requirements.txt
 streamlit run app.py                     # "Load synthetic demo cohort" works without data
-pytest                                   # 64 tests (pip install -r requirements-dev.txt)
+pytest                                   # 65 tests (pip install -r requirements-dev.txt)
 python study.py --master data/battery_master_data.parquet --imp data/impedance.parquet --out results/study
 python study.py --synthetic --out results/study_demo
 pip install -r requirements-service.txt && uvicorn service:app --port 8000   # streaming REST service
@@ -36,7 +36,7 @@ on the engine version, so engine updates always recompute.
 | `study.py` | Offline cohort study → CSVs, `summary.md`, manifest |
 | `service.py` | Streaming twin: framework-free `TwinRegistry` + optional FastAPI endpoints |
 | `benchmark.py` | Offline forecast-origin sweep (ML, Twin, PINN, HB) |
-| `tests/test_twin_engine.py` | 64 tests: gradient checks, synthetic-truth recovery, every model and study function |
+| `tests/test_twin_engine.py` | 65 tests: gradient checks, synthetic-truth recovery, every model and study function |
 
 ## Views
 
@@ -58,8 +58,10 @@ on the engine version, so engine updates always recompute.
 
    The view also shows live accuracy per model, mechanism shares, the equations, the measurement ablation
    and the update-frequency study (M2).
-3. **Models & forecasting: a learning ladder**, all levels on one shared forecast origin, ending in a
-   leaderboard that compares everything on the same future cycles:
+3. **Models & forecasting: a learning ladder.** A training scheme at the top applies to every level:
+   *within a battery* (train on its first part, test on the rest; optionally also learn from the other batteries)
+   or *across batteries* (train on chosen batteries, forecast one or more test batteries after seeing the start
+   of each). The leaderboard averages over the test batteries:
    - Level 1 · Baselines: persistence, linear trend, decision tree, Bayesian ridge.
    - Level 2 · Classical ML: random forest, extra trees, Gaussian process.
    - Level 3 · Boosting: histogram GB; XGBoost and LightGBM when installed (`requirements-ml.txt`).
