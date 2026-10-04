@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.3"
+REQUIRED_ENGINE = "5.4"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -3940,13 +3940,10 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
     ml_cfg = dict(cell=show_t, n0=n0_show, targets=tuple(sc["targets"]), models=tuple(models), source=source,
                   train_cells=train_cells, eol_ah=float(eol_ah), strategy=strategy, conformal_cells=conf,
                   band_level=level, params={m: params.get(m) for m in models})
-    version = st.radio("Forecaster version", ["v1", "v2", "both"], index=2, horizontal=True, key="ml_version",
-                       format_func={"v1": "v1 · fade-rate law (SOH + conditions)",
-                                    "v2": "v2 · state features, trend + learned deviation",
-                                    "both": "v1 and v2 (compare on the leaderboard)"}.get,
-                       help="v2 uses resistance, temperature rise, CV-charge time, voltage, efficiency and their "
-                            "recent trends at the origin, predicts each horizon directly and only trusts its "
-                            "correction to the battery's own trend as far as it proved itself on held-out batteries.")
+    version = scheme().get("gen", "v2")
+    st.caption({"v2": "Generation v2: state features at the origin, the battery's own trend + a learned, "
+                      "cross-validated deviation.", "v1": "Generation v1: fade-rate law of SOH and conditions.",
+                "both": "Both generations run; compare them on the leaderboard."}[version])
     ready = bool(models) and (source != "cross" or bool(train_cells))
     n_runs = len(models) * len(sc["targets"]) * (2 if version == "both" else 1)
     if st.button(f"Train and forecast ({n_runs} run{'s' if n_runs > 1 else ''})", type="primary", key="ml_go",
@@ -4380,7 +4377,7 @@ LEVEL_COLORS = {1: "#8C8C8C", 2: "#0072B2", 3: "#332288", 4: "#AA4499", 5: "#56B
 
 
 def scheme() -> Dict[str, Any]:
-    return st.session_state.get("_scheme") or {"mode": "within", "targets": [cell], "train": None,
+    return st.session_state.get("_scheme") or {"mode": "within", "targets": [cell], "train": None, "gen": "v2",
                                                "n0": {cell: int(max(5, round(0.4 * meta.loc[cell, "cycles"])))},
                                                "use_cohort": True, "show": cell}
 
@@ -4421,6 +4418,13 @@ def scheme_controls() -> Dict[str, Any]:
             st.caption(f"Learning from {len(train)} batteries, forecasting {len(test)}: each test battery is seen for its "
                        f"first {100 * frac:.0f}% of life. Baselines, the PINN and the first-principles model only need "
                        "the test battery itself; the other levels learn from the training batteries.")
+    gen = st.radio("Model generation (applies to every level)", ["v2", "v1", "both"], horizontal=True, key="gen",
+                   format_func={"v2": "v2 · cleaned data, physical limits, state features (recommended)",
+                                "v1": "v1 · original models", "both": "both · compare on the leaderboard"}.get,
+                   help="v2 removes capacity-recovery jumps (causally for the test battery), trains on comparable "
+                        "batteries, keeps forecasts physical, gives the deep models four health channels and the "
+                        "first-principles model fleet priors.")
+    sc["gen"] = gen
     st.session_state["_scheme"] = sc
     return sc
 
@@ -4509,6 +4513,11 @@ def ladder_level_block(level: int, key: str) -> None:
                          "Scores on the test cycles of this battery."))
 
 
+def gens() -> List[str]:
+    g = scheme().get("gen", "v2")
+    return ["v1", "v2"] if g == "both" else [g]
+
+
 def _run_targets(fn: Callable[[str, int], Any], label: str) -> None:
     """Run a forecaster for every test battery of the current scheme, with progress and per-battery errors."""
     sc = scheme()
@@ -4539,8 +4548,9 @@ def ladder_baselines() -> None:
     if st.button("Run baselines", key="lad_b_go", icon=":material/play_arrow:", type="primary"):
         def run(t, n0):
             for kind in ("persistence", "trend"):
-                f = te.baseline_forecast(ct, t, n0, kind, float(eol_ah))
-                ladder_add(f.name, 1, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+                for g in gens():
+                    f = (te.baseline_forecast_v2 if g == "v2" else te.baseline_forecast)(ct, t, n0, kind, float(eol_ah))
+                    ladder_add(f.name, 1, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
         _run_targets(run, "Baselines")
     ladder_level_block(1, "lad_base")
 
@@ -4560,9 +4570,14 @@ def ladder_deep() -> None:
         sc = scheme()
         def run(t, n0):
             for k in kinds:
-                f = te.seq_forecast(ct, t, n0, k, float(eol_ah), L=int(L), epochs=int(ep), n_members=int(mem),
-                                    train_cells=sc["train"])
-                ladder_add(k, 4, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+                for g in gens():
+                    if g == "v2":
+                        f = te.seq_forecast_v2(ct, t, n0, k, float(eol_ah), L=int(L), epochs=int(ep),
+                                               n_members=max(1, int(mem) - 1), train_cells=sc["train"])
+                    else:
+                        f = te.seq_forecast(ct, t, n0, k, float(eol_ah), L=int(L), epochs=int(ep), n_members=int(mem),
+                                            train_cells=sc["train"])
+                    ladder_add(f.name, 4, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
         _run_targets(run, "Deep models")
     ladder_level_block(4, "lad_deep")
     with st.expander("Why no large language model (LLM) forecaster?", icon=":material/help:"):
@@ -4586,13 +4601,21 @@ def ladder_hybrid() -> None:
     if st.button("Run hybrid models", key="lad_h_go", icon=":material/hub:", type="primary"):
         sc = scheme()
         def run(t, n0):
-            if run_p:
-                r = te.train_pinn(ct, imp, t, n0, te.PINNConfig(epochs=int(ep), physics="mechanistic"), float(eol_ah))
-                ladder_add("Mechanistic PINN", 5, n0, r.n_grid, r.soh, r.soh_lo, r.soh_hi, r.metrics, t)
-            if run_hb:
-                pop = sc["train"] if sc["mode"] == "across" else None
-                f = te.hierarchical_bayes_forecast(ct, t, n0, float(eol_ah), train_cells=pop)
-                ladder_add("Hierarchical Bayes", 5, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+            pop = sc["train"] if sc["mode"] == "across" else None
+            cfg = te.PINNConfig(epochs=int(ep), physics="mechanistic")
+            for g in gens():
+                if run_p:
+                    if g == "v2":
+                        f = te.pinn_forecast_v2(ct, imp, t, n0, cfg, float(eol_ah), train_cells=pop)
+                        ladder_add(f.name, 5, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+                    else:
+                        r = te.train_pinn(ct, imp, t, n0, cfg, float(eol_ah))
+                        ladder_add("Mechanistic PINN", 5, n0, r.n_grid, r.soh, r.soh_lo, r.soh_hi, r.metrics, t)
+                if run_hb:
+                    f = (te.hierarchical_bayes_forecast_v2 if g == "v2" else te.hierarchical_bayes_forecast)(
+                        ct, t, n0, float(eol_ah), train_cells=pop)
+                    ladder_add(f.name if g == "v2" else "Hierarchical Bayes", 5, n0, f.n_grid, f.soh, f.lo, f.hi,
+                               f.metrics, t)
         _run_targets(run, "Hybrid models")
     ladder_level_block(5, "lad_hybrid")
 
@@ -4630,10 +4653,15 @@ def ladder_first_principles() -> None:
         st.latex(r"\mathrm{LLI}(\mathrm{Ah}) = a\,\mathrm{Ah} + b\,\sqrt{\mathrm{Ah}},\qquad x_0 \rightarrow x_0 - \mathrm{LLI},"
                  r"\qquad R_\mathrm{film} \propto \mathrm{LLI}")
     if st.button("Run first-principles forecast", key="lad_s_go", icon=":material/science:", type="primary"):
+        sc = scheme()
         def run(t, n0):
-            f = te.spm_forecast(ct, t, n0, float(eol_ah))
-            ladder_add("SPM + SEI", 6, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
-            st.session_state["spm_params"] = f.params
+            for g in gens():
+                if g == "v2":
+                    f = te.spm_forecast_v2(ct, t, n0, float(eol_ah), train_cells=sc["train"] if sc["mode"] == "across" else None)
+                else:
+                    f = te.spm_forecast(ct, t, n0, float(eol_ah))
+                ladder_add(f.name if g == "v2" else "SPM + SEI", 6, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+                st.session_state["spm_params"] = f.params
         _run_targets(run, "First-principles model")
     ladder_level_block(6, "lad_spm")
     if st.session_state.get("spm_params"):

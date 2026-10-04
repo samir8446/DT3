@@ -922,6 +922,34 @@ def test_ml_v2_cleaning_causal_features_and_forecast():
     assert "S002" not in pool and len(pool) >= 3
 
 
+def test_v2_preparation_has_no_lookahead_and_forecasts_are_physical():
+    store, ct, imp, _ = synthetic()
+    a = te.prepare_v2_ct(ct, "S004", 30)
+    b = te.prepare_v2_ct(ct[ct["n"] <= 30].copy() if False else ct, "S004", 30)
+    past = a[(a["Cell_ID"] == "S004") & (a["n"] <= 30)]
+    # the target's prepared past must not depend on its future: rebuild from truncated data
+    trunc = ct[~((ct["Cell_ID"] == "S004") & (ct["n"] > 30))].copy()
+    c = te.prepare_v2_ct(trunc, "S004", 30)
+    past_c = c[(c["Cell_ID"] == "S004") & (c["n"] <= 30)]
+    assert np.allclose(past["SOH"].to_numpy(), past_c["SOH"].to_numpy())
+    fut = a[(a["Cell_ID"] == "S004") & (a["n"] > 30)]
+    raw = ct[(ct["Cell_ID"] == "S004") & (ct["n"] > 30)]
+    assert np.allclose(fut["SOH"].to_numpy(), raw["SOH"].to_numpy())            # future left raw for scoring
+    for f in (te.baseline_forecast_v2(ct, "S004", 30, "trend", 1.6), te.hierarchical_bayes_forecast_v2(ct, "S004", 30, 1.6),
+              te.spm_forecast_v2(ct, "S004", 30, 1.6)):
+        m = f.n_grid > 30
+        assert np.all((f.soh >= 0) & (f.soh <= 1.05)) and np.all(np.diff(f.soh[m]) <= 1e-12)
+        assert np.all(f.lo <= f.soh + 1e-12) and np.all(f.hi >= f.soh - 1e-12) and f.name.endswith("v2")
+
+
+def test_deep_v2_multichannel_direct_horizons():
+    _, ct, _, _ = synthetic()
+    f = te.seq_forecast_v2(ct, "S004", 36, te.SEQ_MODELS[0], 1.6, epochs=30, n_members=1)
+    m = f.n_grid > 36
+    assert np.all(np.diff(f.soh[m]) <= 1e-12) and f.metrics.rmse < 0.1
+    assert "correction trusted" in f.params and all(0 <= w <= 1 for w in f.params["correction trusted"].values())
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

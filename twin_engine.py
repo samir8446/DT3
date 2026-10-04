@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.3.0"
+ENGINE_VERSION = "5.4.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -6329,21 +6329,21 @@ def _seq_windows(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int],
 class _SeqNet:
     """Small GRU or single-head attention network on the numpy autodiff (no extra dependencies)."""
 
-    def __init__(self, kind: str, L: int, H: int = 16, seed: int = 0):
+    def __init__(self, kind: str, L: int, H: int = 16, seed: int = 0, d_in: int = 1, d_out: int = 1, d_cond: int = 3):
         rng = np.random.default_rng(seed)
         g = lambda *s: Tensor(rng.normal(0, 1 / math.sqrt(s[0]), size=s))
-        self.kind, self.L, self.H = kind, L, H
+        self.kind, self.L, self.H, self.d_in = kind, L, H, d_in
         if kind.startswith("GRU"):
-            self.Wz, self.Uz, self.bz = g(1, H), g(H, H), Tensor(np.zeros((1, H)))
-            self.Wr, self.Ur, self.br = g(1, H), g(H, H), Tensor(np.zeros((1, H)))
-            self.Wh, self.Uh, self.bh = g(1, H), g(H, H), Tensor(np.zeros((1, H)))
+            self.Wz, self.Uz, self.bz = g(d_in, H), g(H, H), Tensor(np.zeros((1, H)))
+            self.Wr, self.Ur, self.br = g(d_in, H), g(H, H), Tensor(np.zeros((1, H)))
+            self.Wh, self.Uh, self.bh = g(d_in, H), g(H, H), Tensor(np.zeros((1, H)))
             core = [self.Wz, self.Uz, self.bz, self.Wr, self.Ur, self.br, self.Wh, self.Uh, self.bh]
         else:
-            self.We, self.be = g(2, H), Tensor(np.zeros((1, H)))
+            self.We, self.be = g(d_in + 1, H), Tensor(np.zeros((1, H)))
             self.Wq, self.Wk, self.Wv = g(H, H), g(H, H), g(H, H)
             core = [self.We, self.be, self.Wq, self.Wk, self.Wv]
-        self.Wc, self.W1, self.b1 = g(3, H), g(H, H), Tensor(np.zeros((1, H)))
-        self.W2, self.b2 = g(H, 1), Tensor(np.zeros((1, 1)))
+        self.Wc, self.W1, self.b1 = g(d_cond, H), g(H, H), Tensor(np.zeros((1, H)))
+        self.W2, self.b2 = g(H, d_out), Tensor(np.zeros((1, d_out)))
         self.params = core + [self.Wc, self.W1, self.b1, self.W2, self.b2]
 
     def forward(self, X: np.ndarray, C: np.ndarray) -> Tensor:
@@ -6351,7 +6351,7 @@ class _SeqNet:
         if self.kind.startswith("GRU"):
             h = Tensor(np.zeros((N, self.H)))
             for t in range(self.L):
-                x = Tensor(X[:, t:t + 1])
+                x = Tensor(X[:, t, :] if X.ndim == 3 else X[:, t:t + 1])
                 z = (x @ self.Wz + h @ self.Uz + self.bz).sigmoid()
                 r = (x @ self.Wr + h @ self.Ur + self.br).sigmoid()
                 hh = (x @ self.Wh + (r * h) @ self.Uh + self.bh).tanh()
@@ -6359,8 +6359,8 @@ class _SeqNet:
             feat = h
         else:
             pos = np.linspace(-1, 1, self.L)
-            toks = [(Tensor(np.column_stack([X[:, t], np.full(N, pos[t])])) @ self.We + self.be).tanh()
-                    for t in range(self.L)]
+            toks = [(Tensor(np.column_stack([X[:, t, :] if X.ndim == 3 else X[:, t], np.full(N, pos[t])]))
+                     @ self.We + self.be).tanh() for t in range(self.L)]
             q = toks[-1] @ self.Wq
             ones = Tensor(np.ones((self.H, 1)))
             num, den = None, None
@@ -6508,7 +6508,8 @@ def spm_discharge(p: SPMParams, I_A: float, T_C: float = 25.0, lli: float = 0.0,
 
 
 def spm_forecast(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float = DEFAULT_EOL_AH, p: Optional[SPMParams] = None,
-                 horizon_factor: float = 1.5, level: float = 0.9, n_samples: int = 300, seed: int = 0) -> ProgForecast:
+                 horizon_factor: float = 1.5, level: float = 0.9, n_samples: int = 300, seed: int = 0,
+                 sei_prior: Optional[Tuple[np.ndarray, np.ndarray]] = None) -> ProgForecast:
     """Level-6 first-principles forecast. The single-particle model gives capacity as a function of lost
     lithium at the cell's own current and temperature (a lookup table from full discharge simulations, so
     rate and temperature effects are physical). SEI growth, the dominant ageing mechanism in the model,
@@ -6540,11 +6541,25 @@ def spm_forecast(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float = DEFAUL
         with_r = np.interp(lli, grid, caps_r)
         return base + np.clip(rho * lli / 0.08, 0, 1) * (with_r - base)
 
-    sol = least_squares(lambda th: model(th, A) - y, x0=np.log([1e-4, 1e-3, 0.5]),
-                        bounds=(np.log([1e-9, 1e-9, 1e-3]), np.log([1e-1, 1e-1, 50.0])))
+    if sei_prior is not None:
+        mu_p, sd_p = sei_prior
+        sig_y = max(float(np.std(np.diff(y))) / math.sqrt(2), 0.004)
+        resid = lambda th: np.concatenate([(model(th, A) - y) / sig_y, (th - mu_p) / sd_p])
+        x_init = np.clip(mu_p, np.log([1e-9, 1e-9, 1e-3]) + 1e-6, np.log([1e-1, 1e-1, 50.0]) - 1e-6)
+    else:
+        resid = lambda th: model(th, A) - y
+        x_init = np.log([1e-4, 1e-3, 0.5])
+    sol = least_squares(resid, x0=x_init, bounds=(np.log([1e-9, 1e-9, 1e-3]), np.log([1e-1, 1e-1, 50.0])))
+    if sei_prior is not None:                          # report data-misfit units for the covariance
+        sol.fun = model(sol.x, A) - y
     J = sol.jac
     s2 = float(np.sum(sol.fun ** 2) / max(len(y) - 3, 1))
-    cov = s2 * np.linalg.pinv(J.T @ J)
+    # with a prior the residuals are already normalised: the Laplace covariance is (J^T J)^-1 directly
+    if sei_prior is not None:
+        chi2 = float(np.sum((sol.fun / sig_y) ** 2) / max(len(y) - 3, 1))   # model misfit beyond the noise
+        cov = max(chi2, 1.0) * np.linalg.pinv(J.T @ J)
+    else:
+        cov = s2 * np.linalg.pinv(J.T @ J)
     rng = np.random.default_rng(seed)
     th = rng.multivariate_normal(sol.x, cov + 1e-10 * np.eye(3), size=n_samples)
     th = np.clip(th, np.log([1e-9, 1e-9, 1e-3]), np.log([1e-1, 1e-1, 50.0]))
@@ -6554,6 +6569,11 @@ def spm_forecast(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float = DEFAUL
     a_f = A[-1] + (fut - int(obs["n"].iloc[-1])) * dah
     s0 = float(obs["SOH"].head(3).median())
     paths = np.array([model(t_, a_f) for t_ in th]) * s0 + math.sqrt(s2) * 0.5 * rng.standard_normal((n_samples, 1))
+    if sei_prior is not None:
+        # model discrepancy growing with the extrapolation distance (the prior pins the parameters, not the law)
+        h_ = (fut - int(obs["n"].iloc[-1])).astype(float)
+        sd_h = max(math.sqrt(s2), 0.004) * np.sqrt(1.0 + h_ / max(len(obs), 5)) * (1.0 + h_ / 60.0)
+        paths = paths + sd_h[None, :] * rng.standard_normal((n_samples, 1))
     past = np.interp(n_grid[n_grid <= n0], good["n"], good["SOH"])
     # central forecast from the fitted (MAP) parameters; the weakly identified film term only widens the band
     med = np.concatenate([past, model(sol.x, a_f) * s0])
@@ -6818,3 +6838,245 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Extr
     return V2Forecast(f"ML v2 · {model_name}", cell_id, n0, n_grid, med_c, lo_c, hi_c, metrics,
                       imp_rows if imp_rows is not None else pd.DataFrame(), f0, pool, time.time() - t0,
                       dict(zip(V2_HORIZONS, shrink_w)))
+
+
+# =============================================================================
+# 30. v2 for every level: cleaned data, comparable pool, physical limits, priors
+# =============================================================================
+def prepare_v2_ct(ct: pd.DataFrame, target: str, n0: int, train_cells: Optional[Sequence[str]] = None,
+                  after: int = 2) -> pd.DataFrame:
+    """Cycle table prepared for v2 forecasting (no look-ahead for the target):
+    - target, cycles n <= n0: regeneration transients flagged invalid, SOH replaced by the causal cleaned
+      trend (trailing median + running minimum); cycles n > n0 left raw (they are only used for scoring);
+    - training batteries: transients flagged invalid, SOH replaced by the isotonic cleaned curve;
+    - batteries outside the comparable pool (or outside `train_cells`) flagged invalid entirely."""
+    out = ct.copy()
+    pool = set(v2_training_pool(ct, target, train_cells)) | {target}
+    for cid, d in ct.groupby("Cell_ID"):
+        idx = d.index
+        if cid not in pool:
+            out.loc[idx, "outlier"] = True
+            continue
+        part = d[d["n"] <= n0] if cid == target else d
+        if part[~part["outlier"]].shape[0] < 5:
+            continue
+        cl = clean_capacity(part, after)
+        dropped = part.index[~part.index.isin(cl.index) & ~part["outlier"]]
+        out.loc[dropped, "outlier"] = True
+        col = "SOH_causal" if cid == target else "SOH_clean"
+        out.loc[cl.index, "SOH"] = cl[col].to_numpy()
+        out.loc[cl.index, "Capacity_Ah"] = cl[col].to_numpy() * float(d["C_bol_Ah"].iloc[0])
+    return out
+
+
+def _v2_finish(fc: Any, ct_raw: pd.DataFrame, cell_id: str, n0: int, eol_ah: float, name: str,
+               alpha: float = 0.2) -> ProgForecast:
+    """Physical limits and honest scoring: SOH within [0, 1.05], non-increasing after the origin, band
+    ordered around the median; metrics recomputed against the raw (uncleaned) measurements."""
+    n_grid = np.asarray(fc.n_grid)
+    med = np.asarray(getattr(fc, "soh", getattr(fc, "soh_pred", None)), float).copy()
+    lo = getattr(fc, "lo", getattr(fc, "soh_lo", None))
+    hi = getattr(fc, "hi", getattr(fc, "soh_hi", None))
+    fut = n_grid > n0
+    if fut.any():
+        med[fut] = np.minimum.accumulate(np.clip(med[fut], 0.0, 1.05))
+    med = np.clip(med, 0.0, 1.05)
+    if lo is not None and hi is not None:
+        lo = np.minimum(np.clip(np.asarray(lo, float), 0.0, 1.05), med)
+        hi = np.maximum(np.clip(np.asarray(hi, float), 0.0, 1.05), med)
+    good = ct_raw[(ct_raw["Cell_ID"] == cell_id) & ~ct_raw["outlier"]].sort_values("n")
+    soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
+    out = ProgForecast(name, n_grid, med, lo, hi, getattr(fc, "rul_samples", None), dict(getattr(fc, "params", {}) or {}))
+    out.metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), n_grid, med, n0, soh_eol, lo, hi, alpha)
+    return out
+
+
+def baseline_forecast_v2(ct: pd.DataFrame, cell_id: str, n0: int, kind: str = "trend", eol_ah: float = DEFAULT_EOL_AH,
+                         **kw) -> ProgForecast:
+    cv = prepare_v2_ct(ct, cell_id, n0)
+    f = baseline_forecast(cv, cell_id, n0, kind, eol_ah, **kw)
+    return _v2_finish(f, ct, cell_id, n0, eol_ah, f.name + " v2")
+
+
+def hierarchical_bayes_forecast_v2(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float = DEFAULT_EOL_AH,
+                                   train_cells: Optional[Sequence[str]] = None, **kw) -> ProgForecast:
+    """Hierarchical Bayes on cleaned data with a comparable population; forecasts kept physical."""
+    cv = prepare_v2_ct(ct, cell_id, n0, train_cells)
+    f = hierarchical_bayes_forecast(cv, cell_id, n0, eol_ah, train_cells=train_cells, **kw)
+    return _v2_finish(f, ct, cell_id, n0, eol_ah, HB_NAME + " v2")
+
+
+def pinn_forecast_v2(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str, n0: int, cfg: "PINNConfig",
+                     eol_ah: float = DEFAULT_EOL_AH, train_cells: Optional[Sequence[str]] = None) -> ProgForecast:
+    """Mechanistic PINN trained on the cleaned history (no recovery jumps), forecasts kept physical."""
+    cv = prepare_v2_ct(ct, cell_id, n0, train_cells)
+    r = train_pinn(cv, imp, cell_id, n0, cfg, eol_ah)
+    return _v2_finish(r, ct, cell_id, n0, eol_ah, "Mechanistic PINN v2")
+
+
+def spm_pool_prior(ct: pd.DataFrame, target: str, train_cells: Optional[Sequence[str]] = None,
+                   p: Optional[SPMParams] = None, max_cells: int = 8) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """SEI-kinetics prior (mean, sd of log a, log b, log rho) from full-history SPM fits on comparable batteries."""
+    pool = v2_training_pool(ct, target, train_cells)[:max_cells]
+    fits = []
+    for c in pool:
+        try:
+            g = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]]
+            f = spm_forecast(prepare_v2_ct(ct, c, int(g["n"].max())), c, int(g["n"].max()), p=p)
+            fits.append(np.log([f.params["SEI reaction term a (1/Ah)"] + 1e-12,
+                                f.params["SEI diffusion term b (1/sqrt(Ah))"] + 1e-12,
+                                f.params["film resistance coupling"] + 1e-12]))
+        except Exception:
+            continue
+    if len(fits) < 2:
+        return None
+    F = np.array(fits)
+    return np.median(F, axis=0), np.maximum(F.std(axis=0), 0.5)
+
+
+def spm_forecast_v2(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float = DEFAULT_EOL_AH,
+                    train_cells: Optional[Sequence[str]] = None, p: Optional[SPMParams] = None) -> ProgForecast:
+    """First-principles forecast on the cleaned history with SEI priors learned from comparable batteries:
+    early in life the prior keeps the SEI kinetics realistic, later the battery's own data dominate."""
+    prior = spm_pool_prior(ct, cell_id, train_cells, p)
+    cv = prepare_v2_ct(ct, cell_id, n0, train_cells)
+    f = spm_forecast(cv, cell_id, n0, eol_ah, p, sei_prior=prior)
+    return _v2_finish(f, ct, cell_id, n0, eol_ah, "SPM + SEI v2")
+
+
+def _seq_channels(d: pd.DataFrame) -> np.ndarray:
+    """Per-cycle input channels (valid cycles, in order): SOH, resistance growth, temperature rise, CV-time growth."""
+    def rel(col):
+        if col not in d or d[col].notna().sum() < 3:
+            return np.zeros(len(d))
+        v = d[col].astype(float).ffill().bfill().to_numpy()
+        base = float(np.nanmedian(v[:3])) or 1.0
+        return v / base - 1.0
+    dT = d["dT_C"].astype(float).ffill().bfill().fillna(0).to_numpy() if "dT_C" in d else np.zeros(len(d))
+    return np.column_stack([d["SOH"].to_numpy(float), rel("R_dc_ohm"), dT, rel("t_cv_s")])
+
+
+def seq_forecast_v2(ct: pd.DataFrame, cell_id: str, n0: int, kind: str = SEQ_MODELS[0], eol_ah: float = DEFAULT_EOL_AH,
+                    L: int = 10, epochs: int = 200, hidden: int = 16, lr: float = 3e-3, n_members: int = 2,
+                    train_cells: Optional[Sequence[str]] = None, level: float = 0.9, seed: int = 0,
+                    horizon_factor: float = 1.5, progress: ProgressFn = None) -> ProgForecast:
+    """Level-4 v2: a GRU or Transformer reads windows of four health channels (cleaned SOH, resistance growth,
+    temperature rise, CV-time growth) and predicts, for every horizon at once, how far the future drop departs
+    from the battery's own recent trend. Grouped cross-validation by battery sets the band and how much of the
+    learned correction is trusted (0 = trend only). No autoregressive chaining, physical limits enforced."""
+    from scipy.stats import theilslopes
+
+    cv = prepare_v2_ct(ct, cell_id, n0, train_cells)
+    pool = v2_training_pool(ct, cell_id, train_cells)
+    meta = cell_meta(ct)
+    Hs = np.array(V2_HORIZONS, float)
+    Xs, Cs, Ys, G = [], [], [], []
+    target_state = None
+    for c in pool + [cell_id]:
+        d = cv[(cv["Cell_ID"] == c) & ~cv["outlier"]].sort_values("n")
+        if c == cell_id:
+            d = d[d["n"] <= n0]
+        if len(d) < L + 3:
+            continue
+        ch = _seq_channels(d)
+        n = d["n"].to_numpy(float)
+        T = float(d["T_mean_C"].median()) + 273.15
+        cond = [math.exp(30e3 / R_GAS * (1 / 298.15 - 1 / T)) - 1, float(meta.loc[c, "I_dis_A"]) / float(meta.loc[c, "C_bol_Ah"]) - 1]
+
+        def window(i):
+            w = ch[i - L + 1:i + 1].copy()
+            w[:, 0] = (w[:, 0] - w[-1, 0]) * 50
+            w[:, 1] *= 10
+            w[:, 2] /= 5
+            w[:, 3] *= 5
+            tl = slice(max(0, i - 14), i + 1)
+            rate = float(theilslopes(ch[tl, 0], n[tl])[0]) if i >= 4 else 0.0
+            return w, min(rate, 0.0)
+
+        for i in range(L - 1, len(d), 2):
+            w, rate = window(i)
+            y = np.full(len(Hs), np.nan)
+            if c != cell_id:
+                for j, hz in enumerate(Hs):
+                    if n[i] + hz <= n[-1]:
+                        y[j] = (np.interp(n[i] + hz, n, ch[:, 0]) - ch[i, 0] - rate * hz) * 20
+            if np.isfinite(y).any():
+                Xs.append(w); Cs.append(cond + [(ch[i, 0] - 0.85) * 5]); Ys.append(y); G.append(c)
+        if c == cell_id:
+            w, rate = window(len(d) - 1)
+            target_state = (w, cond + [(ch[-1, 0] - 0.85) * 5], rate, float(ch[-1, 0]))
+    if target_state is None or len(Xs) < 30:
+        raise ValueError("deep v2: not enough training windows (choose more comparable training batteries).")
+    X, C, Y, G = np.array(Xs), np.array(Cs), np.array(Ys), np.array(G)
+    M = np.isfinite(Y).astype(float)
+    Y0 = np.nan_to_num(Y)
+    rng = np.random.default_rng(seed)
+
+    def train(idx, sd):
+        net = _SeqNet(kind, L, hidden, sd, d_in=4, d_out=len(Hs), d_cond=3)
+        opt = Adam(net.params, lr=lr)
+        for ep in range(epochs):
+            b = rng.choice(idx, size=min(256, len(idx)), replace=False)
+            mt = Tensor(M[b])
+            loss = (((net.forward(X[b], C[b]) - Tensor(Y0[b])) * mt).square()).mean() * (M[b].size / max(M[b].sum(), 1))
+            for p_ in net.params:
+                p_.grad = np.zeros_like(p_.data)
+            loss.backward()
+            opt.step()
+        return net
+
+    # grouped cross-validation: shrinkage weight and band per horizon
+    cells_u = np.unique(G)
+    folds = np.array_split(rng.permutation(cells_u), 2) if len(cells_u) >= 4 else []
+    cv_p, cv_y = [], []
+    for k, fold in enumerate(folds):
+        te_m = np.isin(G, fold)
+        _report(progress, 0.1 + 0.3 * k, f"{kind} v2: cross-validation fold {k + 1}")
+        net = train(np.nonzero(~te_m)[0], seed + 100 + k)
+        cv_p.append(net.forward(X[te_m], C[te_m]).data)
+        cv_y.append(Y[te_m])
+    if cv_p:
+        P_cv, Y_cv = np.vstack(cv_p), np.vstack(cv_y)
+        w_h, q_h = [], []
+        for j in range(len(Hs)):
+            mj = np.isfinite(Y_cv[:, j])
+            if mj.sum() < 5:
+                w_h.append(0.0); q_h.append(np.nan)
+                continue
+            e_m, e_0 = np.mean((Y_cv[mj, j] - P_cv[mj, j]) ** 2), np.mean(Y_cv[mj, j] ** 2)
+            w = float(np.clip(1 - e_m / e_0, 0, 1)) if e_0 > 0 else 0.0
+            w_h.append(w)
+            q_h.append(float(np.quantile(np.abs(Y_cv[mj, j] - w * P_cv[mj, j]), level)))
+    else:
+        w_h, q_h = [0.0] * len(Hs), [np.nan] * len(Hs)
+    w_h, q_h = np.array(w_h), np.array(q_h)
+    q_h = np.where(np.isfinite(q_h), q_h, np.nanmax(q_h) if np.isfinite(q_h).any() else 0.4)
+    preds = []
+    for mbr in range(n_members):
+        _report(progress, 0.7 + 0.3 * mbr / max(n_members, 1), f"{kind} v2: final member {mbr + 1}")
+        net = train(np.arange(len(X)), seed + mbr)
+        preds.append(net.forward(target_state[0][None], np.array([target_state[1]])).data[0])
+    dev = np.mean(preds, axis=0) * w_h / 20
+    rate0, s0 = target_state[2], target_state[3]
+    P_ = np.minimum.accumulate(np.minimum(rate0 * Hs + dev, 0.0))
+    L_ = np.minimum(P_ - q_h / 20, P_)
+    H_ = np.minimum(P_ + q_h / 20, 0.0)
+    good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
+    n_grid = np.arange(1, int(good["n"].max() * horizon_factor) + 1)
+    h_f = np.maximum(n_grid - n0, 0).astype(float)
+    tail = (P_[-1] - P_[-2]) / (Hs[-1] - Hs[-2])
+
+    def curve(vals):
+        xs, ys = np.concatenate([[0.0], Hs]), np.concatenate([[0.0], vals])
+        out = np.interp(h_f, xs, ys)
+        out[h_f > xs[-1]] = ys[-1] + min(tail, 0.0) * (h_f[h_f > xs[-1]] - xs[-1])
+        return out
+
+    past = np.interp(n_grid, good["n"], good["SOH"])
+    med = np.where(n_grid > n0, s0 + curve(P_), past)
+    lo = np.where(n_grid > n0, s0 + curve(L_), past)
+    hi = np.where(n_grid > n0, s0 + curve(H_), past)
+    fc = ProgForecast(kind + " v2", n_grid, med, lo, hi, None,
+                      {"windows": int(len(X)), "channels": "SOH, resistance, temperature rise, CV time",
+                       "correction trusted": dict(zip(V2_HORIZONS, np.round(w_h, 2).tolist()))})
+    return _v2_finish(fc, ct, cell_id, n0, eol_ah, kind + " v2")
