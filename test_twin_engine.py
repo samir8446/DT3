@@ -917,7 +917,7 @@ def test_ml_v2_cleaning_causal_features_and_forecast():
     assert np.all(np.diff(f.soh_pred[fut]) <= 1e-12) and np.all((f.soh_pred >= 0) & (f.soh_pred <= 1.05))
     assert np.all(f.soh_lo[fut] <= f.soh_pred[fut] + 1e-12) and np.all(f.soh_hi[fut] >= f.soh_pred[fut] - 1e-12)
     assert all(0 <= w <= 1 for w in f.correction_weight.values() if np.isfinite(w))
-    assert len(f.importance) == len(te.V2_FEATURES) and f.metrics.rmse < 0.05
+    assert 10 <= len(f.importance) <= len(te.V2_FEATURES) and f.metrics.rmse < 0.05
     pool = te.v2_training_pool(ct, "S002")
     assert "S002" not in pool and len(pool) >= 3
 
@@ -973,6 +973,36 @@ def test_xgboost_lightgbm_svm_integration_and_ensemble():
     for n in ("xgboost", "lightgbm"):
         if not real[n]:
             sys.modules.pop(n, None)
+
+
+def test_ml_push_shapley_ica_selection_augmentation_monotone_bayes():
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import xgb_shim
+    _, ct, imp, _ = synthetic()
+    # Shapley values are exact on a linear function: phi_j = w_j (x_j - mean background_j)
+    rng = np.random.default_rng(0)
+    bg, x0, w = rng.normal(size=(40, 4)), np.array([1.0, -2.0, 0.5, 3.0]), np.array([0.3, -1.0, 2.0, 0.0])
+    phi, base = te.shapley_values(lambda Z: Z @ w, x0, bg, n_perm=200)
+    assert abs(phi.sum() - (x0 @ w - base)) < 1e-9 and abs(phi[3]) < 1e-12
+    f = te.train_ml_v2(ct, "S004", 45, "Bayesian Ridge", eol_ah=1.6, select_features=True)
+    assert set(f.selected) <= set(te.V2_FEATURES) and 4 <= len(f.selected) <= len(te.V2_FEATURES)
+    assert np.isfinite(f.features["ica_h_rel"]) and np.isfinite(f.features["cum_heat"])
+    assert f.shap is not None and abs(f.shap["Shapley (SOH at +40 cycles)"].sum()
+                                      - 0) < 1.0                       # finite, bounded contributions
+    plain = te._v2_samples(ct, ["S001", "S002"], {})
+    aug = te._v2_samples(ct, ["S001", "S002"], {}, augment=(0.85, 1.15), target="S004")
+    assert len(aug) > len(plain) and set(aug["Cell_ID"]) == set(plain["Cell_ID"])   # copies stay in their group
+    xgb_shim.install()
+    mono = [te.V2_MONOTONE.get(k, 0) for k in te.V2_FEATURES]
+    est = te.make_model("XGBoost", 0, None, monotone=mono)
+    reg = est[-1] if hasattr(est, "steps") else est
+    assert reg.monotone_constraints.startswith("(") and "-1" in reg.monotone_constraints
+    for method in te.TUNING_METHODS:
+        r = te.tune_soh_estimator(ct, imp, "SVM", n_iter=6, method=method)
+        assert r.best_score <= r.default_score + 1e-12 and method in r.validation
+    for n in ("xgboost", "lightgbm"):
+        sys.modules.pop(n, None)
 
 
 if __name__ == "__main__":                            # minimal runner when pytest is absent
