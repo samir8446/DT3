@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.9"
+REQUIRED_ENGINE = "6.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -558,6 +558,8 @@ EXPLAIN: Dict[str, str] = {
     "abl_fig": "The twin re-run with different measurement sets: the gap between open loop and voltage-only is the information the sensors add (Mission 2).",
     "uf_fig": "Tracking accuracy when the twin is updated every m cycles: it shows how rarely the twin can be updated without losing accuracy (Mission 2).",
     # models
+    "wf_timeline": "Which cycles each battery contributes: forecasts start at the blue marks (training data up to there, test data after). The knee and end of life come from the Diagnostics analysis.",
+    "wf_board": "All models evaluated with the same batteries and protocol. Bars: mean error over held-out batteries with 95% confidence interval; dashed line: the best baseline. Colours: model family.",
     "lad_base": "Level 1 references: 'nothing changes' (persistence) and 'the recent straight line continues' (linear trend). A model is only useful if it beats these.",
     "lad_deep": "Level 4 deep sequence models (GRU, Transformer) read a window of past SOH values and predict the next cycle, repeatedly, to build the forecast.",
     "lad_hybrid": "Level 5 hybrid models combine physics equations with learning: the mechanistic PINN obeys the degradation kinetics; hierarchical Bayes combines a physics law with fleet knowledge.",
@@ -3495,15 +3497,16 @@ def _reco_items(view: str) -> List[Tuple[str, str]]:
         else:
             items.append(("swap_horiz", "Pick a cold or hot battery in the control bar to see the mechanistic model take over."))
     elif view == "models":
-        done = {e["level"] for e in ladder_entries()}
-        nxt = next((lv for lv in LEVEL_INFO if lv not in done and lv not in (2, 3)), None)
-        if not done:
-            items.append(("flag", "Start with **Level 1 · Baselines**: every other model must beat the linear trend."))
-        elif nxt:
-            items.append(("trending_up", f"Next: **Level {nxt} · {LEVEL_INFO[nxt][0]}**, then compare in the leaderboard."))
-        if not ss.get("ml"):
-            items.append(("model_training", "In the ML workbench, press **Auto-tune** before judging the tree and boosting models."))
-        items.append(("fact_check", "One battery is an anecdote: confirm the ranking in the **cross-cell benchmark** or the Study results."))
+        w = ss.get("wf") or {}
+        res = w.get("res")
+        if res is None or not len(res):
+            items.append(("flag", "Start with **Step 2 · Run baselines**: they define the bar every model must beat."))
+        elif not (res["family"] != "Baselines").any():
+            items.append(("play_arrow", "Next: **Step 4 · Run selected models**, then read the verdict in Step 5."))
+        else:
+            items.append(("fact_check", "Read the **Step 5 verdict**; repeat for another condition group in Step 1."))
+        if not w.get("est"):
+            items.append(("monitor_heart", "**Step 3** shows how well today's SOH is known without a capacity test."))
     elif view == "ops":
         if not ss.get("ops_calib", True):
             items.append(("tune", "Turn on **Calibrate the plant** so the optimisation plans for this real battery."))
@@ -5041,8 +5044,229 @@ def partial_field_windows(saved: Dict[str, Any]) -> None:
                             "battery's health best.")
 
 
+FAMILY_COLORS = {"Baselines": "#8C8C8C", "Statistical / Bayesian": "#56B4E9", "Machine learning": "#0072B2",
+                 "Deep learning": "#AA4499", "Physics": "#882255"}
+
+
+def fig_wf_timeline(cells: Sequence[str], origins: Sequence[float], P: Palette) -> go.Figure:
+    fig = go.Figure()
+    for i, c in enumerate(cells):
+        g = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]]
+        n_last = int(g["n"].max())
+        soh_eol_c = te.soh_eol_for(float(g["C_bol_Ah"].iloc[0]), float(eol_ah))
+        eol_c, _ = te.eol_crossing(g["n"].to_numpy(), g["SOH"].to_numpy(), soh_eol_c)
+        k = knee_cached(ct[ct["Cell_ID"] == c], DATA_KEY, c)
+        fig.add_trace(go.Scatter(x=[0, n_last], y=[c, c], mode="lines", line=dict(color=P.grid, width=14),
+                                 showlegend=False, hovertemplate=f"{c}: {n_last} valid cycles<extra></extra>"))
+        for o in origins:
+            n0 = int(max(10, round(o * n_last)))
+            fig.add_trace(go.Scatter(x=[n0], y=[c], mode="markers", marker=dict(symbol="line-ns", size=22,
+                                     line=dict(color="#0072B2", width=3)), showlegend=False,
+                                     hovertemplate=f"origin {100 * o:.0f}%: train ≤ {n0}, test after<extra></extra>"))
+        if k.get("found"):
+            fig.add_trace(go.Scatter(x=[k["knee_n"]], y=[c], mode="markers", marker=dict(symbol="star", size=12, color="#CC79A7"),
+                                     showlegend=False, hovertemplate="knee (Diagnostics) at n = %{x}<extra></extra>"))
+        if eol_c is not None:
+            fig.add_trace(go.Scatter(x=[eol_c], y=[c], mode="markers", marker=dict(symbol="x", size=11, color=P.eol),
+                                     showlegend=False, hovertemplate="end of life at n = %{x}<extra></extra>"))
+    fig.update_xaxes(title_text="Discharge cycle n")
+    fig.update_yaxes(autorange="reversed")
+    return style_fig(fig, P, 120 + 34 * len(cells), "Evaluation plan: each battery is held out in turn (blue = forecast origins, "
+                     "★ = knee, × = end of life)", hovermode="closest")
+
+
+def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
+    d = sb.iloc[::-1]
+    fig = go.Figure(go.Bar(y=d.index, x=d["RMSE (SOH pts)"], orientation="h",
+                           marker=dict(color=[FAMILY_COLORS.get(f, P.text) for f in d["Family"]]),
+                           error_x=dict(type="data", array=d["95% CI ±"].fillna(0), color=P.muted),
+                           customdata=np.column_stack([d["Family"], d["Batteries"], d["vs best baseline"]]),
+                           hovertemplate="%{y}<br>%{x:.2f} ± CI SOH points<br>%{customdata[0]} · %{customdata[1]} batteries"
+                                         "<br>%{customdata[2]}<extra></extra>"))
+    bb = sb.attrs.get("best_baseline")
+    if bb in sb.index:
+        fig.add_vline(x=float(sb.loc[bb, "RMSE (SOH pts)"]), line_dash="dash", line_color=P.muted,
+                      annotation_text=f"best baseline: {bb}", annotation_font=dict(color=P.muted))
+    fig.update_xaxes(title_text="Forecast error, RMSE (SOH points), mean over held-out batteries ± 95% CI", rangemode="tozero")
+    return style_fig(fig, P, 140 + 36 * len(sb), "Scoreboard: every model, same batteries, same protocol",
+                     hovermode="closest")
+
+
+def _wf_state() -> Dict[str, Any]:
+    return st.session_state.setdefault("wf", {"cfg": None, "res": pd.DataFrame(), "est": None, "partial": None})
+
+
+def _wf_merge(new: pd.DataFrame) -> None:
+    w = _wf_state()
+    old = w["res"]
+    if len(old):
+        old = old[~old["key"].isin(new["key"].unique())]
+    w["res"] = pd.concat([old, new], ignore_index=True)
+
+
+def _wf_run(keys: Sequence[str], cfg: Dict[str, Any], label: str) -> None:
+    prog = st.progress(0.0, text=label)
+    res = te.run_protocol(store, ct, imp, cfg["cells"], list(keys), cfg["origins"], float(eol_ah),
+                          progress=lambda f, m: prog.progress(min(max(float(f), 0.0), 1.0), text=m))
+    prog.empty()
+    _wf_merge(res)
+    bad = res[res["status"] != "ok"]
+    if len(bad):
+        st.warning(f"{len(bad)} of {len(res)} runs failed (kept on the scoreboard as failures): "
+                   + "; ".join(sorted(set(bad["status"].str[:70]))[:3]))
+
+
 def view_models() -> None:
     recommendations("models")
+    st.markdown("A single, reproducible workflow. **Step 1** fixes which batteries, cycles and metrics are used; every "
+                "model in **steps 2–4** is evaluated with exactly that set-up; **step 5** puts all results in one "
+                "scoreboard with confidence intervals and an honest verdict against the baselines.")
+    groups = te.condition_groups(ct)
+    usable = [g for g in te.GROUP_ORDER if g in set(groups["Group"]) and g not in te.V2_EXCLUDED_GROUPS]
+    # ------------------------------------------------------------------ step 1
+    section("Step 1 · Set-up: batteries, cycles and how results are scored")
+    my = groups.loc[cell, "Group"] if cell in groups.index and groups.loc[cell, "Group"] in usable else (usable[0] if usable else None)
+    if my is None:
+        st.warning("No usable condition group (mixed, corrupted and pulsed cells are excluded).")
+        return
+    c1, c2 = st.columns(2)
+    grp = c1.selectbox("Condition group (from Diagnostics)", usable, index=usable.index(my), key="wf_group",
+                       format_func=lambda g: f"{g} · {len(te.protocol_cells(ct, g))} usable batteries")
+    allc = te.protocol_cells(ct, grp)
+    cells = c2.multiselect("Batteries in the evaluation", allc, default=allc, key=f"wf_cells_{grp}",
+                           format_func=lambda c: cell_label(c, meta))
+    origins = st.multiselect("Forecast origins (share of each battery's recorded life)", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+                             default=[0.3, 0.5, 0.7], key="wf_origins", format_func=lambda v: f"{100 * v:.0f}%")
+    if len(cells) < 3 or not origins:
+        st.warning("Choose at least three batteries and one origin: with fewer batteries there is nothing to learn from "
+                   "when one is held out.")
+        return
+    cfg = {"group": grp, "cells": tuple(cells), "origins": tuple(sorted(origins)), "eol": float(eol_ah)}
+    w = _wf_state()
+    if w["cfg"] != cfg:
+        if w["cfg"] is not None and len(w["res"]):
+            st.info("The set-up changed: previous results were cleared so that every model is scored the same way.")
+        w.update({"cfg": cfg, "res": pd.DataFrame(), "est": None, "partial": None})
+    show(fig_wf_timeline(cells, cfg["origins"], P), key="wf_timeline", export=False)
+    rows = []
+    fs, _ = fleet_cached(ct, DATA_KEY, float(eol_ah), asdict(te.SafetyLimits()))
+    for c in cells:
+        d = ct[ct["Cell_ID"] == c]
+        rows.append({"Battery": c, "valid cycles": int((~d["outlier"]).sum()), "excluded cycles": int(d["outlier"].sum()),
+                     "recovery jumps": int(d["regen"].sum()) if "regen" in d else 0,
+                     "risk (Diagnostics)": fs.loc[c, "Risk"] if c in fs.index else "—",
+                     "SOH now": float(fs.loc[c, "SOH"]) if c in fs.index else np.nan})
+    show_table(pd.DataFrame(rows).set_index("Battery").style.format({"SOH now": "{:.1%}"}, na_rep="—"),
+               note="Protocol: each battery is held out in turn and forecast from each origin using only its own cycles "
+                    "up to the origin plus the other batteries of the group; it is scored on all its later measured "
+                    f"cycles. Errors in SOH points; end of life = {float(eol_ah):.2f} Ah for 3 consecutive cycles; "
+                    "recovery jumps are removed from the training data, never from the test data.")
+    n_runs = len(cells) * len(cfg["origins"])
+    # ------------------------------------------------------------------ step 2
+    section("Step 2 · Baselines: the bar every model must beat")
+    st.markdown("Three references that need no learning: **persistence** (SOH stays where it is), **linear trend** "
+                "(the recent slope continues) and **fleet shape** (the typical fade curve of the other batteries in "
+                "the group, placed at this battery's state and speed).")
+    if st.button(f"Run baselines ({3 * n_runs} forecasts)", key="wf_base", type="primary", icon=":material/flag:"):
+        _wf_run(["persistence", "trend", "shape"], cfg, "Baselines")
+    res = w["res"]
+    if len(res) and res["family"].eq("Baselines").any():
+        sbb = te.protocol_scoreboard(res[res["family"] == "Baselines"])
+        show_table(sbb[["Batteries", "RMSE (SOH pts)", "95% CI ±", "EOL |error| (cycles)", "Coverage"]].style.format(
+            {"RMSE (SOH pts)": "{:.2f}", "95% CI ±": "{:.2f}", "EOL |error| (cycles)": "{:.1f}", "Coverage": "{:.0%}"}, na_rep="—"),
+            note=f"The best baseline ({sbb.attrs.get('best_baseline')}) is the reference in steps 4–5: a model is "
+                 "only worth using if it beats it on the same batteries.")
+    else:
+        placeholder("Run the baselines first: they define the reference for every later step.")
+    # ------------------------------------------------------------------ step 3
+    section("Step 3 · SOH now: estimating today's health without a capacity test")
+    hi = hi_rank_cached(ct, imp, DATA_KEY)
+    ranked = [k for k in hi.index if k not in te.CAPACITY_LEAKS] if hi is not None and len(hi) else list(te.DEFAULT_EST_FEATURES)
+    c1, c2 = st.columns(2)
+    feats = c1.multiselect("Indicators (ranked in Diagnostics, capacity-derived ones excluded)", ranked,
+                           default=ranked[:5], key="wf_feats",
+                           format_func=lambda k: te.HI_CATALOG[k].name if k in te.HI_CATALOG else k)
+    est_models = c2.multiselect("Models", list(te.available_models()),
+                                default=[m for m in ("Bayesian Ridge", "Gaussian Process", "Random Forest") if m in te.available_models()],
+                                key="wf_est_models")
+    b1, b2 = st.columns(2)
+    if b1.button("Estimate SOH now (each battery held out)", key="wf_est", icon=":material/monitor_heart:",
+                 disabled=not (feats and est_models)):
+        with st.spinner("Leave-one-battery-out estimation…"):
+            w["est"] = te.estimation_protocol(ct, imp, cells, est_models, feats)
+    if b2.button("Real-time SOH from partial discharges", key="wf_part", icon=":material/bolt:"):
+        with st.spinner("Leave-one-battery-out, partial discharges…"):
+            w["partial"] = te.partial_group_study(ct, groups=[grp])
+    if w.get("est") is not None and len(w["est"]):
+        e = w["est"][w["est"]["status"] == "ok"].groupby("model")["RMSE (SOH pts)"].agg(["mean", "std", "count"])
+        e["95% CI ±"] = 1.96 * e["std"] / np.sqrt(e["count"].clip(lower=1))
+        show_table(e.rename(columns={"mean": "RMSE (SOH pts)", "count": "Batteries"})[["Batteries", "RMSE (SOH pts)", "95% CI ±"]]
+                   .sort_values("RMSE (SOH pts)").style.format({"RMSE (SOH pts)": "{:.2f}", "95% CI ±": "{:.2f}"}),
+                   note="Error of today's SOH estimated from the chosen indicators on a battery the model never saw.")
+    if w.get("partial") is not None and len(w["partial"]):
+        show_table(w["partial"].style.format({"MAE at 50% (SOH pts)": "{:.2f}", "MAE full curve": "{:.2f}",
+                                              "depth for ≤ 1%": lambda v: "never" if v is None or not np.isfinite(v) else f"{100 * v:.0f}%",
+                                              "depth for ≤ 2%": lambda v: "never" if v is None or not np.isfinite(v) else f"{100 * v:.0f}%",
+                                              "coverage": "{:.0%}"}, na_rep="never"),
+                   note="How much of a discharge is needed before SOH is known within 1 or 2 points (field use).")
+    # ------------------------------------------------------------------ step 4
+    section("Step 4 · Forecast models, family by family")
+    av = te.available_models()
+    c = st.columns(4)
+    sel: List[str] = []
+    if c[0].toggle("Statistical / Bayesian", value=True, key="wf_f_stat"):
+        sel.append("hb")
+    ml = c[1].multiselect("Machine learning (ML v2)", [m for m in av], default=[m for m in ("Bayesian Ridge", "Random Forest", "SVM") if m in av],
+                          key="wf_f_ml")
+    sel += [f"ml:{m}" for m in ml]
+    deep = c[2].multiselect("Deep learning (slow)", ["GRU (recurrent network)", "Transformer (self-attention)"], default=[],
+                            key="wf_f_deep")
+    sel += [f"deep:{m}" for m in deep]
+    phys = c[3].multiselect("Physics", ["spm", "pinn"], default=["spm"], key="wf_f_phys",
+                            format_func={"spm": "Single-particle model + SEI", "pinn": "Mechanistic PINN (slow)"}.get)
+    sel += phys
+    sec_per = {"hb": 1, "spm": 4, "pinn": 20}
+    est_s = n_runs * sum(sec_per.get(k, 25 if k.startswith("deep:") else 6) for k in sel)
+    if st.button(f"Run selected models ({len(sel) * n_runs} forecasts, ≈ {max(1, est_s // 60)} min)", key="wf_models",
+                 type="primary", icon=":material/play_arrow:", disabled=not sel or not len(res)):
+        _wf_run(sel, cfg, "Forecast models")
+    if not len(res):
+        st.caption("Run the baselines (step 2) first.")
+    # ------------------------------------------------------------------ step 5
+    section("Step 5 · Scoreboard and verdict")
+    res = w["res"]
+    if not len(res):
+        placeholder("Results appear here as soon as step 2 has run.")
+    else:
+        sb = te.protocol_scoreboard(res)
+        st.session_state["wf_scoreboard"] = sb
+        show(fig_scoreboard(sb, P), key="wf_board", data=sb.reset_index())
+        show_table(sb.style.format({"RMSE (SOH pts)": "{:.2f}", "95% CI ±": "{:.2f}", "EOL |error| (cycles)": "{:.1f}",
+                                    "Coverage": "{:.0%}", "p (Wilcoxon)": "{:.3f}"}, na_rep="—"),
+                   note="RMSE averaged per battery first, then across batteries (95% CI). 'vs best baseline' is a paired "
+                        "comparison on the same batteries (Wilcoxon when ≥ 5 batteries). Coverage should be near 90%.")
+        best = sb.index[0]
+        bb = sb.attrs.get("best_baseline")
+        better = sb[sb["vs best baseline"] == "better than baseline"]
+        verdict = (f"In the **{grp}** group ({len(cells)} batteries, origins {', '.join(f'{100 * o:.0f}%' for o in cfg['origins'])}), "
+                   f"the lowest error is **{best}** ({sb.loc[best, 'RMSE (SOH pts)']:.2f} ± {sb.loc[best, '95% CI ±']:.2f} SOH points). ")
+        verdict += (f"Models significantly better than the best baseline ({bb}): " + ", ".join(better.index) + "."
+                    if len(better) else f"No model is significantly better than the best baseline ({bb}) with these batteries.")
+        card("Verdict", [verdict])
+        by_o = res[res["status"] == "ok"].groupby(["model", "origin"])["RMSE (SOH pts)"].mean().unstack()
+        by_o.columns = [f"from {100 * o:.0f}%" for o in by_o.columns]
+        show_table(by_o.loc[[m for m in sb.index if m in by_o.index]].style.format("{:.2f}", na_rep="—"),
+                   note="Error by forecast origin: forecasts from later origins should be more accurate.")
+        download("Download all protocol results (CSV)", res.to_csv(index=False).encode(), f"forecast_protocol_{grp}.csv",
+                 "text/csv", key="wf_csv")
+    # ------------------------------------------------------------------ advanced
+    st.markdown("---")
+    if st.toggle("Advanced single-battery tools (learning ladder, ML workbench, real-time section)", value=False,
+                 key="wf_adv"):
+        legacy_models_view()
+
+
+def legacy_models_view() -> None:
     section("Learning ladder: from simple references to first principles")
     sc = scheme_controls()
     if not sc["targets"]:
