@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.6.0"
+ENGINE_VERSION = "5.7.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -7269,3 +7269,225 @@ def ml_v2_ensemble(members: Sequence["V2Forecast"], ct: pd.DataFrame, eol_ah: fl
     fc = ProgForecast("ML ensemble (v2)", grid, mean, mean - half, mean + half, None,
                       {"weights": {m.model: float(x) for m, x in zip(ms, w)}})
     return _v2_finish(fc, ct, ms[0].cell_id, ms[0].n0, eol_ah, "ML ensemble (v2)", alpha)
+
+
+# =============================================================================
+# 31. REAL-TIME SOH FROM PARTIAL DISCHARGES (after Qin, Arunan & Yuen, IEEE TII 19(5), 2023)
+# =============================================================================
+# A discharge in progress is described by the charge delivered at each fixed voltage it has already passed
+# (the stored Q(V) grid, 3.95 V -> 3.10 V). For a constant-current discharge this voltage-domain alignment is an
+# energy-preserving synchronisation of cycles of different length (the role of EDTW in the paper) that needs
+# no optimisation. "Depth" j = number of grid voltages reached so far.
+PARTIAL_DEPTHS = (4, 8, 12, 16, 20, 24, 28, 35)          # depth buckets (grid points reached)
+PARTIAL_METHODS = {"direct": "Direct (one model per discharge depth)",
+                   "knn": "Nearest-cycle reconstruction (paper, k = 5)"}
+
+
+def partial_table(ct: pd.DataFrame, cells: Sequence[str], max_n: Optional[Dict[str, int]] = None,
+                  min_n: Optional[Dict[str, int]] = None) -> pd.DataFrame:
+    """One row per valid discharge: Q at every grid voltage (Ah), capacity label, C_bol and cell id.
+    Cycles outside [min_n, max_n] of a cell are left out (used to split one battery into train / test)."""
+    rows = []
+    for c in cells:
+        d = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
+        if QV_COLS[0] not in d or d.empty:
+            continue
+        if max_n and c in max_n:
+            d = d[d["n"] <= max_n[c]]
+        if min_n and c in min_n:
+            d = d[d["n"] > min_n[c]]
+        d = d.dropna(subset=QV_COLS[:2] + ["Capacity_Ah"])
+        if d.empty:
+            continue
+        d = d.assign(I_set=float(d["I_dis_A"].median()), V_cut_set=float(d["V_min_V"].median()))
+        rows.append(d[["Cell_ID", "n", "Capacity_Ah", "C_bol_Ah", "SOH", "I_set", "V_cut_set"] + QV_COLS])
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def _prefix_X(Q: np.ndarray, j: int, S: Optional[np.ndarray] = None) -> np.ndarray:
+    """Features of a discharge after reaching the first j grid voltages: the Q values, their increments
+    (incremental capacity between grid voltages: the ICA information) and the discharge settings known
+    beforehand (S: current, cut-off voltage), which decide how much charge remains below the last grid point."""
+    q = np.nan_to_num(Q[:, :j], nan=0.0)
+    dq = np.diff(np.concatenate([np.zeros((len(q), 1)), q], axis=1), axis=1)
+    return np.hstack([q, dq] + ([S] if S is not None else []))
+
+
+def voltage_importance(tab: pd.DataFrame, threshold: float = 0.35) -> pd.DataFrame:
+    """Paper's time-attention importance in the voltage domain: spread of Q(V) across cycles at each grid
+    voltage, normalised by its maximum (I(V) = Var_cycles Q(V) / max). Also |correlation| of Q(V) with the
+    capacity label, which shows where the ageing information actually sits. 'important' = I >= threshold."""
+    Q = tab[QV_COLS].to_numpy(float)
+    var = np.nanvar(Q, axis=0)
+    cap = tab["Capacity_Ah"].to_numpy(float)
+    corr = [abs(float(pd.Series(Q[:, j]).corr(pd.Series(cap)))) if np.isfinite(Q[:, j]).sum() > 5 else np.nan
+            for j in range(Q.shape[1])]
+    imp = var / np.nanmax(var) if np.nanmax(var) > 0 else var
+    frac = np.nanmedian(Q / cap[:, None], axis=0)
+    return pd.DataFrame({"V": QV_GRID, "depth": np.arange(1, len(QV_GRID) + 1), "importance": imp,
+                         "abs_corr_with_capacity": corr, "fraction_discharged": frac, "important": imp >= threshold})
+
+
+@dataclass
+class PartialSOHEstimator:
+    """Real-time capacity estimator for discharges in progress. method='direct': one regressor per depth
+    bucket, trained on exactly the information available at that depth. method='knn': the paper's
+    reconstruction: the k training cycles closest to the partial curve (Euclidean on the reached points) lend
+    their remaining curve (shifted to join continuously), and the full-depth model is applied to each
+    reconstruction; the spread across neighbours gives the band. Bands are split-conformal per depth."""
+    model_name: str = "Random Forest"
+    method: str = "direct"
+    k: int = 5
+    level: float = 0.9
+    seed: int = 0
+    models: Dict[int, Any] = field(default_factory=dict)
+    q_conf: Dict[int, float] = field(default_factory=dict)
+    library: Optional[np.ndarray] = None
+    train_cells: List[str] = field(default_factory=list)
+
+    def _fit_depth(self, X: np.ndarray, y: np.ndarray) -> Any:
+        Xs, ys, _ = _gp_subsample(self.model_name, X, y, np.ones(len(y)), self.seed)
+        # up to ~70 inputs: a polynomial expansion would explode (degree 3 -> tens of thousands of terms)
+        prm = {"degree": 1} if MODEL_SPECS[self.model_name].poly else None
+        return _StandardisedTarget(make_model(self.model_name, self.seed, prm)).fit(Xs, ys)
+
+    def fit(self, tab: pd.DataFrame) -> "PartialSOHEstimator":
+        if len(tab) < 30:
+            raise ValueError("partial-discharge estimator: fewer than 30 training discharges")
+        Q = tab[QV_COLS].to_numpy(float)
+        S = tab[["I_set", "V_cut_set"]].to_numpy(float)
+        y = tab["Capacity_Ah"].to_numpy(float)
+        g = tab["Cell_ID"].to_numpy()
+        self.train_cells = sorted(set(g))
+        self.library = np.nan_to_num(Q, nan=0.0)
+        self.library_S = S
+        rng = np.random.default_rng(self.seed)
+        cells = np.array(self.train_cells)
+        if len(cells) >= 3:                                  # split-conformal calibration by battery
+            cal = np.isin(g, rng.choice(cells, size=max(1, len(cells) // 3), replace=False))
+        else:
+            cal = rng.random(len(y)) < 0.2
+        full = len(QV_COLS)
+        depths = PARTIAL_DEPTHS if self.method == "direct" else (full,)
+        cal_models = {}
+        for jd in depths:
+            cal_models[jd] = self._fit_depth(_prefix_X(Q[~cal], jd, S[~cal]), y[~cal])
+            if self.method == "direct":
+                r = np.abs(cal_models[jd].predict(_prefix_X(Q[cal], jd, S[cal])) - y[cal])
+                self.q_conf[jd] = float(np.quantile(r, min(1.0, self.level * (1 + 1 / max(len(r), 1)))))
+            self.models[jd] = self._fit_depth(_prefix_X(Q, jd, S), y)
+        if self.method == "knn":
+            # calibrate the reconstruction route on held-out batteries, neighbours drawn from the other batteries
+            idx = np.nonzero(cal)[0]
+            idx = idx[rng.permutation(len(idx))[:200]]
+            lib_mask = ~cal
+            for jd in PARTIAL_DEPTHS:
+                mu = self._knn_batch(Q[idx], S[idx], jd, cal_models[full], lib_mask)[0]
+                r = np.abs(mu - y[idx])
+                self.q_conf[jd] = float(np.quantile(r, min(1.0, self.level * (1 + 1 / max(len(r), 1))))) if len(r) else 0.05
+        return self
+
+    def _bucket(self, j: int) -> int:
+        ok = [d for d in PARTIAL_DEPTHS if d <= j]
+        return ok[-1] if ok else PARTIAL_DEPTHS[0]
+
+    def _knn_batch(self, Qp: np.ndarray, Sp: np.ndarray, j: int, model: Any,
+                   lib_mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Batched reconstruction for many partial curves: k nearest library cycles on the first j points (same
+        settings preferred), their remainder shifted to join continuously, full-curve model on each, mean and sd."""
+        lib = self.library if lib_mask is None else self.library[lib_mask]
+        libS = self.library_S if lib_mask is None else self.library_S[lib_mask]
+        q = np.nan_to_num(Qp[:, :j], nan=0.0)
+        d2 = ((q[:, None, :] - lib[None, :, :j]) ** 2).sum(axis=2)
+        d2 = d2 + 10.0 * ((Sp[:, None, :] - libS[None, :, :]) ** 2).sum(axis=2)   # prefer the same settings
+        nn = np.argsort(d2, axis=1)[:, : self.k]
+        full = lib.shape[1]
+        R = np.empty((len(q) * self.k, full))
+        SR = np.repeat(Sp, self.k, axis=0)
+        for a in range(len(q)):
+            for b, i in enumerate(nn[a]):
+                tail = lib[i, j:] - lib[i, j - 1] + q[a, -1] if j < full else np.array([])
+                R[a * self.k + b] = np.concatenate([q[a], tail])
+        p = model.predict(_prefix_X(R, full, SR)).reshape(len(q), self.k)
+        return p.mean(axis=1), p.std(axis=1)
+
+    def predict(self, q_full: np.ndarray, j: int, settings: Optional[np.ndarray] = None) -> Tuple[float, float, float]:
+        """Capacity estimate (Ah) and band after reaching the first j grid voltages."""
+        j = int(np.clip(j, 1, len(QV_COLS)))
+        b = self._bucket(j)
+        q = np.asarray(q_full, float)[None, :]
+        S = np.asarray(settings if settings is not None else [2.0, 2.7], float)[None, :]
+        if self.method == "knn":
+            mu, sd = self._knn_batch(q, S, j, self.models[len(QV_COLS)])
+            mu, sd = float(mu[0]), float(sd[0])
+            half = max(self.q_conf.get(b, 0.05), 1.645 * sd)
+        else:
+            mu = float(self.models[b].predict(_prefix_X(q, b, S))[0])
+            half = self.q_conf.get(b, 0.05)
+        return mu, mu - half, mu + half
+
+    def predict_table(self, tab: pd.DataFrame, j: int) -> np.ndarray:
+        """Batched estimates (n x 3: mean, lo, hi) for many discharges at depth j."""
+        Q = tab[QV_COLS].to_numpy(float)
+        S = tab[["I_set", "V_cut_set"]].to_numpy(float)
+        b = self._bucket(j)
+        if self.method == "knn":
+            mu, sd = self._knn_batch(Q, S, j, self.models[len(QV_COLS)])
+            half = np.maximum(self.q_conf.get(b, 0.05), 1.645 * sd)
+        else:
+            mu = self.models[b].predict(_prefix_X(Q, b, S))
+            half = np.full(len(mu), self.q_conf.get(b, 0.05))
+        return np.column_stack([mu, mu - half, mu + half])
+
+
+def partial_depth_evaluation(est: PartialSOHEstimator, tab: pd.DataFrame) -> pd.DataFrame:
+    """Error vs discharge depth on test discharges (the paper's Fig. 11, in the voltage domain): MAE and RMSE
+    of the capacity estimate in SOH points (% of each battery's initial capacity) and band coverage."""
+    rows = []
+    Q = tab[QV_COLS].to_numpy(float)
+    y = tab["Capacity_Ah"].to_numpy(float)
+    cb = tab["C_bol_Ah"].to_numpy(float)
+    frac = np.nanmedian(Q / y[:, None], axis=0)
+    for j in PARTIAL_DEPTHS:
+        pr = est.predict_table(tab, j)
+        e = (pr[:, 0] - y) / cb * 100
+        inside = (y >= pr[:, 1]) & (y <= pr[:, 2])
+        rows.append({"depth": j, "V reached": float(QV_GRID[j - 1]), "fraction discharged": float(frac[j - 1]),
+                     "MAE (SOH %)": float(np.mean(np.abs(e))), "RMSE (SOH %)": float(np.sqrt(np.mean(e ** 2))),
+                     "coverage": float(np.mean(inside)), "discharges": len(tab)})
+    return pd.DataFrame(rows)
+
+
+def depth_needed(ev: pd.DataFrame, tol: float) -> Optional[float]:
+    """Smallest fraction of the discharge after which the MAE stays below `tol` SOH points (None if never)."""
+    ok = ev["MAE (SOH %)"].to_numpy() <= tol
+    for i in range(len(ok)):
+        if ok[i:].all():
+            return float(ev["fraction discharged"].iloc[i])
+    return None
+
+
+def realtime_soh_curve(est: PartialSOHEstimator, row: pd.Series) -> pd.DataFrame:
+    """Within-cycle replay of one discharge (the paper's Fig. 10): SOH estimate and band after each grid
+    voltage reached, against the cycle's true end-of-discharge SOH."""
+    q = row[QV_COLS].to_numpy(float)
+    cap, cb = float(row["Capacity_Ah"]), float(row["C_bol_Ah"])
+    S = np.array([row["I_set"], row["V_cut_set"]], float)
+    out = []
+    for j in range(1, len(QV_COLS) + 1):
+        if not np.isfinite(q[j - 1]):
+            break
+        mu, lo, hi = est.predict(q, j, S)
+        out.append({"depth": j, "V": float(QV_GRID[j - 1]), "fraction discharged": float(q[j - 1] / cap),
+                    "SOH estimate": mu / cb, "lo": lo / cb, "hi": hi / cb, "SOH true": cap / cb})
+    return pd.DataFrame(out)
+
+
+def fit_partial_estimator(ct: pd.DataFrame, train_cells: Sequence[str], model_name: str = "Random Forest",
+                          method: str = "direct", target: Optional[str] = None, n0: Optional[int] = None,
+                          level: float = 0.9, seed: int = 0) -> PartialSOHEstimator:
+    """Fit on the training batteries' discharges, plus the target battery's own discharges up to n0 when given
+    (within-battery scheme). The target's later discharges are the test set."""
+    cells = list(dict.fromkeys(list(train_cells) + ([target] if target and n0 else [])))
+    tab = partial_table(ct, cells, max_n={target: n0} if target and n0 else None)
+    return PartialSOHEstimator(model_name, method, level=level, seed=seed).fit(tab)

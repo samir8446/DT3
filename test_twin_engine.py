@@ -1005,6 +1005,37 @@ def test_ml_push_shapley_ica_selection_augmentation_monotone_bayes():
         sys.modules.pop(n, None)
 
 
+def test_partial_discharge_estimator_depth_causality_and_split():
+    m, imp, _ = te.make_synthetic_master(n_cells=6, n_cycles=90, ambients=(24, 24, 24, 34, 24, 34), seed=0, noise_v=0.01)
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    train, test = ["S001", "S002", "S004", "S005"], ["S003", "S006"]
+    tab = te.partial_table(ct, test)
+    for method in te.PARTIAL_METHODS:
+        est = te.fit_partial_estimator(ct, train, "Bayesian Ridge", method)
+        ev = te.partial_depth_evaluation(est, tab)
+        mae = ev["MAE (SOH %)"].to_numpy()
+        assert mae[-1] < mae[0] and mae[-1] < 1.0                      # more of the discharge -> better
+        assert ev["coverage"].mean() > 0.6 and set(est.train_cells) == set(train)
+    est = te.fit_partial_estimator(ct, train, "Bayesian Ridge", "direct")
+    row = tab.iloc[30]
+    q = row[te.QV_COLS].to_numpy(float).copy()
+    S = np.array([row["I_set"], row["V_cut_set"]])
+    a = est.predict(q, 12, S)
+    q2 = q.copy()
+    q2[12:] += 0.5                                                      # change only the part not yet reached
+    assert np.allclose(a, est.predict(q2, 12, S))                       # real-time: no use of unseen voltages
+    cur = te.realtime_soh_curve(est, row)
+    assert len(cur) == len(te.QV_COLS) and (cur["lo"] <= cur["SOH estimate"] + 1e-12).all()
+    # within-battery split: the target's later discharges never enter training
+    est_w = te.fit_partial_estimator(ct, train, "Bayesian Ridge", "direct", target="S003", n0=40)
+    assert "S003" in est_w.train_cells
+    tr = te.partial_table(ct, ["S003"], max_n={"S003": 40})
+    te_tab = te.partial_table(ct, ["S003"], min_n={"S003": 40})
+    assert tr["n"].max() <= 40 < te_tab["n"].min()
+    vi = te.voltage_importance(te.partial_table(ct, train))
+    assert len(vi) == len(te.QV_COLS) and vi["importance"].max() == 1.0
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

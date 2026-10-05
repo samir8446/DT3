@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.6"
+REQUIRED_ENGINE = "5.7"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -566,6 +566,9 @@ EXPLAIN: Dict[str, str] = {
     "lad_board": "All models run so far on this battery and forecast origin, from the simplest to the most advanced, scored on the same future cycles. The best is highlighted.",
     "ml_fig": "Forecasts of the selected ML models from the forecast origin (dotted line), with their uncertainty bands, against the measured SOH.",
     "ml_v2_fig": "ML v2 forecasts: each battery's own recent trend, corrected by what the models learned from the training batteries about acceleration and knees.",
+    "pt_depth": "Error of the real-time SOH estimate against how much of the discharge has run (test batteries only). The lower and the further left a curve crosses the 1% line, the earlier a partial discharge reveals the battery's health.",
+    "pt_vi": "Where the ageing information sits within a discharge: blue = how much the charge delivered at each voltage varies over the battery's life (the paper's attention), purple = how strongly it tracks capacity. The highlighted window is what the estimators rely on.",
+    "pt_cycle": "One discharge replayed sample by sample: the estimate (blue) and its 90% band converge towards the true end-of-discharge SOH (dashed, grey = ±1%) as more of the curve is seen.",
     "ml_v2_shap": "Shapley values: how much each measurement pushed this battery's forecast (SOH change at +40 cycles) above (blue) or below (purple) the average forecast. They add up to the difference from the average.",
     "ml_v2_imp": "Which measurements drive the v2 forecast: how much the error grows when one feature is shuffled (on held-out batteries, 40-cycle horizon). This answers which variables are most informative.",
     "ml_board": "Leaderboard of the ML models on the held-out cycles (fade skill: 1 = perfect, 0 = no better than assuming no further fade).",
@@ -4811,6 +4814,132 @@ def ladder_leaderboard() -> None:
         st.rerun()
 
 
+def fig_partial_depth(evs: Dict[str, pd.DataFrame], P: Palette) -> go.Figure:
+    fig = go.Figure()
+    for i, (name, ev) in enumerate(evs.items()):
+        col = CELL_COLORS[i % len(CELL_COLORS)]
+        fig.add_trace(go.Scatter(x=100 * ev["fraction discharged"], y=ev["MAE (SOH %)"], mode="lines+markers", name=name,
+                                 line=dict(color=col, width=2.6, dash=DASHES[i % len(DASHES)]), marker=dict(size=7),
+                                 customdata=np.column_stack([ev["V reached"], ev["coverage"]]),
+                                 hovertemplate="%{x:.0f}% discharged (V = %{customdata[0]:.2f})<br>MAE %{y:.2f} SOH points"
+                                               "<br>coverage %{customdata[1]:.0%}<extra>" + html.escape(name) + "</extra>"))
+    for tol, dash in ((1.0, "dash"), (2.0, "dot")):
+        fig.add_hline(y=tol, line_dash=dash, line_color=P.muted, annotation_text=f"{tol:.0f}% SOH",
+                      annotation_font=dict(color=P.muted))
+    fig.update_xaxes(title_text="Share of the discharge completed (%)", range=[0, 100])
+    fig.update_yaxes(title_text="Mean absolute SOH error (SOH points)", rangemode="tozero")
+    return style_fig(fig, P, 480, "How far must a discharge run before its SOH is known? (test batteries)")
+
+
+def fig_voltage_importance(vi: pd.DataFrame, P: Palette) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=vi["V"], y=vi["importance"], mode="lines+markers", name="Importance (spread across cycles)",
+                             line=dict(color="#0072B2", width=2.6), hovertemplate="%{x:.2f} V: %{y:.2f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=vi["V"], y=vi["abs_corr_with_capacity"], mode="lines+markers",
+                             name="|correlation| with capacity", line=dict(color="#AA4499", width=2.2, dash="dash"),
+                             hovertemplate="%{x:.2f} V: %{y:.2f}<extra></extra>"))
+    imp = vi[vi["important"]]
+    if len(imp):
+        fig.add_vrect(x0=float(imp["V"].min()), x1=float(imp["V"].max()), fillcolor=rgba("#56B4E9", 0.12), line_width=0,
+                      annotation_text="important window", annotation_font=dict(color=P.muted))
+    fig.update_xaxes(title_text="Voltage reached during the discharge (V)", autorange="reversed")
+    fig.update_yaxes(title_text="normalised value", range=[0, 1.05])
+    return style_fig(fig, P, 420, "Where in the discharge is the ageing information? (paper's time attention, in volts)")
+
+
+def fig_realtime_cycle(cur: pd.DataFrame, P: Palette, title: str) -> go.Figure:
+    fig = go.Figure()
+    x = 100 * cur["fraction discharged"]
+    add_band(fig, x.to_numpy(), cur["lo"].to_numpy(), cur["hi"].to_numpy(), "#0072B2", "90% band", group="est", alpha=0.18)
+    t = float(cur["SOH true"].iloc[0])
+    fig.add_hrect(y0=t - 0.01, y1=t + 0.01, fillcolor=rgba(P.muted, 0.12), line_width=0)
+    fig.add_hline(y=t, line_color=P.measured, line_dash="dash", annotation_text=f"true SOH {100 * t:.1f}% (end of discharge)",
+                  annotation_font=dict(color=P.measured))
+    fig.add_trace(go.Scatter(x=x, y=cur["SOH estimate"], mode="lines+markers", name="Real-time SOH estimate", legendgroup="est",
+                             line=dict(color="#0072B2", width=3), hovertemplate="%{x:.0f}% discharged: %{y:.2%}<extra></extra>"))
+    fig.update_xaxes(title_text="Share of the discharge completed (%)", range=[0, 100])
+    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%")
+    return style_fig(fig, P, 440, title)
+
+
+def partial_section() -> None:
+    section("Real-time SOH from partial discharges", icon=":material/bolt:")
+    st.markdown("Field batteries are rarely discharged completely. Following Qin, Arunan & Yuen (IEEE TII, 2023), the "
+                "app estimates capacity **while a discharge is still running**, from the part already seen. Discharges "
+                "are aligned on voltage (charge delivered at fixed voltages), the constant-current equivalent of the "
+                "paper's energy-preserving time warping. Two estimators: **direct** (one model per discharge depth) "
+                "and the paper's **nearest-cycle reconstruction**.")
+    sc = scheme()
+    if sc["mode"] == "within":
+        pool = te.v2_training_pool(ct, cell)
+        train, tests, n0 = pool, [cell], sc["n0"][cell]
+        st.caption(f"Within scheme: trained on {len(pool)} comparable batteries plus {cell}'s discharges up to cycle {n0}; "
+                   f"tested on {cell}'s later discharges.")
+    else:
+        train, tests, n0 = list(sc["train"]), list(sc["targets"]), None
+        st.caption(f"Trained on {len(train)} batteries' discharges, tested on all discharges of {len(tests)} other battery(ies).")
+    avail = list(te.available_models())
+    c1, c2 = st.columns(2)
+    mdls = c1.multiselect("Models", avail, default=[m for m in ("Bayesian Ridge", "Gaussian Process", "SVM", "LightGBM")
+                                                    if m in avail][:3], key="pt_models",
+                          help="Linear and kernel models extrapolate to unseen batteries; tree models cannot predict "
+                               "capacities outside the training range.")
+    meths = c2.multiselect("Estimators", list(te.PARTIAL_METHODS), default=["direct", "knn"], key="pt_methods",
+                           format_func=te.PARTIAL_METHODS.get)
+    if st.button("Train real-time estimators", key="pt_go", type="primary", icon=":material/bolt:",
+                 disabled=not (mdls and meths and train and tests)):
+        prog = st.progress(0.0)
+        out, k_ = {}, 0
+        test_tab = te.partial_table(ct, tests, min_n={cell: n0} if n0 else None)
+        for mdl in mdls:
+            for mt in meths:
+                prog.progress(k_ / (len(mdls) * len(meths)), text=f"{mdl} · {mt}")
+                k_ += 1
+                try:
+                    est = te.fit_partial_estimator(ct, train, mdl, mt, target=cell if n0 else None, n0=n0)
+                    out[f"{mdl} · {mt}"] = (est, te.partial_depth_evaluation(est, test_tab))
+                except Exception as exc:
+                    st.warning(f"{mdl} · {mt}: {exc}")
+        prog.empty()
+        vi = te.voltage_importance(te.partial_table(ct, train)) if train else None
+        st.session_state["partial"] = {"res": out, "test": test_tab, "vi": vi, "key": (DATA_KEY, tuple(train), tuple(tests), n0)}
+    saved = st.session_state.get("partial")
+    if not saved or not saved["res"]:
+        placeholder("Press 'Train real-time estimators': the error-vs-depth chart, the voltage importance and a "
+                    "within-cycle replay appear here.")
+        return
+    res, test_tab = saved["res"], saved["test"]
+    evs = {k: v[1] for k, v in res.items()}
+    show(fig_partial_depth(evs, P), key="pt_depth", data=pd.concat([e.assign(estimator=k) for k, e in evs.items()]))
+    rows = []
+    for k, ev in evs.items():
+        f = 100 * ev["fraction discharged"].to_numpy()
+        mae = ev["MAE (SOH %)"].to_numpy()
+        d1, d2 = te.depth_needed(ev, 1.0), te.depth_needed(ev, 2.0)
+        rows.append({"Estimator": k, "MAE at 25%": float(np.interp(25, f, mae)), "MAE at 50%": float(np.interp(50, f, mae)),
+                     "MAE at 75%": float(np.interp(75, f, mae)), "MAE full curve": float(mae[-1]),
+                     "≤ 1% from": f"{100 * d1:.0f}% discharged" if d1 is not None else "never",
+                     "≤ 2% from": f"{100 * d2:.0f}% discharged" if d2 is not None else "never",
+                     "Coverage": float(ev["coverage"].mean())})
+    tbl = pd.DataFrame(rows).set_index("Estimator").sort_values("MAE at 50%")
+    show_table(tbl.style.format({c: "{:.2f}" for c in tbl.columns if c.startswith("MAE")} | {"Coverage": "{:.0%}"})
+               .highlight_min(subset=["MAE at 50%"], props="background-color: rgba(0,114,178,0.22); font-weight: 700;"),
+               note="Errors in SOH points (% of each battery's initial capacity) on the test batteries' discharges, "
+                    "read at 25 / 50 / 75 % of the discharge. '≤ 1% from' is the depth after which the error stays "
+                    "within 1 SOH point: the headline result for field use.")
+    if saved.get("vi") is not None:
+        show(fig_voltage_importance(saved["vi"], P), key="pt_vi", export=False)
+    best = tbl.index[0]
+    est = res[best][0]
+    c1, c2 = st.columns([1, 2])
+    bat = c1.selectbox("Test battery", sorted(test_tab["Cell_ID"].unique()), key="pt_bat")
+    cyc = test_tab[test_tab["Cell_ID"] == bat].sort_values("n")
+    n_pick = c2.select_slider("Discharge (cycle n)", cyc["n"].astype(int).tolist(),
+                              value=int(cyc["n"].iloc[len(cyc) // 2]), key="pt_cyc")
+    cur = te.realtime_soh_curve(est, cyc[cyc["n"] == n_pick].iloc[0])
+    show(fig_realtime_cycle(cur, P, f"Within-cycle replay · {bat}, cycle {n_pick} · {best}"), key="pt_cycle", export=False)
+
+
 def view_models() -> None:
     recommendations("models")
     section("Learning ladder: from simple references to first principles")
@@ -4825,6 +4954,7 @@ def view_models() -> None:
     ladder_hybrid()
     ladder_first_principles()
     ladder_leaderboard()
+    partial_section()
     early_life_section()
     cross_cell_section()
 
