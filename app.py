@@ -5185,7 +5185,7 @@ def view_models() -> None:
     c1, c2 = st.columns(2)
     feats = c1.multiselect("Indicators (ranked in Diagnostics, capacity-derived ones excluded)", ranked,
                            default=ranked[:5], key="wf_feats",
-                           format_func=lambda k: te.HI_CATALOG[k].name if k in te.HI_CATALOG else k)
+                           format_func=lambda k: te.HI_CATALOG[k].label if k in te.HI_CATALOG else k)
     est_models = c2.multiselect("Models", list(te.available_models()),
                                 default=[m for m in ("Bayesian Ridge", "Gaussian Process", "Random Forest") if m in te.available_models()],
                                 key="wf_est_models")
