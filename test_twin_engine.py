@@ -132,7 +132,7 @@ def test_twin_forecast_band_and_rul_samples():
 # ------------------------------------------------------------------------ ML --
 def test_increment_ml_extrapolates_beyond_training_horizon():
     _, ct, _, _ = synthetic()
-    r = te.train_ml_forecast(ct, "S004", 36, "Extra Trees", strategy="increment")
+    r = te.train_ml_forecast(ct, "S004", 36, "Random Forest", strategy="increment")
     n_train_max = 90
     assert r.soh_pred[-1] < r.soh_pred[n_train_max - 1] - 0.01       # keeps fading past n = 90
     assert np.all(np.diff(r.soh_pred[36:]) <= 1e-12)                  # monotone forecast
@@ -140,7 +140,7 @@ def test_increment_ml_extrapolates_beyond_training_horizon():
 
 def test_conformal_band_brackets_point_forecast():
     _, ct, _, _ = synthetic()
-    r = te.train_ml_forecast(ct, "S002", 30, "Hist. Gradient Boosting", conformal_cells=3)
+    r = te.train_ml_forecast(ct, "S002", 30, "SVM", conformal_cells=3)
     assert r.soh_lo is not None and len(r.calibration_cells) == 3
     assert np.all(r.soh_lo <= r.soh_pred + 1e-12) and np.all(r.soh_pred <= r.soh_hi + 1e-12)
     assert r.metrics.coverage is not None and 0 <= r.metrics.coverage <= 1
@@ -417,14 +417,14 @@ def test_robust_baseline_repairs_crashed_logging_segment():
 def test_model_registry_all_models_and_param_validation():
     X = np.random.default_rng(0).normal(size=(60, 3))
     y = X[:, 0] - 0.5 * X[:, 1] ** 2
-    assert {"Decision Tree", "Random Forest", "Extra Trees", "Hist. Gradient Boosting", "Gaussian Process",
+    assert {"Decision Tree", "Random Forest", "Random Forest", "SVM", "Gaussian Process",
             "Bayesian Ridge"} <= set(te.ML_MODELS)
-    for name in te.ML_MODELS:
+    for name in te.available_models():
         m = te.make_model(name, 0, te.default_params(name)).fit(X, y)
         assert np.all(np.isfinite(m.predict(X))), name
     for bad in ({"n_estimators": 5}, {"nope": 1}):
         try:
-            te.validate_params("Extra Trees", bad)
+            te.validate_params("Random Forest", bad)
             raise AssertionError(f"accepted {bad}")
         except ValueError:
             pass
@@ -432,7 +432,7 @@ def test_model_registry_all_models_and_param_validation():
 
 def test_ml_forecast_hyperparams_and_cross_battery():
     _, ct, _, _ = synthetic()
-    f = te.train_ml_forecast(ct, "S004", 36, "Extra Trees", eol_ah=1.6, model_params={"n_estimators": 60})
+    f = te.train_ml_forecast(ct, "S004", 36, "Random Forest", eol_ah=1.6, model_params={"n_estimators": 60})
     assert np.isfinite(f.metrics.accuracy) and f.metrics.accuracy > 95 and f.metrics.fade_skill > 0.5
     x = te.train_ml_forecast(ct, "S004", 10, "Bayesian Ridge", eol_ah=1.6, train_cells=["S005"])
     assert np.isfinite(x.metrics.rmse)
@@ -447,7 +447,7 @@ def test_soh_estimator_splits_and_leakage_guard():
     _, ct, imp, _ = synthetic()
     for split, kw in (("random", {}), ("chronological", {}),
                       ("by_cell", {"train_cells": ["S001", "S002", "S003"], "test_cells": ["S004"]})):
-        r = te.train_soh_estimator(ct, imp, "Extra Trees", split=split, test_frac=0.3,
+        r = te.train_soh_estimator(ct, imp, "Random Forest", split=split, test_frac=0.3,
                                    params={"n_estimators": 60}, **kw)
         assert set(r.metrics.index) == {"train", "test"} and r.metrics.loc["test", "Cycles"] >= 3
         assert r.metrics.loc["test", "R²"] > 0 and len(r.importance) == len(r.features)
@@ -584,7 +584,7 @@ def test_hyperparameter_tuning_is_leakage_free_and_never_worse_on_validation():
                               test_cells=["S004"])
     assert e.best_score <= e.default_score + 1e-12 and "grouped" in e.validation
     rng = np.random.default_rng(0)
-    for name in te.ML_MODELS:
+    for name in te.available_models():
         te.validate_params(name, te.sample_params(name, rng))              # search space stays valid
 
 
@@ -845,9 +845,9 @@ def test_A5_single_dip_is_not_end_of_life():
 # ------------------------------------------------------------------ learning ladder (v5.2) --
 def test_ladder_registry_levels_and_optional_boosting():
     assert {"Decision Tree", "Random Forest"} <= set(te.ML_MODELS)
-    assert te.MODEL_SPECS["Decision Tree"].level == 1 and te.MODEL_SPECS["Hist. Gradient Boosting"].level == 3
+    assert te.MODEL_SPECS["Decision Tree"].level == 1 and te.MODEL_SPECS["XGBoost"].level == 3
     for name, pkg in te.OPTIONAL_ML.items():
-        assert (name in te.ML_MODELS) == te._has(pkg)                 # optional libraries appear only if installed
+        assert name in te.ML_MODELS and te.model_available(name) == te._has(pkg)   # listed; usable only if installed
 
 
 def test_baselines_are_valid_references():
@@ -912,7 +912,7 @@ def test_ml_v2_cleaning_causal_features_and_forecast():
     dc_past = te.clean_capacity(ct[(ct["Cell_ID"] == "S001") & (ct["n"] <= 30)])
     f_past = te.state_features(dc_past, 30, 2.0)
     assert abs(f_full["soh_now"] - f_past["soh_now"]) < 1e-12 and abs(f_full["soh_slope"] - f_past["soh_slope"]) < 1e-9
-    f = te.train_ml_v2(ct, "S002", 40, "Hist. Gradient Boosting", eol_ah=1.6)
+    f = te.train_ml_v2(ct, "S002", 40, "SVM", eol_ah=1.6)
     fut = f.n_grid > 40
     assert np.all(np.diff(f.soh_pred[fut]) <= 1e-12) and np.all((f.soh_pred >= 0) & (f.soh_pred <= 1.05))
     assert np.all(f.soh_lo[fut] <= f.soh_pred[fut] + 1e-12) and np.all(f.soh_hi[fut] >= f.soh_pred[fut] - 1e-12)
@@ -948,6 +948,31 @@ def test_deep_v2_multichannel_direct_horizons():
     m = f.n_grid > 36
     assert np.all(np.diff(f.soh[m]) <= 1e-12) and f.metrics.rmse < 0.1
     assert "correction trusted" in f.params and all(0 <= w <= 1 for w in f.params["correction trusted"].values())
+
+
+def test_xgboost_lightgbm_svm_integration_and_ensemble():
+    import importlib.util
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import xgb_shim
+    real = {n: importlib.util.find_spec(n) is not None for n in ("xgboost", "lightgbm")}
+    if not all(real.values()):
+        xgb_shim.install()                                    # integration test with a stand-in library
+    assert te.model_available("XGBoost") and te.model_available("LightGBM")
+    _, ct, _, _ = synthetic()
+    fs = [te.train_ml_v2(ct, "S004", 40, m, eol_ah=1.6) for m in ("XGBoost", "LightGBM", "SVM")]
+    for f in fs:
+        assert np.isfinite(f.metrics.rmse) and f.metrics.rmse < 0.06 and np.isfinite(f.cv_rmse)
+    v1 = te.train_ml_forecast(ct, "S004", 36, "XGBoost", eol_ah=1.6)
+    assert np.isfinite(v1.metrics.rmse)
+    tr = te.tune_ml_forecast(ct, "S004", 36, "LightGBM", n_iter=3, n_val=2)
+    assert tr.best_score <= tr.default_score + 1e-12
+    e = te.ml_v2_ensemble(fs, ct, 1.6)
+    assert abs(sum(e.params["weights"].values()) - 1) < 1e-9 and e.metrics.rmse <= max(f.metrics.rmse for f in fs) + 1e-9
+    assert "dq_logvar" in fs[0].features
+    for n in ("xgboost", "lightgbm"):
+        if not real[n]:
+            sys.modules.pop(n, None)
 
 
 if __name__ == "__main__":                            # minimal runner when pytest is absent

@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.4.0"
+ENGINE_VERSION = "5.5.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -950,13 +950,10 @@ MODEL_SPECS: Dict[str, ModelSpec] = {m.name: m for m in (
     ModelSpec("Random Forest", "Tree ensemble (bagging)", "Averages many decorrelated trees; robust default.",
               (_P("n_estimators", "Trees", "int", 300, 50, 1000), _P("max_depth", "Max depth (0 = none)", "int", 0, 0, 30),
                _P("min_samples_leaf", "Min samples per leaf", "int", 3, 1, 30)), scaled=False),
-    ModelSpec("Extra Trees", "Tree ensemble (bagging)", "Randomised split thresholds: smoother, less variance than RF.",
-              (_P("n_estimators", "Trees", "int", 400, 50, 1000), _P("max_depth", "Max depth (0 = none)", "int", 0, 0, 30),
-               _P("min_samples_leaf", "Min samples per leaf", "int", 2, 1, 30)), scaled=False),
-    ModelSpec("Hist. Gradient Boosting", "Tree ensemble (boosting)", "Histogram gradient boosting (scikit-learn); fast, handles NaN.",
-              (_P("max_iter", "Iterations", "int", 300, 50, 2000), _P("learning_rate", "Learning rate", "log", 0.05, 0.005, 0.5),
-               _P("max_leaf_nodes", "Leaves per tree", "int", 31, 4, 128), _P("l2_regularization", "L2 regularisation", "log", 1e-3, 1e-6, 10.0)),
-              scaled=False, level=3),
+    ModelSpec("SVM", "Kernel machine (support-vector regression)", "RBF / polynomial / linear kernel; robust epsilon-insensitive loss.",
+              (_P("C", "C (regularisation inverse)", "log", 10.0, 0.01, 1000.0), _P("epsilon", "Epsilon (tolerated error)", "log", 0.01, 1e-4, 0.5),
+               _P("gamma", "Kernel width γ", "log", 0.1, 1e-3, 10.0),
+               _P("kernel", "Kernel", "choice", "rbf", options=("rbf", "poly", "linear"))), scaled=True, level=2),
     ModelSpec("Gaussian Process", "Kernel / Bayesian", "Smooth non-parametric fit with native uncertainty (O(n³)).",
               (_P("length_scale", "Initial RBF length scale", "log", 1.0, 0.05, 20.0), _P("noise", "Initial noise level", "log", 0.1, 1e-4, 1.0),
                _P("restarts", "Optimiser restarts", "int", 1, 0, 5))),
@@ -972,9 +969,19 @@ MODEL_SPECS.update({m.name: m for m in (
               (_P("n_estimators", "Trees", "int", 400, 50, 2000), _P("learning_rate", "Learning rate", "log", 0.05, 0.005, 0.5),
                _P("num_leaves", "Leaves per tree", "int", 15, 4, 128), _P("min_child_samples", "Min samples per leaf", "int", 10, 2, 100)),
               scaled=False, level=3, requires="lightgbm"),
-) if _has(m.requires)})
+)})
 ML_MODELS = tuple(MODEL_SPECS)
 OPTIONAL_ML = {"XGBoost": "xgboost", "LightGBM": "lightgbm"}      # shown as "install to enable" when missing
+
+
+def model_available(name: str) -> bool:
+    """True when the model's library is importable (XGBoost / LightGBM are optional packages)."""
+    req = MODEL_SPECS[name].requires if name in MODEL_SPECS else ""
+    return not req or _has(req)
+
+
+def available_models() -> Tuple[str, ...]:
+    return tuple(m for m in ML_MODELS if model_available(m))
 # Removed in v4.5 (dominated on every benchmark, see README): Gradient Boosting (duplicate of the faster
 # histogram version), AdaBoost, Decision Tree, k-NN (cannot extrapolate), SVR and Kernel Ridge (a GP
 # without uncertainty).
@@ -1029,6 +1036,8 @@ def make_model(name: str, seed: int = 0, params: Optional[Dict[str, Any]] = None
     elif name == "Random Forest":
         est = E.RandomForestRegressor(n_estimators=p["n_estimators"], max_depth=depth(p["max_depth"]),
                                       min_samples_leaf=p["min_samples_leaf"], n_jobs=-1, random_state=seed)
+    elif name in OPTIONAL_ML and not _has(OPTIONAL_ML[name]):
+        raise ValueError(f"{name} is not installed on this server: add '{OPTIONAL_ML[name]}' to requirements.txt.")
     elif name == "XGBoost":
         from xgboost import XGBRegressor
         est = XGBRegressor(n_estimators=p["n_estimators"], learning_rate=p["learning_rate"], max_depth=p["max_depth"],
@@ -1038,13 +1047,9 @@ def make_model(name: str, seed: int = 0, params: Optional[Dict[str, Any]] = None
         from lightgbm import LGBMRegressor
         est = LGBMRegressor(n_estimators=p["n_estimators"], learning_rate=p["learning_rate"], num_leaves=p["num_leaves"],
                             min_child_samples=p["min_child_samples"], random_state=seed, verbose=-1)
-    elif name == "Extra Trees":
-        est = E.ExtraTreesRegressor(n_estimators=p["n_estimators"], max_depth=depth(p["max_depth"]),
-                                    min_samples_leaf=p["min_samples_leaf"], n_jobs=-1, random_state=seed)
-    elif name == "Hist. Gradient Boosting":
-        est = E.HistGradientBoostingRegressor(max_iter=p["max_iter"], learning_rate=p["learning_rate"],
-                                              max_leaf_nodes=p["max_leaf_nodes"],
-                                              l2_regularization=p["l2_regularization"], random_state=seed)
+    elif name == "SVM":
+        from sklearn.svm import SVR
+        est = SVR(C=p["C"], epsilon=p["epsilon"], gamma=p["gamma"], kernel=p["kernel"], degree=3)
     elif name == "Gaussian Process":
         from sklearn.gaussian_process import GaussianProcessRegressor
         from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
@@ -3121,7 +3126,7 @@ def resolve_ea(ct: pd.DataFrame, cfg: PINNConfig) -> Tuple[Optional[float], Opti
 
 def compare_paradigms(cell_df: pd.DataFrame, ct: pd.DataFrame, imp: Optional[pd.DataFrame],
                       cell_id: str, n0_frac: float, twin_params: TwinParameters,
-                      pinn_cfg: PINNConfig, ml_model: str = "Hist. Gradient Boosting",
+                      pinn_cfg: PINNConfig, ml_model: str = "Random Forest",
                       eol_ah: float = DEFAULT_EOL_AH, ekf: Optional[EKFResult] = None,
                       progress: ProgressFn = None, *, observer: str = "dual",
                       dual_cfg: Optional[DualTwinConfig] = None, ml_strategy: str = "increment",
@@ -3239,7 +3244,7 @@ BENCH_PARADIGMS = ("ML", "Twin", "PINN", "HB")
 class BenchmarkConfig:
     fracs: Tuple[float, ...] = (0.2, 0.3, 0.4, 0.5, 0.6)
     paradigms: Tuple[str, ...] = BENCH_PARADIGMS
-    ml_model: str = "Hist. Gradient Boosting"
+    ml_model: str = "Random Forest"
     ml_strategy: str = "increment"
     conformal_cells: int = 4
     band_level: float = 0.9
@@ -6600,6 +6605,7 @@ V2_FEATURES = {
     "vmean_rel": "Mean discharge voltage now / new", "eff_now": "Energy efficiency now",
     "cum_ah": "Cumulative throughput (Ah)", "ah_cycle": "Ah per cycle",
     "arrhenius": "Arrhenius factor (cell temperature)", "c_rate": "C-rate", "v_cut": "Cut-off voltage",
+    "dq_logvar": "ΔQ(V) variance (log10), cycle 2 → now",
 }
 
 
@@ -6664,7 +6670,8 @@ def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> 
             "cum_ah": float(h["cum_Ah"].iloc[-1] - h["cum_Ah"].iloc[0]),
             "ah_cycle": float(np.median(da[da > 0])) if (da > 0).any() else 2.0,
             "arrhenius": math.exp(30e3 / R_GAS * (1 / 298.15 - 1 / T)), "c_rate": I / max(c_bol, 1e-6),
-            "v_cut": float(h["V_min_V"].median()) if "V_min_V" in h else 2.7}
+            "v_cut": float(h["V_min_V"].median()) if "V_min_V" in h else 2.7,
+            "dq_logvar": delta_q_stats(h, 2, k)["dq_logvar"] if k >= 6 else np.nan}
 
 
 def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], step: int = 3, k_min: int = 8
@@ -6719,9 +6726,10 @@ class V2Forecast:
     train_cells: List[str]
     fit_seconds: float
     correction_weight: Dict[int, float] = field(default_factory=dict)   # per horizon: 0 = pure trend, 1 = full ML
+    cv_rmse: float = float("nan")      # held-out-battery error of the final (shrunk) predictor, SOH units
 
 
-def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Extra Trees",
+def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Random Forest",
                 eol_ah: float = DEFAULT_EOL_AH, train_cells: Optional[Sequence[str]] = None,
                 model_params: Optional[Dict[str, Any]] = None, level: float = 0.9, cv_folds: int = 3,
                 seed: int = 0, horizon_factor: float = 1.5, alpha: float = 0.2) -> V2Forecast:
@@ -6751,7 +6759,7 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Extr
     groups = tab["Cell_ID"].to_numpy()
     uniq = np.unique(groups)
     z = 1.6449 if abs(level - 0.9) < 1e-9 else 1.96
-    preds, his, los, imp_rows, shrink_w = [], [], [], None, []
+    preds, his, los, imp_rows, shrink_w, cv_sq = [], [], [], None, [], []
     rng = np.random.default_rng(seed)
     for hz in V2_HORIZONS:
         y = tab[f"y{hz}"].to_numpy(float)
@@ -6785,6 +6793,7 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Extr
             mse_model, mse_zero = float(np.mean((cy - cp) ** 2)), float(np.mean(cy ** 2))
             w_h = float(np.clip(1 - mse_model / mse_zero, 0.0, 1.0)) if mse_zero > 0 else 0.0
             r = cy - w_h * cp                         # residuals of the shrunk predictor
+            cv_sq.append(float(np.mean(r ** 2)))
         else:
             w_h, r = 0.0, np.array([0.01])
         shrink_w.append(w_h)
@@ -6837,7 +6846,7 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Extr
     metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), n_grid, med_c, n0, soh_eol, lo_c, hi_c, alpha)
     return V2Forecast(f"ML v2 · {model_name}", cell_id, n0, n_grid, med_c, lo_c, hi_c, metrics,
                       imp_rows if imp_rows is not None else pd.DataFrame(), f0, pool, time.time() - t0,
-                      dict(zip(V2_HORIZONS, shrink_w)))
+                      dict(zip(V2_HORIZONS, shrink_w)), float(np.sqrt(np.mean(cv_sq))) if cv_sq else float("nan"))
 
 
 # =============================================================================
@@ -7080,3 +7089,23 @@ def seq_forecast_v2(ct: pd.DataFrame, cell_id: str, n0: int, kind: str = SEQ_MOD
                       {"windows": int(len(X)), "channels": "SOH, resistance, temperature rise, CV time",
                        "correction trusted": dict(zip(V2_HORIZONS, np.round(w_h, 2).tolist()))})
     return _v2_finish(fc, ct, cell_id, n0, eol_ah, kind + " v2")
+
+
+
+def ml_v2_ensemble(members: Sequence["V2Forecast"], ct: pd.DataFrame, eol_ah: float = DEFAULT_EOL_AH,
+                   alpha: float = 0.2) -> ProgForecast:
+    """Skill-weighted ensemble of ML v2 forecasts for one battery: weights proportional to 1 / CV-MSE measured on
+    held-out batteries (never on the test battery), band = moment-matched mixture of the members' bands."""
+    ms = [m for m in members if np.isfinite(m.cv_rmse) and m.cv_rmse > 0]
+    if len(ms) < 2:
+        raise ValueError("ensemble needs at least two ML v2 models with a cross-validation score")
+    w = np.array([1.0 / m.cv_rmse ** 2 for m in ms])
+    w /= w.sum()
+    grid = ms[0].n_grid
+    mu = np.array([np.interp(grid, m.n_grid, m.soh_pred) for m in ms])
+    sd = np.array([(np.interp(grid, m.n_grid, m.soh_hi) - np.interp(grid, m.n_grid, m.soh_lo)) / 3.29 for m in ms])
+    mean = w @ mu
+    half = 1.6449 * np.sqrt(np.maximum(w @ (sd ** 2 + mu ** 2) - mean ** 2, 0))
+    fc = ProgForecast("ML ensemble (v2)", grid, mean, mean - half, mean + half, None,
+                      {"weights": {m.model: float(x) for m, x in zip(ms, w)}})
+    return _v2_finish(fc, ct, ms[0].cell_id, ms[0].n0, eol_ah, "ML ensemble (v2)", alpha)

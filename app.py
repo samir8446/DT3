@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.4"
+REQUIRED_ENGINE = "5.5"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -2604,7 +2604,8 @@ st.markdown(
 view = nav(VIEWS, key="view")
 st.session_state["_sec_n"] = 0
 _scope_lbl = str(st.session_state.get("diag_scope", "Single battery")).split(": ")[-1].split(" ", 1)[-1]
-_sch = {"within": "within a battery", "across": "across batteries"}.get(st.session_state.get("sch_mode", "within"), "")
+_sch = {"within": "within a battery", "same": "same operating conditions",
+        "across": "across batteries"}.get(st.session_state.get("sch_mode", "within"), "")
 st.markdown(
     '<div class="bt-context">'
     f'<span><i>Battery</i> <b>{html.escape(cell_label(cell, meta))}</b></span>'
@@ -3825,14 +3826,18 @@ def ml_section() -> None:
     st.markdown("Two tasks, 8 curated models, every hyperparameter adjustable. **Forecast**: predict future SOH from the past "
                 "(prognosis). **Estimate**: infer the present SOH from operando indicators measured on the same cycle "
                 "(diagnosis, no capacity test needed).")
+    avail = set(te.available_models())
     models = st.multiselect("Models (L1 simple → L3 boosting)", sorted(te.ML_MODELS, key=lambda m: te.MODEL_SPECS[m].level),
-                            default=["Decision Tree", "Random Forest", "Extra Trees", "Hist. Gradient Boosting"],
-                            key="ml_models", format_func=lambda m: f"L{te.MODEL_SPECS[m].level} · {m}",
+                            default=[m for m in ("Decision Tree", "Random Forest", "SVM", "XGBoost", "LightGBM")
+                                     if m in avail],
+                            key="ml_models",
+                            format_func=lambda m: f"L{te.MODEL_SPECS[m].level} · {m}" + ("" if m in avail else " · not installed"),
                             help="Select any number; the leaderboard ranks them.")
-    missing_opt = [n for n in te.OPTIONAL_ML if n not in te.ML_MODELS]
+    missing_opt = [n for n in te.OPTIONAL_ML if n not in avail]
     if missing_opt:
-        st.caption("Also available once installed on the server: " + ", ".join(missing_opt) +
-                   " (add `xgboost` / `lightgbm` to requirements.txt).")
+        st.warning("Not installed on this server: " + ", ".join(missing_opt) + ". They are listed in requirements.txt; "
+                   "reboot the app after deploying it.")
+    models = [m for m in models if m in avail]
     params = hyperparam_editor(models, "hp")
     t_fc, t_est = st.tabs([":material/trending_down: Forecast future SOH", ":material/biotech: Estimate SOH from indicators"])
     with t_fc:
@@ -3894,14 +3899,23 @@ def ml_v2_panel(res: Sequence[Any], target: str) -> None:
     for r in res:
         w = {h: v for h, v in r.correction_weight.items() if np.isfinite(v)}
         rows.append({"Model": r.model, "Accuracy (%)": r.metrics.accuracy, "RMSE": r.metrics.rmse,
+                     "CV RMSE (held-out batteries)": r.cv_rmse,
                      "Coverage": r.metrics.coverage, "Training batteries": len(r.train_cells),
                      "Correction trusted (short → long horizons)": " · ".join(f"{100 * v:.0f}%" for v in w.values()),
                      "Time (s)": r.fit_seconds})
     show_table(pd.DataFrame(rows).set_index("Model").style.format(
-        {"Accuracy (%)": "{:.2f}", "RMSE": "{:.4f}", "Coverage": "{:.0%}", "Time (s)": "{:.1f}"}),
+        {"Accuracy (%)": "{:.2f}", "RMSE": "{:.4f}", "CV RMSE (held-out batteries)": "{:.4f}", "Coverage": "{:.0%}",
+         "Time (s)": "{:.1f}"}),
         note="'Correction trusted' is how much of the ML correction to the battery's own trend was kept at each "
              "horizon (+10 … +140 cycles), measured on held-out batteries: 0% means the trend alone was more "
              "reliable there. Coverage is the share of test cycles inside the 90% band.")
+    ens = (st.session_state.get("ml_v2_ens") or {}).get(target)
+    if ens is not None:
+        wt = ens.params.get("weights", {})
+        st.markdown(f"**ML ensemble (v2)** · accuracy {ens.metrics.accuracy:.2f}% · RMSE {ens.metrics.rmse:.4f} · weights: "
+                    + ", ".join(f"{k.split(' · ')[1]} {v:.2f}" for k, v in wt.items()))
+        note("The ensemble weights each model by its error on held-out batteries (never on this test battery), so "
+             "the most reliable models count most.")
     imp = next((r.importance for r in res if len(r.importance)), None)
     if imp is not None:
         show(fig_importance(imp, P, res[0].model.split(" · ")[1]), key="ml_v2_imp", export=False)
@@ -3976,6 +3990,14 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
                                    v2.metrics, t)
                     except Exception as exc:
                         st.warning(f"{mname} (v2) on {t}: {exc}")
+        for t, mem in v2_by_target.items():                 # skill-weighted ensemble of the v2 models
+            if len(mem) >= 2:
+                try:
+                    e = te.ml_v2_ensemble(mem, ct, float(eol_ah))
+                    ladder_add(e.name, 3, sc["n0"][t], e.n_grid, e.soh, e.lo, e.hi, e.metrics, t)
+                    st.session_state.setdefault("ml_v2_ens", {})[t] = e
+                except Exception as exc:
+                    st.warning(f"ML ensemble on {t}: {exc}")
         prog.empty()
         st.session_state["ml"] = {"cfg": ml_cfg, "res": by_target.get(show_t, []), "by_target": by_target}
         st.session_state["ml_v2"] = v2_by_target
@@ -4385,9 +4407,10 @@ def scheme() -> Dict[str, Any]:
 def scheme_controls() -> Dict[str, Any]:
     """One training scheme for every level of the ladder."""
     all_cells = list(meta.index)
-    mode = st.radio("Training scheme", ["within", "across"], horizontal=True, key="sch_mode",
-                    format_func={"within": ":material/call_split: Within a battery: train on its first part, test on the rest",
-                                 "across": ":material/swap_horiz: Across batteries: train on some batteries, predict others"}.get)
+    mode = st.radio("Training scheme", ["within", "same", "across"], horizontal=True, key="sch_mode",
+                    format_func={"within": ":material/call_split: Within a battery: first part → rest",
+                                 "same": ":material/thermostat: Same operating conditions: batteries of one group",
+                                 "across": ":material/swap_horiz: Across batteries: any batteries → others"}.get)
     if mode == "within":
         c1, c2 = st.columns([3, 2])
         frac = c1.slider("Training part of the battery's life (the rest is the test)", 0.1, 0.9, 0.4, 0.05, key="ml_frac")
@@ -4397,6 +4420,36 @@ def scheme_controls() -> Dict[str, Any]:
         sc = {"mode": "within", "targets": [cell], "train": None if use_cohort else [], "use_cohort": use_cohort,
               "n0": {cell: n0}, "show": cell, "frac": frac}
         st.caption(f"Battery {cell}: training on cycles 1–{n0}, testing on cycles {n0 + 1}–{int(meta.loc[cell, 'cycles'])}.")
+    elif mode == "same":
+        grp = te.condition_groups(ct)
+        order = [g for g in te.GROUP_ORDER if g in set(grp["Group"])]
+        my = grp.loc[cell, "Group"] if cell in grp.index else order[0]
+        g_sel = st.selectbox("Operating-condition group", order, index=order.index(my), key="sch_group",
+                             format_func=lambda g: f"{g} · {int((grp['Group'] == g).sum())} batteries")
+        members = list(grp.index[grp["Group"] == g_sel])
+        lab = lambda c: (f"{c} · {grp.loc[c, 'Ambient_C']:.0f} °C · {grp.loc[c, 'I_dis_A']:.1f} A · "
+                         f"cut-off {meta.loc[c, 'V_cut_V']:.2f} V · {int(grp.loc[c, 'cycles'])} cycles")
+        c1, c2 = st.columns(2)
+        test_default = [cell] if cell in members else members[-1:]
+        train = c1.multiselect("Training batteries (same group)", members,
+                               default=[c for c in members if c not in test_default], key="sch_same_train",
+                               format_func=lab)
+        test = c2.multiselect("Test batteries (same group)", [c for c in members if c not in train],
+                              default=[c for c in test_default if c not in train], key="sch_same_test", format_func=lab)
+        frac = st.slider("Start of each test battery the models may see (the rest is forecast)", 0.05, 0.6, 0.15, 0.05,
+                         key="sch_same_seen")
+        n0 = {t: int(max(10, round(frac * meta.loc[t, "cycles"]))) for t in test}
+        show_t = st.selectbox("Battery to display in the charts", test or [cell], key="sch_same_show",
+                              format_func=lambda c: cell_label(c, meta)) if test else cell
+        sc = {"mode": "across", "variant": "same", "group": g_sel, "targets": test, "train": train,
+              "use_cohort": False, "n0": n0, "show": show_t, "frac": frac}
+        if len(members) < 2:
+            st.warning(f"The {g_sel} group has a single battery: choose another group or another scheme.")
+        elif not train or not test:
+            st.warning("Choose at least one training and one test battery in this group.")
+        else:
+            st.caption(f"{g_sel}: learning from {len(train)} battery(ies) to forecast {len(test)} under the same "
+                       "operating conditions. This isolates cell-to-cell variation from the effect of conditions.")
     else:
         c1, c2 = st.columns(2)
         near = te.calibration_partners(meta, cell, 4)
