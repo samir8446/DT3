@@ -3505,7 +3505,8 @@ def _reco_items(view: str) -> List[Tuple[str, str]]:
             items.append(("play_arrow", "Next: **Step 4 · Run selected models**, then read the verdict in Step 5."))
         else:
             items.append(("fact_check", "Read the **Step 5 verdict**; repeat for another condition group in Step 1."))
-        if not w.get("est"):
+        est = w.get("est")
+        if est is None or not len(est):
             items.append(("monitor_heart", "**Step 3** shows how well today's SOH is known without a capacity test."))
     elif view == "ops":
         if not ss.get("ops_calib", True):
@@ -3562,7 +3563,7 @@ GLOSSARY = {
 def sidebar_guide() -> None:
     ss = st.session_state
     steps = [("Data loaded", True, VIEWS[1]), ("Half-cell modes fitted", bool(ss.get("hc")), VIEWS[1]),
-             ("Live twin opened", bool(ss.get("ekf")), VIEWS[2]), ("Ladder models compared", bool(ss.get("ladder")), VIEWS[3]),
+             ("Live twin opened", bool(ss.get("ekf")), VIEWS[2]), ("Forecast models scored", len((ss.get("wf") or {}).get("res", pd.DataFrame())) > 0, VIEWS[3]),
              ("M3 optimisation run", bool(ss.get("om") or ss.get("dp")), VIEWS[4]),
              ("Cohort study run", bool(ss.get("study")), VIEWS[5])]
     done = sum(ok for _, ok, _ in steps)
