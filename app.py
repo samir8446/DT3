@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.8"
+REQUIRED_ENGINE = "5.9"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -565,7 +565,7 @@ EXPLAIN: Dict[str, str] = {
     "lad_spm_curves": "Simulated discharge curves of the single-particle model: the effect of lost lithium, higher current and cold on voltage and delivered capacity.",
     "lad_board": "All models run so far on this battery and forecast origin, from the simplest to the most advanced, scored on the same future cycles. The best is highlighted.",
     "ml_fig": "Forecasts of the selected ML models from the forecast origin (dotted line), with their uncertainty bands, against the measured SOH.",
-    "ml_v2_fig": "ML v2 forecasts: each battery's own recent trend, corrected by what the models learned from the training batteries about acceleration and knees.",
+    "ml_v2_fig": "ML v2 forecasts. The grey line is the baseline: by default the typical fade curve of comparable batteries, placed at this battery's state and speed; the models add only what they learned beyond it, and only as far as that helped on held-out batteries.",
     "pt_depth": "Error of the real-time SOH estimate against how much of the discharge has run (test batteries only). The lower and the further left a curve crosses the 1% line, the earlier a partial discharge reveals the battery's health.",
     "pt_vi": "Where the ageing information sits within a discharge: blue = how much the charge delivered at each voltage varies over the battery's life (the paper's attention), purple = how strongly it tracks capacity. The highlighted window is what the estimators rely on.",
     "pt_wmap": "SOH error for discharges that only cover a voltage window (rows: where it starts, columns: where it stops). Wide windows across the main voltage region give the best estimates; short ones carry little capacity information.",
@@ -3956,6 +3956,19 @@ def ml_v2_panel(res: Sequence[Any], target: str) -> None:
     st.markdown(f"**ML v2 on {target}** · trend of the battery's own recent fade + a learned deviation")
     entries = [{"name": r.model, "level": te.MODEL_SPECS[r.model.split(" · ")[1]].level, "n_grid": r.n_grid,
                 "soh": r.soh_pred, "lo": r.soh_lo, "hi": r.soh_hi, "m": r.metrics, "target": target} for r in res]
+    bl = res[0].options.get("baseline", "trend")
+    if res[0].baseline_curve is not None:
+        entries.append({"name": "Fleet-shape baseline" if bl == "shape" else "Straight-trend baseline", "level": 1,
+                        "n_grid": res[0].n_grid, "soh": res[0].baseline_curve, "lo": None, "hi": None, "m": None,
+                        "target": target})
+    trust = [np.nanmean([v for v in r.correction_weight.values() if np.isfinite(v)] or [0.0]) for r in res]
+    chips = " · ".join(f"{r.model.split(' · ')[1]} {100 * t:.0f}%" for r, t in zip(res, trust))
+    st.markdown(f"**Baseline:** {'fleet shape of comparable batteries' if bl == 'shape' else 'straight recent trend'} · "
+                f"**correction trusted (mean over horizons):** {chips}")
+    if max(trust) < 0.1:
+        note("The learned corrections did not beat the baseline on held-out batteries, so the forecasts follow the "
+             "baseline (grey). With the fleet shape that is a curved, physically typical path; with the straight "
+             "trend it is a line: switch the baseline in Advanced ML options to compare.")
     show(fig_ladder(entries, res[0].n0, P, "ML v2 forecasts", target), key="ml_v2_fig", export=False)
     rows = []
     for r in res:
@@ -4044,6 +4057,11 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
                                                   "battery, not only of single cycles."),
             "explain": o[1].toggle("Shapley explanation of the forecast", value=True, key="ml_o_shap",
                                    help="How each feature pushed this battery's 40-cycle forecast up or down."),
+            "baseline": o[2].radio("Baseline", ["shape", "trend"], horizontal=True, key="ml_o_base",
+                                   format_func={"shape": "Fleet shape", "trend": "Straight trend"}.get,
+                                   help="Fleet shape: the typical fade curve of comparable batteries, placed at this "
+                                        "battery's state and speed (bends at the end of the early plateau and at "
+                                        "knees). Straight trend: the last cycles' slope continued."),
         }
         st.caption("On synthetic test batteries these options changed the error only slightly (augmentation: "
                    "0.0351 → 0.0345); they target battery-to-battery variation and irrelevant features, which "
@@ -4624,6 +4642,7 @@ def fig_ladder(entries: Sequence[Dict[str, Any]], n0: int, P: Palette, title: st
 
 def _ladder_table(entries: Sequence[Dict[str, Any]]) -> pd.DataFrame:
     """Per model: metrics averaged over the test batteries (one row per model)."""
+    entries = [e for e in entries if e.get("m") is not None]
     rows = [{"Level": f"L{e['level']} · {LEVEL_INFO[e['level']][0]}", "Model": e["name"], "Battery": e["target"],
              "Accuracy (%)": e["m"].accuracy, "RMSE": e["m"].rmse, "Fade skill": e["m"].fade_skill,
              "Coverage": e["m"].coverage, "RUL error": e["m"].rul_error} for e in entries if e["m"] is not None]

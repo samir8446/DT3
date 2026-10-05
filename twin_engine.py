@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.8.0"
+ENGINE_VERSION = "5.9.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -6677,6 +6677,7 @@ V2_FEATURES = {
     "cum_ah": "Cumulative throughput (Ah)", "ah_cycle": "Ah per cycle",
     "arrhenius": "Arrhenius factor (cell temperature)", "c_rate": "C-rate", "v_cut": "Cut-off voltage",
     "dq_logvar": "ΔQ(V) variance (log10), cycle 2 → now",
+    "soh_slope_ah": "SOH trend per Ah, last 20 cycles",
     "ica_h_rel": "ICA main-peak height now / new", "ica_v_shift": "ICA main-peak voltage shift (V)",
     "ica_h_slope": "ICA peak-height trend", "cum_heat": "Cumulative heating (Σ temperature rise)",
     "rest_h": "Rest before recent cycles (h)",
@@ -6736,6 +6737,74 @@ def _ica_state(h: pd.DataFrame) -> Dict[str, float]:
             "ica_h_slope": 100 * _slope(h["n"].to_numpy(float)[last], hh[last] / (first_h or 1.0))}
 
 
+def _slope_ah(h: pd.DataFrame, window: int = 20) -> float:
+    """Robust (Theil-Sen) fade per Ah of throughput over the last `window` cleaned cycles, x100 (SOH % per Ah)."""
+    from scipy.stats import theilslopes
+
+    t = h.tail(window)
+    if len(t) < 5 or "cum_Ah" not in t or np.ptp(t["cum_Ah"]) <= 0:
+        return 0.0
+    col = "SOH_causal" if "SOH_causal" in t else "SOH"
+    return 100 * min(float(theilslopes(t[col], t["cum_Ah"])[0]), 0.0)
+
+
+def fleet_shape(ct: pd.DataFrame, cells: Sequence[str], n_grid: int = 300) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Typical fade shape of comparable batteries: median cleaned SOH against Ah throughput (where at least two
+    batteries have data), extended beyond the longest history with the final slope, non-increasing."""
+    curves = []
+    for c in cells:
+        d = ct[ct["Cell_ID"] == c]
+        if d[~d["outlier"]].shape[0] < 10:
+            continue
+        dc = clean_capacity(d)
+        A = dc["cum_Ah"].to_numpy(float) - float(dc["cum_Ah"].iloc[0])
+        curves.append((A, dc["SOH_clean"].to_numpy(float)))
+    if not curves:
+        return None
+    a_max = max(c[0].max() for c in curves)
+    grid = np.linspace(0, a_max, n_grid)
+    M = np.full((len(curves), n_grid), np.nan)
+    for i, (A, S) in enumerate(curves):
+        ok = grid <= A.max()
+        M[i, ok] = np.interp(grid[ok], A, S)
+    cnt = np.isfinite(M).sum(axis=0)
+    need = 2 if len(curves) >= 2 else 1
+    F = np.where(cnt >= need, np.nanmedian(np.where(np.isfinite(M), M, np.nan), axis=0), np.nan)
+    ok = np.isfinite(F)
+    if ok.sum() < 5:
+        return None
+    grid, F = grid[ok], np.minimum.accumulate(F[ok])
+    return grid, F
+
+
+def _shape_at(shape: Tuple[np.ndarray, np.ndarray], a: np.ndarray) -> np.ndarray:
+    A, F = shape
+    tail = max(5, len(A) // 7)
+    slope = min((F[-1] - F[-tail]) / max(A[-1] - A[-tail], 1e-9), 0.0)
+    a = np.asarray(a, float)
+    return np.where(a <= A[-1], np.interp(a, A, F), F[-1] + slope * (a - A[-1]))
+
+
+def shape_drop(shape: Tuple[np.ndarray, np.ndarray], s0: float, slope_ah: float, dah: float,
+               horizons: np.ndarray, shrink: float = 0.7) -> np.ndarray:
+    """SOH drop at each horizon (cycles) predicted by the fleet shape for a battery now at SOH s0 that fades at
+    `slope_ah` (SOH per Ah): place the battery at the fleet's equivalent age (same SOH), estimate its speed
+    relative to the fleet there (k, shrunk towards 1 and bounded), then follow the fleet curve at that speed.
+    Unlike a straight line this bends where batteries of this type bend (end of the early plateau, knee)."""
+    A, F = shape
+    a_star = 0.0 if s0 >= F[0] else float(np.interp(s0, F[::-1], A[::-1]))
+    w = max(15 * dah, A[1] - A[0])
+    lo_a = max(a_star - w, 0.0)
+    hi_a = lo_a + w if a_star - lo_a < 0.5 * w else a_star
+    fs = float((_shape_at(shape, [hi_a])[0] - _shape_at(shape, [lo_a])[0]) / max(hi_a - lo_a, 1e-9))
+    if fs < -1e-9 and slope_ah < 0:
+        k = float(np.exp(shrink * np.log(np.clip(slope_ah / fs, 0.4, 2.5))))
+    else:
+        k = 1.0
+    base = _shape_at(shape, [a_star])[0]
+    return _shape_at(shape, a_star + k * dah * np.asarray(horizons, float)) - base
+
+
 def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> Dict[str, float]:
     """Features known at cycle k (rows n <= k of a cleaned battery history): current level and recent trend
     of the health indicators, cumulative throughput and physics-scaled operating conditions."""
@@ -6773,21 +6842,24 @@ def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> 
             "arrhenius": math.exp(30e3 / R_GAS * (1 / 298.15 - 1 / T)), "c_rate": I / max(c_bol, 1e-6),
             "v_cut": float(h["V_min_V"].median()) if "V_min_V" in h else 2.7,
             "dq_logvar": delta_q_stats(h, 2, k)["dq_logvar"] if k >= 6 else np.nan,
+            "soh_slope_ah": _slope_ah(h),
             **_ica_state(h), "cum_heat": float(h["dT_C"].clip(lower=0).sum()) if "dT_C" in h else np.nan,
             "rest_h": float(last["rest_h"].median()) if "rest_h" in h and last["rest_h"].notna().any() else np.nan}
 
 
 def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], step: int = 3, k_min: int = 8,
-                augment: Sequence[float] = (), target: Optional[str] = None) -> pd.DataFrame:
+                augment: Sequence[float] = (), target: Optional[str] = None, baseline: str = "trend") -> pd.DataFrame:
     """Training table: for every cell and origin k, the state features at k and, per horizon, how far the true
     SOH drop departs from the cell's own recent trend. `augment` adds time-warped copies of every training
     battery (ageing per cycle x 1/f: cycle index and throughput stretched by f); copies keep the original
     Cell_ID so cross-validation never splits a battery from its copies."""
     rows = []
+    hz_arr = np.array(V2_HORIZONS, float)
     for c in cells:
         d = ct[ct["Cell_ID"] == c]
         if d.empty:
             continue
+        shape_c = fleet_shape(ct, [x for x in cells if x not in (c, target)]) if baseline == "shape" else None
         dc0 = clean_capacity(d)
         c_bol = float(d["C_bol_Ah"].iloc[0])
         factors = [1.0] + ([f for f in augment if f != 1.0] if c != target else [])
@@ -6804,10 +6876,13 @@ def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], 
                 except ValueError:
                     continue
                 s_k = float(f["soh_now"])
-                rate = f["soh_slope"] / 100.0
+                if shape_c is not None:
+                    base = shape_drop(shape_c, s_k, f["soh_slope_ah"] / 100.0, f["ah_cycle"], hz_arr)
+                else:
+                    base = f["soh_slope"] / 100.0 * hz_arr
                 row = {"Cell_ID": c, "k": k, "aug": fct, **f}
-                for hz in V2_HORIZONS:
-                    row[f"y{hz}"] = (float(np.interp(k + hz, n_arr, s_arr)) - s_k - rate * hz) \
+                for hz, b in zip(V2_HORIZONS, base):
+                    row[f"y{hz}"] = (float(np.interp(k + hz, n_arr, s_arr)) - s_k - b) \
                         if k + hz <= min(lim, n_arr.max()) else np.nan
                 rows.append(row)
     return pd.DataFrame(rows)
@@ -6841,6 +6916,7 @@ class V2Forecast:
     shap: Optional[pd.DataFrame] = None    # Shapley contribution of each feature to the 40-cycle forecast
     selected: List[str] = field(default_factory=list)
     options: Dict[str, Any] = field(default_factory=dict)
+    baseline_curve: Optional[np.ndarray] = None    # the baseline alone (fleet shape or straight trend) on n_grid
 
 
 def shapley_values(predict: Callable[[np.ndarray], np.ndarray], x0: np.ndarray, background: np.ndarray,
@@ -6873,7 +6949,7 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
                 model_params: Optional[Dict[str, Any]] = None, level: float = 0.9, cv_folds: int = 3,
                 seed: int = 0, horizon_factor: float = 1.5, alpha: float = 0.2, monotone: bool = True,
                 select_features: bool = False, augment: bool = False, battery_conformal: bool = True,
-                explain: bool = True) -> V2Forecast:
+                explain: bool = True, baseline: str = "shape") -> V2Forecast:
     """ML v2 forecaster. Forecast = the battery's own robust recent trend + a learned deviation: one regressor
     per horizon h predicts how far the true drop SOH(n0 + h) - SOH(n0) departs from "the last-15-cycle trend
     continues", from the state features at n0. Grouped cross-validation by battery sets (a) how much of the
@@ -6889,7 +6965,8 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
     model_params = validate_params(model_name, model_params)
     good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
     pool = v2_training_pool(ct, cell_id, train_cells)
-    tab = _v2_samples(ct, pool + [cell_id], {cell_id: n0}, augment=(0.85, 1.15) if augment else (), target=cell_id)
+    tab = _v2_samples(ct, pool + [cell_id], {cell_id: n0}, augment=(0.85, 1.15) if augment else (), target=cell_id,
+                      baseline=baseline)
     all_feats = [f for f in V2_FEATURES if f in tab.columns and tab[f].notna().mean() > 0.3]
     if len(tab) < 20:
         raise ValueError("ML v2: not enough training origins (choose more training batteries).")
@@ -6985,10 +7062,14 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
                                                                                   key=np.abs, ascending=False)
         shap_df.attrs["base"] = base
     hz = np.array(V2_HORIZONS, float)
-    rate0 = f0["soh_slope"] / 100.0
-    P_ = np.array(res["preds"], float) + rate0 * hz
-    L0 = np.array(res["los"], float) + rate0 * hz
-    H0 = np.array(res["his"], float) + rate0 * hz
+    shape_t = fleet_shape(ct, pool) if baseline == "shape" else None
+    if shape_t is not None:
+        base0 = shape_drop(shape_t, float(f0["soh_now"]), f0["soh_slope_ah"] / 100.0, f0["ah_cycle"], hz)
+    else:
+        base0 = f0["soh_slope"] / 100.0 * hz
+    P_ = np.array(res["preds"], float) + base0
+    L0 = np.array(res["los"], float) + base0
+    H0 = np.array(res["his"], float) + base0
     ok = np.isfinite(P_)
     if ok.sum() < 2:
         raise ValueError("ML v2: too few horizons could be trained.")
@@ -7010,6 +7091,8 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
 
     past = np.interp(n_grid, good["n"], good["SOH"])
     med_c = np.where(n_grid > n0, np.clip(s0 + curve(P_), 0.0, 1.05), past)
+    b_ok = np.minimum.accumulate(np.minimum(base0[ok], 0.0))
+    base_c = np.where(n_grid > n0, np.clip(s0 + curve(b_ok), 0.0, 1.05), past)
     lo_c = np.where(n_grid > n0, np.clip(s0 + curve(L_), 0.0, 1.05), past)
     hi_c = np.where(n_grid > n0, np.clip(s0 + curve(H_), 0.0, 1.05), past)
     soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
@@ -7019,7 +7102,7 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
                       res["imp"] if res["imp"] is not None else pd.DataFrame(), f0, pool, time.time() - t0,
                       dict(zip(V2_HORIZONS, res["w"])), cv, shap_df, feats,
                       {"monotone": bool(use_mono), "select_features": select_features, "augment": augment,
-                       "battery_conformal": battery_conformal})
+                       "battery_conformal": battery_conformal, "baseline": baseline}, base_c)
 
 
 # =============================================================================

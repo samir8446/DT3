@@ -1,4 +1,4 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.8)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.9)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
@@ -17,7 +17,7 @@ remaining life and optimise operation and maintenance.
 ```bash
 pip install -r requirements.txt
 streamlit run app.py                     # "Load synthetic demo cohort" works without data
-pytest                                   # 72 tests (pip install -r requirements-dev.txt)
+pytest                                   # 73 tests (pip install -r requirements-dev.txt)
 python study.py --master data/battery_master_data.parquet --imp data/impedance.parquet --out results/study
 python study.py --synthetic --out results/study_demo
 pip install -r requirements-service.txt && uvicorn service:app --port 8000   # streaming REST service
@@ -36,7 +36,7 @@ on the engine version, so engine updates always recompute.
 | `study.py` | Offline cohort study → CSVs, `summary.md`, manifest |
 | `service.py` | Streaming twin: framework-free `TwinRegistry` + optional FastAPI endpoints |
 | `benchmark.py` | Offline forecast-origin sweep (ML, Twin, PINN, HB) |
-| `tests/test_twin_engine.py` | 72 tests: gradient checks, synthetic-truth recovery, every model and study function |
+| `tests/test_twin_engine.py` | 73 tests: gradient checks, synthetic-truth recovery, every model and study function |
 
 ## Views
 
@@ -114,7 +114,7 @@ on the engine version, so engine updates always recompute.
   - B0025–B0028: square-wave load, pulse-aware twin;
   - erratic 4 °C runs: outlier flags.
 
-## ML v2 (v5.8)
+## ML v2 (v5.9)
 
 `train_ml_v2`: forecast = the battery's own robust recent trend + a learned deviation. Features at the origin:
 level and 10-cycle trend of cleaned SOH, load-step resistance, temperature rise, CV-charge time, mean voltage,
