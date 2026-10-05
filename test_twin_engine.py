@@ -1036,6 +1036,52 @@ def test_partial_discharge_estimator_depth_causality_and_split():
     assert len(vi) == len(te.QV_COLS) and vi["importance"].max() == 1.0
 
 
+def test_partial_soh_feeds_twin_windows_and_live_streaming():
+    m, imp, _ = te.make_synthetic_master(n_cells=6, n_cycles=90, ambients=(24, 24, 24, 34, 24, 34), seed=0, noise_v=0.01)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    g = ct[(ct["Cell_ID"] == "S003") & ~ct["outlier"]]
+
+    def rmse(r):
+        e = g[["n", "SOH"]].merge(r.per_cycle[["n", "SOH"]], on="n", suffixes=("", "_e"))
+        return float(np.sqrt(((e["SOH_e"] - e["SOH"]) ** 2).mean()))
+
+    base = te.run_dual_twin(store.cell_frame("S003"), ct, imp, "S003", te.TwinParameters(), te.DualTwinConfig())
+    perfect = {int(r.n): (float(r.Capacity_Ah), 0.005) for r in g.itertuples()}
+    fed = te.run_dual_twin(store.cell_frame("S003"), ct, imp, "S003", te.TwinParameters(), te.DualTwinConfig(),
+                           capacity_override=perfect)
+    assert rmse(fed) < 0.5 * rmse(base)                                  # per-cycle capacity info is used
+    est = te.fit_partial_estimator(ct, ["S001", "S002", "S004", "S005"], "Bayesian Ridge", "direct")
+    ov = te.partial_capacity_series(est, ct, "S003", 0.4)
+    assert len(ov) == len(te.partial_table(ct, ["S003"])) and all(sd > 0 for _, sd in ov.values())
+    r = te.twin_with_partial_soh(store, ct, imp, "S003", est, 0.4)
+    assert np.isfinite(rmse(r))
+    w = te.WindowSOHEstimator("Bayesian Ridge").fit(te.partial_table(ct, ["S001", "S002", "S004", "S005"]))
+    ev = te.window_evaluation(w, te.partial_table(ct, ["S003"]))
+    wide = ev[ev["width (grid points)"] >= 15]["MAE (SOH %)"].mean()
+    narrow = ev[ev["width (grid points)"] <= 6]["MAE (SOH %)"].mean()
+    assert wide < narrow
+    # live streaming of a raw discharge converges to the end-of-discharge SOH
+    cf = store.cell_frame("S003")
+    dis = cf[cf["Cycle_Type"] == "discharge"]
+    ci = sorted(dis["Cycle_Index"].unique())[40]
+    row = ct[(ct["Cell_ID"] == "S003") & (ct["Cycle_Index"] == ci)].iloc[0]
+    live = te.LiveDischarge(est, float(row["C_bol_Ah"]), 2.0, float(g["V_min_V"].median()))
+    outs = [live.add(x.Time_s, x.Voltage_V, x.Current_A) for x in dis[dis["Cycle_Index"] == ci].itertuples()]
+    final = [o for o in outs if o["status"] == "estimating"][-1]
+    assert abs(final["SOH"] - float(row["SOH"])) < 0.02 and final["depth"] == len(te.QV_COLS)
+    import importlib, sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    service = importlib.import_module("service")
+    reg = service.TwinRegistry()
+    reg.set_partial_estimator(est)
+    reg.start_discharge("S003", float(row["C_bol_Ah"]), 2.0, float(g["V_min_V"].median()))
+    for x in dis[dis["Cycle_Index"] == ci].itertuples():
+        last = reg.add_sample("S003", x.Time_s, x.Voltage_V, x.Current_A)
+    end = reg.end_discharge("S003")
+    assert abs(end["SOH"] - final["SOH"]) < 1e-9 and last["battery_id"] == "S003"
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.7.0"
+ENGINE_VERSION = "5.8.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -1963,7 +1963,8 @@ def _dual_measurement(x: np.ndarray, arr: Tuple[np.ndarray, np.ndarray, np.ndarr
     return np.concatenate(z), np.concatenate(h), np.vstack(H), np.concatenate(R), vres
 
 
-def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = None
+def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = None,
+                 capacity_override: Optional[Dict[int, Tuple[float, float]]] = None
                  ) -> Tuple[pd.DataFrame, np.ndarray, int, int]:
     from scipy.stats import chi2
 
@@ -2007,7 +2008,15 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
         if any_meas and due and not bool(r.outlier) and arr is not None:
             p_soh0, p_lk0 = float(P[0, 0]), float(P[3, 3])
             cap_due = cfg.capacity_every > 0 and i % int(cfg.capacity_every) == 0
-            meas = _dual_measurement(x, arr, prep, cfg_cap if cap_due else cfg, r.Capacity_Ah)
+            ov = capacity_override.get(int(r.n)) if capacity_override else None
+            if ov is not None:
+                # real-time capacity estimate from a partial discharge, with its own uncertainty
+                cap_val = float(ov[0])
+                meas = _dual_measurement(x, arr, prep, replace(cfg, use_capacity=True, sigma_q_Ah=max(float(ov[1]), 1e-3)),
+                                         cap_val)
+            else:
+                cap_val = float(r.Capacity_Ah) if np.isfinite(r.Capacity_Ah) else float("nan")
+                meas = _dual_measurement(x, arr, prep, cfg_cap if cap_due else cfg, r.Capacity_Ah)
             if meas is not None:
                 z, hx, H, Rv, vres = meas
                 m = len(z)
@@ -2031,7 +2040,7 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
                     # cycles in a row (e.g. load changes in mixed campaigns). Re-initialise the capacity state
                     # from a measured capacity when one is available and reset the degradation rate to its
                     # prior; otherwise mark the forecast unreliable. Then continue from a widened covariance.
-                    cap = float(r.Capacity_Ah) if np.isfinite(r.Capacity_Ah) else float("nan")
+                    cap = cap_val if (ov is not None or cap_due or cfg.use_capacity) else float("nan")
                     if np.isfinite(cap) and cap > 0:
                         x[0] = cap / prep.c_bol
                         x[3] = math.log(prep.k_prior)
@@ -2040,7 +2049,10 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
                     n_guard += 1
                     consec_fail = 0
                     unreliable_for = 10
-                    meas2 = _dual_measurement(x, arr, prep, cfg_cap if cap_due else cfg, r.Capacity_Ah)
+                    meas2 = (_dual_measurement(x, arr, prep, replace(cfg, use_capacity=True,
+                                                                     sigma_q_Ah=max(float(ov[1]), 1e-3)), cap_val)
+                             if ov is not None else _dual_measurement(x, arr, prep, cfg_cap if cap_due else cfg,
+                                                                      r.Capacity_Ah))
                     if meas2 is not None:
                         z, hx, H, Rv, vres = meas2
                         m = len(z)
@@ -2091,7 +2103,8 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
 def run_dual_twin(cell_df: pd.DataFrame, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str,
                   params: TwinParameters, cfg: Optional[DualTwinConfig] = None,
                   calib_cells: Sequence[str] = (), progress: ProgressFn = None,
-                  _prep: Optional[_DualPrep] = None) -> EKFResult:
+                  _prep: Optional[_DualPrep] = None,
+                  capacity_override: Optional[Dict[int, Tuple[float, float]]] = None) -> EKFResult:
     """Dual time-scale ECM twin (per-cycle EKF, see DualTwinConfig). Estimates are causal:
     the state at cycle n uses only data up to n. The degradation-rate prior log k comes
     from cohort calibration partners, and the filter personalises it with the cell's own
@@ -2099,7 +2112,7 @@ def run_dual_twin(cell_df: pd.DataFrame, ct: pd.DataFrame, imp: Optional[pd.Data
     t0 = time.time()
     cfg = cfg or DualTwinConfig()
     prep = _prep or _dual_prepare(cell_df, ct, imp, cell_id, params, calib_cells)
-    per, covs, n_upd, n_infl = _dual_filter(prep, cfg, progress)
+    per, covs, n_upd, n_infl = _dual_filter(prep, cfg, progress, capacity_override)
     pr = asdict(prep.params)
     pr.update({"k_ah": float(per["k_ah"].iloc[-1]), "k_prior": prep.k_prior})
     _report(progress, 1.0, "dual twin done")
@@ -7491,3 +7504,185 @@ def fit_partial_estimator(ct: pd.DataFrame, train_cells: Sequence[str], model_na
     cells = list(dict.fromkeys(list(train_cells) + ([target] if target and n0 else [])))
     tab = partial_table(ct, cells, max_n={target: n0} if target and n0 else None)
     return PartialSOHEstimator(model_name, method, level=level, seed=seed).fit(tab)
+
+
+
+# ---------------------------------------------------------------- phase 3: partial-discharge SOH -> twin
+def partial_capacity_series(est: "PartialSOHEstimator", ct: pd.DataFrame, cell_id: str, depth_frac: float = 0.5,
+                            min_n: Optional[int] = None, relative: bool = False,
+                            relative_sd_factor: float = 1.0) -> Dict[int, Tuple[float, float]]:
+    """Per-cycle capacity pseudo-measurements for the twin: for every discharge of the battery, the real-time
+    estimate after `depth_frac` of the discharge (the grid voltage reached at that share), with sd = band / 1.645.
+    This is what a field battery that is only partly discharged can provide on every cycle."""
+    tab = partial_table(ct, [cell_id], min_n={cell_id: min_n} if min_n else None)
+    if tab.empty:
+        return {}
+    frac = np.nanmedian(tab[QV_COLS].to_numpy(float) / tab["Capacity_Ah"].to_numpy(float)[:, None], axis=0)
+    j = int(np.clip(np.searchsorted(frac, depth_frac) + 1, 1, len(QV_COLS)))
+    pr = est.predict_table(tab, j)
+    sd = np.maximum((pr[:, 2] - pr[:, 1]) / (2 * 1.645), 1e-3)
+    mu = pr[:, 0].copy()
+    if relative:
+        # remove the battery-specific bias of a cross-battery estimator: use the estimated *change* since the
+        # battery's first discharges, anchored on its known initial capacity (spec sheet / first test);
+        # the band then only needs to cover the noise around the trend, not the offset
+        first = tab.sort_values("n").head(5).index
+        mu = mu - float(np.median(mu[tab.index.get_indexer(first)])) + float(tab["C_bol_Ah"].iloc[0])
+        sd = np.maximum(sd * relative_sd_factor, 1e-3)
+    return {int(n): (float(m), float(s_)) for n, m, s_ in zip(tab["n"], mu, sd)}
+
+
+def twin_with_partial_soh(store: "ParquetStore", ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str,
+                          est: "PartialSOHEstimator", depth_frac: float = 0.5,
+                          cfg: Optional[DualTwinConfig] = None, relative: bool = False) -> EKFResult:
+    """Dual-EKF twin whose capacity measurement on every cycle is the real-time partial-discharge estimate
+    (no full capacity checks needed); periodic full checks are switched off."""
+    ov = partial_capacity_series(est, ct, cell_id, depth_frac, relative=relative)
+    base = twin_config_for(ct, cell_id, cfg or DualTwinConfig())
+    return run_dual_twin(store.cell_frame(cell_id), ct, imp, cell_id, TwinParameters(),
+                         replace(base, capacity_every=0, use_capacity=False), capacity_override=ov)
+
+
+def partial_group_study(ct: pd.DataFrame, model_name: str = "Bayesian Ridge", method: str = "direct",
+                        groups: Optional[Sequence[str]] = None, min_cells: int = 2,
+                        progress: ProgressFn = None) -> pd.DataFrame:
+    """Cohort result for Mission 2: per condition group, leave-one-battery-out within the group, the share of
+    the discharge needed before the real-time SOH error stays below 1 and 2 SOH points."""
+    g = condition_groups(ct)
+    todo = [x for x in (groups or GROUP_ORDER) if x in set(g["Group"]) and x not in V2_EXCLUDED_GROUPS]
+    rows = []
+    for k, grp in enumerate(todo):
+        cells = list(g.index[g["Group"] == grp])
+        if len(cells) < min_cells:
+            continue
+        evs = []
+        for c in cells:
+            _report(progress, (k + cells.index(c) / len(cells)) / max(len(todo), 1), f"{grp}: leave out {c}")
+            try:
+                est = fit_partial_estimator(ct, [x for x in cells if x != c], model_name, method)
+                evs.append(partial_depth_evaluation(est, partial_table(ct, [c])))
+            except Exception:
+                continue
+        if not evs:
+            continue
+        ev = pd.concat(evs).groupby("depth", as_index=False).mean(numeric_only=True)
+        d1, d2 = depth_needed(ev, 1.0), depth_needed(ev, 2.0)
+        rows.append({"Group": grp, "batteries": len(evs), "MAE at 50% (SOH pts)": float(np.interp(0.5, ev["fraction discharged"], ev["MAE (SOH %)"])),
+                     "MAE full curve": float(ev["MAE (SOH %)"].iloc[-1]),
+                     "depth for ≤ 1%": d1, "depth for ≤ 2%": d2, "coverage": float(ev["coverage"].mean())})
+    return pd.DataFrame(rows).set_index("Group") if rows else pd.DataFrame()
+
+
+
+# ---------------------------------------------------------------- phase 4: start-anywhere field windows
+def _window_X(Q: np.ndarray, a: np.ndarray, b: np.ndarray, S: np.ndarray,
+              ref_frac: Optional[np.ndarray] = None) -> np.ndarray:
+    """Features of a window [a, b) of grid voltages (any start, any end): the charge delivered between consecutive
+    grid voltages inside the window (zeros elsewhere, absolute charge is unknown when the discharge did not start
+    full), the window position (start / end voltage), its total charge and the discharge settings."""
+    Qn = np.nan_to_num(Q, nan=0.0)
+    dq = np.diff(np.concatenate([np.zeros((len(Qn), 1)), Qn], axis=1), axis=1)
+    idx = np.arange(Q.shape[1])[None, :]
+    mask = (idx >= a[:, None] + 1) & (idx < b[:, None])          # increments fully inside the window
+    dqw = np.where(mask, dq, 0.0)
+    pos = np.column_stack([QV_GRID[a], QV_GRID[np.maximum(b - 1, 0)], (b - a) / Q.shape[1], dqw.sum(axis=1)])
+    feats = [dqw, pos, S]
+    if ref_frac is not None:
+        # capacity proxy: charge in the window / share of capacity a reference battery delivers in that window
+        share = np.maximum(ref_frac[np.maximum(b - 1, 0)] - ref_frac[a], 1e-3)
+        feats.append((dqw.sum(axis=1) / share)[:, None])
+    return np.hstack(feats)
+
+
+@dataclass
+class WindowSOHEstimator:
+    """Capacity from an arbitrary voltage window of a discharge (field cycles that neither start full nor reach
+    the cut-off). Trained on random windows of the training discharges; split-conformal band by battery."""
+    model_name: str = "Bayesian Ridge"
+    windows_per_cycle: int = 6
+    min_width: int = 4
+    level: float = 0.9
+    seed: int = 0
+    model: Any = None
+    q_conf: float = 0.05
+    ref_frac: Optional[np.ndarray] = None
+
+    def _sample(self, tab: pd.DataFrame, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        K = len(QV_COLS)
+        reps = np.repeat(np.arange(len(tab)), self.windows_per_cycle)
+        a = rng.integers(0, K - self.min_width, size=len(reps))
+        b = np.minimum(a + self.min_width + rng.integers(0, K, size=len(reps)), K)
+        return reps, a, b, tab["Capacity_Ah"].to_numpy(float)[reps]
+
+    def _fit(self, X, y):
+        prm = {"degree": 1} if MODEL_SPECS[self.model_name].poly else None
+        Xs, ys, _ = _gp_subsample(self.model_name, X, y, np.ones(len(y)), self.seed)
+        return _StandardisedTarget(make_model(self.model_name, self.seed, prm)).fit(Xs, ys)
+
+    def fit(self, tab: pd.DataFrame) -> "WindowSOHEstimator":
+        rng = np.random.default_rng(self.seed)
+        Q = tab[QV_COLS].to_numpy(float)
+        S = tab[["I_set", "V_cut_set"]].to_numpy(float)
+        g = tab["Cell_ID"].to_numpy()
+        reps, a, b, y = self._sample(tab, rng)
+        self.ref_frac = np.nanmedian(Q / tab["Capacity_Ah"].to_numpy(float)[:, None], axis=0)
+        X = _window_X(Q[reps], a, b, S[reps], self.ref_frac)
+        cells = np.unique(g)
+        cal = np.isin(g[reps], rng.choice(cells, size=max(1, len(cells) // 3), replace=False)) if len(cells) >= 3 \
+            else rng.random(len(reps)) < 0.2
+        m_cal = self._fit(X[~cal], y[~cal])
+        r = np.abs(m_cal.predict(X[cal]) - y[cal])
+        self.q_conf = float(np.quantile(r, min(1.0, self.level * (1 + 1 / max(len(r), 1))))) if len(r) else 0.05
+        self.model = self._fit(X, y)
+        return self
+
+    def predict_window(self, Q: np.ndarray, a: np.ndarray, b: np.ndarray, S: np.ndarray) -> np.ndarray:
+        mu = self.model.predict(_window_X(Q, a, b, S, self.ref_frac))
+        return np.column_stack([mu, mu - self.q_conf, mu + self.q_conf])
+
+
+def window_evaluation(est: WindowSOHEstimator, tab: pd.DataFrame, n_starts: int = 6, n_widths: int = 6) -> pd.DataFrame:
+    """MAE (SOH points) by window start voltage and window width on test discharges."""
+    K = len(QV_COLS)
+    Q = tab[QV_COLS].to_numpy(float)
+    S = tab[["I_set", "V_cut_set"]].to_numpy(float)
+    y = tab["Capacity_Ah"].to_numpy(float)
+    cb = tab["C_bol_Ah"].to_numpy(float)
+    rows = []
+    for a0 in np.linspace(0, K - est.min_width - 1, n_starts).astype(int):
+        for w in np.linspace(est.min_width, K - a0, n_widths).astype(int):
+            b0 = min(a0 + w, K)
+            pr = est.predict_window(Q, np.full(len(Q), a0), np.full(len(Q), b0), S)
+            e = (pr[:, 0] - y) / cb * 100
+            rows.append({"start V": float(QV_GRID[a0]), "end V": float(QV_GRID[b0 - 1]), "width (grid points)": int(b0 - a0),
+                         "MAE (SOH %)": float(np.mean(np.abs(e))),
+                         "coverage": float(np.mean((y >= pr[:, 1]) & (y <= pr[:, 2])))})
+    return pd.DataFrame(rows)
+
+
+class LiveDischarge:
+    """Within-cycle streaming helper: accumulate (time, voltage, current) samples of the running discharge, keep
+    the charge at each grid-voltage crossing, and return the real-time capacity / SOH estimate after every sample."""
+
+    def __init__(self, est: PartialSOHEstimator, c_bol: float, I_set: float = 2.0, V_cut: float = 2.7):
+        self.est, self.c_bol, self.S = est, c_bol, np.array([I_set, V_cut], float)
+        self.reset()
+
+    def reset(self) -> None:
+        self.q, self.t_last, self.v_min, self.Q = 0.0, None, np.inf, np.full(len(QV_COLS), np.nan)
+
+    def add(self, t_s: float, v: float, i_a: float) -> Dict[str, Any]:
+        if self.t_last is not None and i_a < -0.1:
+            self.q += abs(i_a) * max(t_s - self.t_last, 0.0) / 3600.0
+        self.t_last = t_s
+        if i_a < -0.1:
+            self.v_min = min(self.v_min, v)
+            for j, vg in enumerate(QV_GRID):
+                if np.isnan(self.Q[j]) and self.v_min <= vg:
+                    self.Q[j] = self.q
+        j = int(np.sum(np.isfinite(self.Q)))
+        if j == 0:
+            return {"status": "waiting for the first grid voltage", "depth": 0}
+        mu, lo, hi = self.est.predict(self.Q, j, self.S)
+        return {"status": "estimating", "depth": j, "voltage": float(v), "Ah_so_far": round(self.q, 4),
+                "capacity_Ah": mu, "SOH": mu / self.c_bol, "SOH_band": (lo / self.c_bol, hi / self.c_bol)}

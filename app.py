@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.7"
+REQUIRED_ENGINE = "5.8"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -568,6 +568,7 @@ EXPLAIN: Dict[str, str] = {
     "ml_v2_fig": "ML v2 forecasts: each battery's own recent trend, corrected by what the models learned from the training batteries about acceleration and knees.",
     "pt_depth": "Error of the real-time SOH estimate against how much of the discharge has run (test batteries only). The lower and the further left a curve crosses the 1% line, the earlier a partial discharge reveals the battery's health.",
     "pt_vi": "Where the ageing information sits within a discharge: blue = how much the charge delivered at each voltage varies over the battery's life (the paper's attention), purple = how strongly it tracks capacity. The highlighted window is what the estimators rely on.",
+    "pt_wmap": "SOH error for discharges that only cover a voltage window (rows: where it starts, columns: where it stops). Wide windows across the main voltage region give the best estimates; short ones carry little capacity information.",
     "pt_cycle": "One discharge replayed sample by sample: the estimate (blue) and its 90% band converge towards the true end-of-discharge SOH (dashed, grey = ±1%) as more of the curve is seen.",
     "ml_v2_shap": "Shapley values: how much each measurement pushed this battery's forecast (SOH change at +40 cycles) above (blue) or below (purple) the average forecast. They add up to the difference from the average.",
     "ml_v2_imp": "Which measurements drive the v2 forecast: how much the error grows when one feature is shuffled (on held-out batteries, 40-cycle horizon). This answers which variables are most informative.",
@@ -2204,9 +2205,18 @@ def est_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, model:
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def replay_cached(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str,
-                  soh_eol: float, level: float, cap_every: int = 10) -> Tuple[te.EKFResult, pd.DataFrame]:
-    r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(),
-                         te.twin_config_for(_ct, cell, te.DualTwinConfig(capacity_every=cap_every)))
+                  soh_eol: float, level: float, cap_every: int = 10, partial_depth: float = 0.0,
+                  partial_relative: bool = False) -> Tuple[te.EKFResult, pd.DataFrame]:
+    if partial_depth > 0:
+        # field mode: every cycle, the real-time partial-discharge estimate replaces the full capacity check
+        est = te.fit_partial_estimator(_ct, te.v2_training_pool(_ct, cell), "Bayesian Ridge", "direct")
+        ov = te.partial_capacity_series(est, _ct, cell, partial_depth, relative=partial_relative)
+        base = te.twin_config_for(_ct, cell, te.DualTwinConfig())
+        r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(),
+                             replace(base, capacity_every=0, use_capacity=False), capacity_override=ov)
+    else:
+        r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(),
+                             te.twin_config_for(_ct, cell, te.DualTwinConfig(capacity_every=cap_every)))
     n_max = int(r.per_cycle["n"].max() * 1.6)
     rows = []
     for n in r.per_cycle["n"].astype(int):
@@ -3190,6 +3200,19 @@ def view_study() -> None:
         st.markdown("**How often should the twin update?** (tracking RMSE when updating every 1, 5 or 20 cycles)")
         show_table(res["update"].set_index("Cell_ID").style.format("{:.4f}", subset=[c for c in res["update"].columns
                                                                                    if c.startswith("RMSE")]))
+    st.markdown("**How deep must a field discharge go?** (real-time partial-discharge SOH, leave-one-battery-out "
+                "within each condition group)")
+    if st.button("Run the partial-discharge study", key="st_partial", icon=":material/bolt:"):
+        with st.spinner("Leave-one-battery-out per group…"):
+            res["partial"] = te.partial_group_study(ct)
+    pg = res.get("partial")
+    if pg is not None and len(pg):
+        show_table(pg.style.format({"MAE at 50% (SOH pts)": "{:.2f}", "MAE full curve": "{:.2f}",
+                                    "depth for ≤ 1%": lambda v: "never" if v is None or not np.isfinite(v) else f"{100 * v:.0f}%",
+                                    "depth for ≤ 2%": lambda v: "never" if v is None or not np.isfinite(v) else f"{100 * v:.0f}%",
+                                    "coverage": "{:.0%}"}, na_rep="never"),
+                   note="Mission 2 for the field: the share of a discharge needed before the SOH estimate stays within "
+                        "1 or 2 SOH points, per operating condition (Bayesian ridge, direct estimator).")
     section("Mission 3 · Integrated operation and maintenance")
     card("Answers", A["M3"])
     try:
@@ -3231,10 +3254,27 @@ def view_replay() -> None:
                 "cycle, updates SOH, resistances and the personal degradation rate *k*, and re-forecasts the "
                 "remaining life. Nothing after the cursor is visible to the twin.")
     level = 0.9
-    cap_every = st.select_slider("Reference capacity check every N cycles (0 = operando only)", [0, 5, 10, 20, 50],
-                                 value=10, key="rp_cap",
-                                 help="Between checks the twin sees only partial-window voltage and load-step "
-                                      "resistance. Set 0 to watch pure operando tracking, including its drift.")
+    cap_src = st.radio("Capacity information for the twin", ["full", "partial", "none"], horizontal=True, key="rp_capsrc",
+                       format_func={"full": "Full capacity checks (lab)",
+                                    "partial": "Real-time partial-discharge estimate (field)",
+                                    "none": "None (operando only)"}.get)
+    cap_every, p_depth, p_rel = 0, 0.0, False
+    if cap_src == "full":
+        cap_every = st.select_slider("Full capacity check every N cycles", [5, 10, 20, 50], value=10, key="rp_cap",
+                                     help="Between checks the twin sees only partial-window voltage and load-step resistance.")
+    elif cap_src == "partial":
+        c_a, c_b = st.columns([2, 1])
+        p_depth = c_a.select_slider("Each discharge is seen only up to this share", [0.2, 0.3, 0.4, 0.5, 0.7, 0.9],
+                                    value=0.4, key="rp_pdepth", format_func=lambda v: f"{100 * v:.0f}%",
+                                    help="The real-time SOH estimate at this depth (trained on comparable batteries) "
+                                         "becomes the twin's capacity measurement on every cycle, with its own "
+                                         "uncertainty. No full discharge is ever needed.")
+        p_rel = c_b.toggle("Bias-cancelling (relative)", value=False, key="rp_prel",
+                           help="Use the change since the battery's first discharges, anchored on its initial capacity. "
+                                "Helps when the estimator has a constant offset for this battery, hurts when its "
+                                "error grows over life: compare both.")
+        st.caption("Field mode: the twin never sees a full capacity measurement; it relies on operando voltage, "
+                   "resistance and the partial-discharge estimate.")
     show_models = st.multiselect(
         "Live models", list(te.LIVE_MODELS),
         default=[m for m in ("twin", "mech", "pf", "trend", "ens") if m in te.LIVE_MODELS], key="rp_models",
@@ -3246,10 +3286,11 @@ def view_replay() -> None:
              "Live ensemble: weights every model by its recent 5-cycle-ahead error.")
     with st.spinner("Streaming the battery through all models (runs once, then animates)…"):
         res, _track_old = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol),
-                                        level, int(cap_every))
+                                        level, int(cap_every), float(p_depth), bool(p_rel))
         st.session_state["ekf"] = {"key": (DATA_KEY, cell, "live"), "res": res}     # feeds Operations initialisation
         run_models = ("twin", "mech", "pf", "trend", "hb")
-        frames, track = live_cached(res, ct, imp, DATA_KEY, cell, float(soh_eol), level, int(cap_every), run_models)
+        frames, track = live_cached(res, ct, imp, DATA_KEY + f"|{cap_src}|{p_depth}|{p_rel}", cell, float(soh_eol), level,
+                                    int(cap_every), run_models)
     pc = res.per_cycle
     ns = pc["n"].astype(int).tolist()
     if len(ns) < 6:
@@ -4938,6 +4979,47 @@ def partial_section() -> None:
                               value=int(cyc["n"].iloc[len(cyc) // 2]), key="pt_cyc")
     cur = te.realtime_soh_curve(est, cyc[cyc["n"] == n_pick].iloc[0])
     show(fig_realtime_cycle(cur, P, f"Within-cycle replay · {bat}, cycle {n_pick} · {best}"), key="pt_cycle", export=False)
+    partial_field_windows(saved)
+
+
+def fig_window_map(ev: pd.DataFrame, P: Palette) -> go.Figure:
+    piv = ev.pivot_table(index="start V", columns="end V", values="MAE (SOH %)").sort_index(ascending=False)
+    piv = piv[sorted(piv.columns, reverse=True)]
+    fig = go.Figure(go.Heatmap(z=piv.to_numpy(), x=[f"{v:.2f}" for v in piv.columns], y=[f"{v:.2f}" for v in piv.index],
+                               colorscale=[[0, "#0072B2"], [0.35, "#56B4E9"], [0.7, "#CC79A7"], [1, "#882255"]],
+                               colorbar=dict(title=dict(text="MAE (SOH pts)", font=dict(color=P.text)), tickfont=dict(color=P.muted)),
+                               hovertemplate="window %{y} V → %{x} V<br>MAE %{z:.2f} SOH points<extra></extra>",
+                               text=np.round(piv.to_numpy(), 1), texttemplate="%{text}"))
+    fig.update_xaxes(title_text="Window ends at (V)")
+    fig.update_yaxes(title_text="Window starts at (V)")
+    return style_fig(fig, P, 460, "Field cycles: SOH error by the voltage window a discharge happens to cover",
+                     hovermode="closest")
+
+
+def partial_field_windows(saved: Dict[str, Any]) -> None:
+    with st.expander("Field cycles that start anywhere (beyond the paper)", icon=":material/open_in_full:"):
+        st.markdown("Field discharges rarely start full or reach the cut-off. Here the estimator sees only the charge "
+                    "delivered between the voltages inside a random window, plus where the window lies; a capacity "
+                    "proxy (window charge ÷ the share of capacity a reference battery delivers in that window) "
+                    "carries the physics.")
+        mdl = st.selectbox("Model", [m for m in ("Gaussian Process", "SVM", "Bayesian Ridge") if m in te.available_models()],
+                           key="pt_w_model", help="On synthetic tests the Gaussian process was best for windows.")
+        if st.button("Evaluate field windows", key="pt_w_go", icon=":material/grid_on:"):
+            sc_ = scheme()
+            train = list(saved["key"][1])
+            test_tab = saved["test"]
+            try:
+                w = te.WindowSOHEstimator(mdl).fit(te.partial_table(ct, train))
+                st.session_state["pt_windows"] = te.window_evaluation(w, test_tab)
+            except Exception as exc:
+                report_error("Window evaluation failed", exc, debug)
+        ev = st.session_state.get("pt_windows")
+        if ev is not None and len(ev):
+            show(fig_window_map(ev, P), key="pt_wmap", export=False)
+            show_table(ev.sort_values("MAE (SOH %)").head(8).set_index(["start V", "end V"])
+                       .style.format({"MAE (SOH %)": "{:.2f}", "coverage": "{:.0%}"}),
+                       note="The most informative windows: where a partial field discharge should run to reveal the "
+                            "battery's health best.")
 
 
 def view_models() -> None:
