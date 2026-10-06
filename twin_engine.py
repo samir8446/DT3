@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.6.0"
+ENGINE_VERSION = "6.1.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -1963,7 +1963,8 @@ def _dual_measurement(x: np.ndarray, arr: Tuple[np.ndarray, np.ndarray, np.ndarr
     return np.concatenate(z), np.concatenate(h), np.vstack(H), np.concatenate(R), vres
 
 
-def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = None
+def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = None,
+                 capacity_override: Optional[Dict[int, Tuple[float, float]]] = None
                  ) -> Tuple[pd.DataFrame, np.ndarray, int, int]:
     from scipy.stats import chi2
 
@@ -2007,7 +2008,15 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
         if any_meas and due and not bool(r.outlier) and arr is not None:
             p_soh0, p_lk0 = float(P[0, 0]), float(P[3, 3])
             cap_due = cfg.capacity_every > 0 and i % int(cfg.capacity_every) == 0
-            meas = _dual_measurement(x, arr, prep, cfg_cap if cap_due else cfg, r.Capacity_Ah)
+            ov = capacity_override.get(int(r.n)) if capacity_override else None
+            if ov is not None:
+                # real-time capacity estimate from a partial discharge, with its own uncertainty
+                cap_val = float(ov[0])
+                meas = _dual_measurement(x, arr, prep, replace(cfg, use_capacity=True, sigma_q_Ah=max(float(ov[1]), 1e-3)),
+                                         cap_val)
+            else:
+                cap_val = float(r.Capacity_Ah) if np.isfinite(r.Capacity_Ah) else float("nan")
+                meas = _dual_measurement(x, arr, prep, cfg_cap if cap_due else cfg, r.Capacity_Ah)
             if meas is not None:
                 z, hx, H, Rv, vres = meas
                 m = len(z)
@@ -2031,7 +2040,7 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
                     # cycles in a row (e.g. load changes in mixed campaigns). Re-initialise the capacity state
                     # from a measured capacity when one is available and reset the degradation rate to its
                     # prior; otherwise mark the forecast unreliable. Then continue from a widened covariance.
-                    cap = float(r.Capacity_Ah) if np.isfinite(r.Capacity_Ah) else float("nan")
+                    cap = cap_val if (ov is not None or cap_due or cfg.use_capacity) else float("nan")
                     if np.isfinite(cap) and cap > 0:
                         x[0] = cap / prep.c_bol
                         x[3] = math.log(prep.k_prior)
@@ -2040,7 +2049,10 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
                     n_guard += 1
                     consec_fail = 0
                     unreliable_for = 10
-                    meas2 = _dual_measurement(x, arr, prep, cfg_cap if cap_due else cfg, r.Capacity_Ah)
+                    meas2 = (_dual_measurement(x, arr, prep, replace(cfg, use_capacity=True,
+                                                                     sigma_q_Ah=max(float(ov[1]), 1e-3)), cap_val)
+                             if ov is not None else _dual_measurement(x, arr, prep, cfg_cap if cap_due else cfg,
+                                                                      r.Capacity_Ah))
                     if meas2 is not None:
                         z, hx, H, Rv, vres = meas2
                         m = len(z)
@@ -2091,7 +2103,8 @@ def _dual_filter(prep: _DualPrep, cfg: DualTwinConfig, progress: ProgressFn = No
 def run_dual_twin(cell_df: pd.DataFrame, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str,
                   params: TwinParameters, cfg: Optional[DualTwinConfig] = None,
                   calib_cells: Sequence[str] = (), progress: ProgressFn = None,
-                  _prep: Optional[_DualPrep] = None) -> EKFResult:
+                  _prep: Optional[_DualPrep] = None,
+                  capacity_override: Optional[Dict[int, Tuple[float, float]]] = None) -> EKFResult:
     """Dual time-scale ECM twin (per-cycle EKF, see DualTwinConfig). Estimates are causal:
     the state at cycle n uses only data up to n. The degradation-rate prior log k comes
     from cohort calibration partners, and the filter personalises it with the cell's own
@@ -2099,7 +2112,7 @@ def run_dual_twin(cell_df: pd.DataFrame, ct: pd.DataFrame, imp: Optional[pd.Data
     t0 = time.time()
     cfg = cfg or DualTwinConfig()
     prep = _prep or _dual_prepare(cell_df, ct, imp, cell_id, params, calib_cells)
-    per, covs, n_upd, n_infl = _dual_filter(prep, cfg, progress)
+    per, covs, n_upd, n_infl = _dual_filter(prep, cfg, progress, capacity_override)
     pr = asdict(prep.params)
     pr.update({"k_ah": float(per["k_ah"].iloc[-1]), "k_prior": prep.k_prior})
     _report(progress, 1.0, "dual twin done")
@@ -6664,6 +6677,7 @@ V2_FEATURES = {
     "cum_ah": "Cumulative throughput (Ah)", "ah_cycle": "Ah per cycle",
     "arrhenius": "Arrhenius factor (cell temperature)", "c_rate": "C-rate", "v_cut": "Cut-off voltage",
     "dq_logvar": "ΔQ(V) variance (log10), cycle 2 → now",
+    "soh_slope_ah": "SOH trend per Ah, last 20 cycles",
     "ica_h_rel": "ICA main-peak height now / new", "ica_v_shift": "ICA main-peak voltage shift (V)",
     "ica_h_slope": "ICA peak-height trend", "cum_heat": "Cumulative heating (Σ temperature rise)",
     "rest_h": "Rest before recent cycles (h)",
@@ -6723,6 +6737,74 @@ def _ica_state(h: pd.DataFrame) -> Dict[str, float]:
             "ica_h_slope": 100 * _slope(h["n"].to_numpy(float)[last], hh[last] / (first_h or 1.0))}
 
 
+def _slope_ah(h: pd.DataFrame, window: int = 20) -> float:
+    """Robust (Theil-Sen) fade per Ah of throughput over the last `window` cleaned cycles, x100 (SOH % per Ah)."""
+    from scipy.stats import theilslopes
+
+    t = h.tail(window)
+    if len(t) < 5 or "cum_Ah" not in t or np.ptp(t["cum_Ah"]) <= 0:
+        return 0.0
+    col = "SOH_causal" if "SOH_causal" in t else "SOH"
+    return 100 * min(float(theilslopes(t[col], t["cum_Ah"])[0]), 0.0)
+
+
+def fleet_shape(ct: pd.DataFrame, cells: Sequence[str], n_grid: int = 300) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Typical fade shape of comparable batteries: median cleaned SOH against Ah throughput (where at least two
+    batteries have data), extended beyond the longest history with the final slope, non-increasing."""
+    curves = []
+    for c in cells:
+        d = ct[ct["Cell_ID"] == c]
+        if d[~d["outlier"]].shape[0] < 10:
+            continue
+        dc = clean_capacity(d)
+        A = dc["cum_Ah"].to_numpy(float) - float(dc["cum_Ah"].iloc[0])
+        curves.append((A, dc["SOH_clean"].to_numpy(float)))
+    if not curves:
+        return None
+    a_max = max(c[0].max() for c in curves)
+    grid = np.linspace(0, a_max, n_grid)
+    M = np.full((len(curves), n_grid), np.nan)
+    for i, (A, S) in enumerate(curves):
+        ok = grid <= A.max()
+        M[i, ok] = np.interp(grid[ok], A, S)
+    cnt = np.isfinite(M).sum(axis=0)
+    need = 2 if len(curves) >= 2 else 1
+    F = np.where(cnt >= need, np.nanmedian(np.where(np.isfinite(M), M, np.nan), axis=0), np.nan)
+    ok = np.isfinite(F)
+    if ok.sum() < 5:
+        return None
+    grid, F = grid[ok], np.minimum.accumulate(F[ok])
+    return grid, F
+
+
+def _shape_at(shape: Tuple[np.ndarray, np.ndarray], a: np.ndarray) -> np.ndarray:
+    A, F = shape
+    tail = max(5, len(A) // 7)
+    slope = min((F[-1] - F[-tail]) / max(A[-1] - A[-tail], 1e-9), 0.0)
+    a = np.asarray(a, float)
+    return np.where(a <= A[-1], np.interp(a, A, F), F[-1] + slope * (a - A[-1]))
+
+
+def shape_drop(shape: Tuple[np.ndarray, np.ndarray], s0: float, slope_ah: float, dah: float,
+               horizons: np.ndarray, shrink: float = 0.7) -> np.ndarray:
+    """SOH drop at each horizon (cycles) predicted by the fleet shape for a battery now at SOH s0 that fades at
+    `slope_ah` (SOH per Ah): place the battery at the fleet's equivalent age (same SOH), estimate its speed
+    relative to the fleet there (k, shrunk towards 1 and bounded), then follow the fleet curve at that speed.
+    Unlike a straight line this bends where batteries of this type bend (end of the early plateau, knee)."""
+    A, F = shape
+    a_star = 0.0 if s0 >= F[0] else float(np.interp(s0, F[::-1], A[::-1]))
+    w = max(15 * dah, A[1] - A[0])
+    lo_a = max(a_star - w, 0.0)
+    hi_a = lo_a + w if a_star - lo_a < 0.5 * w else a_star
+    fs = float((_shape_at(shape, [hi_a])[0] - _shape_at(shape, [lo_a])[0]) / max(hi_a - lo_a, 1e-9))
+    if fs < -1e-9 and slope_ah < 0:
+        k = float(np.exp(shrink * np.log(np.clip(slope_ah / fs, 0.4, 2.5))))
+    else:
+        k = 1.0
+    base = _shape_at(shape, [a_star])[0]
+    return _shape_at(shape, a_star + k * dah * np.asarray(horizons, float)) - base
+
+
 def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> Dict[str, float]:
     """Features known at cycle k (rows n <= k of a cleaned battery history): current level and recent trend
     of the health indicators, cumulative throughput and physics-scaled operating conditions."""
@@ -6760,21 +6842,24 @@ def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> 
             "arrhenius": math.exp(30e3 / R_GAS * (1 / 298.15 - 1 / T)), "c_rate": I / max(c_bol, 1e-6),
             "v_cut": float(h["V_min_V"].median()) if "V_min_V" in h else 2.7,
             "dq_logvar": delta_q_stats(h, 2, k)["dq_logvar"] if k >= 6 else np.nan,
+            "soh_slope_ah": _slope_ah(h),
             **_ica_state(h), "cum_heat": float(h["dT_C"].clip(lower=0).sum()) if "dT_C" in h else np.nan,
             "rest_h": float(last["rest_h"].median()) if "rest_h" in h and last["rest_h"].notna().any() else np.nan}
 
 
 def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], step: int = 3, k_min: int = 8,
-                augment: Sequence[float] = (), target: Optional[str] = None) -> pd.DataFrame:
+                augment: Sequence[float] = (), target: Optional[str] = None, baseline: str = "trend") -> pd.DataFrame:
     """Training table: for every cell and origin k, the state features at k and, per horizon, how far the true
     SOH drop departs from the cell's own recent trend. `augment` adds time-warped copies of every training
     battery (ageing per cycle x 1/f: cycle index and throughput stretched by f); copies keep the original
     Cell_ID so cross-validation never splits a battery from its copies."""
     rows = []
+    hz_arr = np.array(V2_HORIZONS, float)
     for c in cells:
         d = ct[ct["Cell_ID"] == c]
         if d.empty:
             continue
+        shape_c = fleet_shape(ct, [x for x in cells if x not in (c, target)]) if baseline == "shape" else None
         dc0 = clean_capacity(d)
         c_bol = float(d["C_bol_Ah"].iloc[0])
         factors = [1.0] + ([f for f in augment if f != 1.0] if c != target else [])
@@ -6791,10 +6876,13 @@ def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], 
                 except ValueError:
                     continue
                 s_k = float(f["soh_now"])
-                rate = f["soh_slope"] / 100.0
+                if shape_c is not None:
+                    base = shape_drop(shape_c, s_k, f["soh_slope_ah"] / 100.0, f["ah_cycle"], hz_arr)
+                else:
+                    base = f["soh_slope"] / 100.0 * hz_arr
                 row = {"Cell_ID": c, "k": k, "aug": fct, **f}
-                for hz in V2_HORIZONS:
-                    row[f"y{hz}"] = (float(np.interp(k + hz, n_arr, s_arr)) - s_k - rate * hz) \
+                for hz, b in zip(V2_HORIZONS, base):
+                    row[f"y{hz}"] = (float(np.interp(k + hz, n_arr, s_arr)) - s_k - b) \
                         if k + hz <= min(lim, n_arr.max()) else np.nan
                 rows.append(row)
     return pd.DataFrame(rows)
@@ -6828,6 +6916,7 @@ class V2Forecast:
     shap: Optional[pd.DataFrame] = None    # Shapley contribution of each feature to the 40-cycle forecast
     selected: List[str] = field(default_factory=list)
     options: Dict[str, Any] = field(default_factory=dict)
+    baseline_curve: Optional[np.ndarray] = None    # the baseline alone (fleet shape or straight trend) on n_grid
 
 
 def shapley_values(predict: Callable[[np.ndarray], np.ndarray], x0: np.ndarray, background: np.ndarray,
@@ -6860,7 +6949,7 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
                 model_params: Optional[Dict[str, Any]] = None, level: float = 0.9, cv_folds: int = 3,
                 seed: int = 0, horizon_factor: float = 1.5, alpha: float = 0.2, monotone: bool = True,
                 select_features: bool = False, augment: bool = False, battery_conformal: bool = True,
-                explain: bool = True) -> V2Forecast:
+                explain: bool = True, baseline: str = "shape") -> V2Forecast:
     """ML v2 forecaster. Forecast = the battery's own robust recent trend + a learned deviation: one regressor
     per horizon h predicts how far the true drop SOH(n0 + h) - SOH(n0) departs from "the last-15-cycle trend
     continues", from the state features at n0. Grouped cross-validation by battery sets (a) how much of the
@@ -6876,7 +6965,8 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
     model_params = validate_params(model_name, model_params)
     good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
     pool = v2_training_pool(ct, cell_id, train_cells)
-    tab = _v2_samples(ct, pool + [cell_id], {cell_id: n0}, augment=(0.85, 1.15) if augment else (), target=cell_id)
+    tab = _v2_samples(ct, pool + [cell_id], {cell_id: n0}, augment=(0.85, 1.15) if augment else (), target=cell_id,
+                      baseline=baseline)
     all_feats = [f for f in V2_FEATURES if f in tab.columns and tab[f].notna().mean() > 0.3]
     if len(tab) < 20:
         raise ValueError("ML v2: not enough training origins (choose more training batteries).")
@@ -6972,10 +7062,14 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
                                                                                   key=np.abs, ascending=False)
         shap_df.attrs["base"] = base
     hz = np.array(V2_HORIZONS, float)
-    rate0 = f0["soh_slope"] / 100.0
-    P_ = np.array(res["preds"], float) + rate0 * hz
-    L0 = np.array(res["los"], float) + rate0 * hz
-    H0 = np.array(res["his"], float) + rate0 * hz
+    shape_t = fleet_shape(ct, pool) if baseline == "shape" else None
+    if shape_t is not None:
+        base0 = shape_drop(shape_t, float(f0["soh_now"]), f0["soh_slope_ah"] / 100.0, f0["ah_cycle"], hz)
+    else:
+        base0 = f0["soh_slope"] / 100.0 * hz
+    P_ = np.array(res["preds"], float) + base0
+    L0 = np.array(res["los"], float) + base0
+    H0 = np.array(res["his"], float) + base0
     ok = np.isfinite(P_)
     if ok.sum() < 2:
         raise ValueError("ML v2: too few horizons could be trained.")
@@ -6997,6 +7091,8 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
 
     past = np.interp(n_grid, good["n"], good["SOH"])
     med_c = np.where(n_grid > n0, np.clip(s0 + curve(P_), 0.0, 1.05), past)
+    b_ok = np.minimum.accumulate(np.minimum(base0[ok], 0.0))
+    base_c = np.where(n_grid > n0, np.clip(s0 + curve(b_ok), 0.0, 1.05), past)
     lo_c = np.where(n_grid > n0, np.clip(s0 + curve(L_), 0.0, 1.05), past)
     hi_c = np.where(n_grid > n0, np.clip(s0 + curve(H_), 0.0, 1.05), past)
     soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
@@ -7006,7 +7102,7 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
                       res["imp"] if res["imp"] is not None else pd.DataFrame(), f0, pool, time.time() - t0,
                       dict(zip(V2_HORIZONS, res["w"])), cv, shap_df, feats,
                       {"monotone": bool(use_mono), "select_features": select_features, "augment": augment,
-                       "battery_conformal": battery_conformal})
+                       "battery_conformal": battery_conformal, "baseline": baseline}, base_c)
 
 
 # =============================================================================
@@ -7269,3 +7365,902 @@ def ml_v2_ensemble(members: Sequence["V2Forecast"], ct: pd.DataFrame, eol_ah: fl
     fc = ProgForecast("ML ensemble (v2)", grid, mean, mean - half, mean + half, None,
                       {"weights": {m.model: float(x) for m, x in zip(ms, w)}})
     return _v2_finish(fc, ct, ms[0].cell_id, ms[0].n0, eol_ah, "ML ensemble (v2)", alpha)
+
+
+# =============================================================================
+# 31. REAL-TIME SOH FROM PARTIAL DISCHARGES (after Qin, Arunan & Yuen, IEEE TII 19(5), 2023)
+# =============================================================================
+# A discharge in progress is described by the charge delivered at each fixed voltage it has already passed
+# (the stored Q(V) grid, 3.95 V -> 3.10 V). For a constant-current discharge this voltage-domain alignment is an
+# energy-preserving synchronisation of cycles of different length (the role of EDTW in the paper) that needs
+# no optimisation. "Depth" j = number of grid voltages reached so far.
+PARTIAL_DEPTHS = (4, 8, 12, 16, 20, 24, 28, 35)          # depth buckets (grid points reached)
+PARTIAL_METHODS = {"direct": "Direct (one model per discharge depth)",
+                   "knn": "Nearest-cycle reconstruction (paper, k = 5)"}
+
+
+def partial_table(ct: pd.DataFrame, cells: Sequence[str], max_n: Optional[Dict[str, int]] = None,
+                  min_n: Optional[Dict[str, int]] = None) -> pd.DataFrame:
+    """One row per valid discharge: Q at every grid voltage (Ah), capacity label, C_bol and cell id.
+    Cycles outside [min_n, max_n] of a cell are left out (used to split one battery into train / test)."""
+    rows = []
+    for c in cells:
+        d = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
+        if QV_COLS[0] not in d or d.empty:
+            continue
+        if max_n and c in max_n:
+            d = d[d["n"] <= max_n[c]]
+        if min_n and c in min_n:
+            d = d[d["n"] > min_n[c]]
+        d = d.dropna(subset=QV_COLS[:2] + ["Capacity_Ah"])
+        if d.empty:
+            continue
+        d = d.assign(I_set=float(d["I_dis_A"].median()), V_cut_set=float(d["V_min_V"].median()))
+        rows.append(d[["Cell_ID", "n", "Capacity_Ah", "C_bol_Ah", "SOH", "I_set", "V_cut_set"] + QV_COLS])
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def _prefix_X(Q: np.ndarray, j: int, S: Optional[np.ndarray] = None) -> np.ndarray:
+    """Features of a discharge after reaching the first j grid voltages: the Q values, their increments
+    (incremental capacity between grid voltages: the ICA information) and the discharge settings known
+    beforehand (S: current, cut-off voltage), which decide how much charge remains below the last grid point."""
+    q = np.nan_to_num(Q[:, :j], nan=0.0)
+    dq = np.diff(np.concatenate([np.zeros((len(q), 1)), q], axis=1), axis=1)
+    return np.hstack([q, dq] + ([S] if S is not None else []))
+
+
+def voltage_importance(tab: pd.DataFrame, threshold: float = 0.35) -> pd.DataFrame:
+    """Paper's time-attention importance in the voltage domain: spread of Q(V) across cycles at each grid
+    voltage, normalised by its maximum (I(V) = Var_cycles Q(V) / max). Also |correlation| of Q(V) with the
+    capacity label, which shows where the ageing information actually sits. 'important' = I >= threshold."""
+    Q = tab[QV_COLS].to_numpy(float)
+    var = np.nanvar(Q, axis=0)
+    cap = tab["Capacity_Ah"].to_numpy(float)
+    corr = [abs(float(pd.Series(Q[:, j]).corr(pd.Series(cap)))) if np.isfinite(Q[:, j]).sum() > 5 else np.nan
+            for j in range(Q.shape[1])]
+    imp = var / np.nanmax(var) if np.nanmax(var) > 0 else var
+    frac = np.nanmedian(Q / cap[:, None], axis=0)
+    return pd.DataFrame({"V": QV_GRID, "depth": np.arange(1, len(QV_GRID) + 1), "importance": imp,
+                         "abs_corr_with_capacity": corr, "fraction_discharged": frac, "important": imp >= threshold})
+
+
+@dataclass
+class PartialSOHEstimator:
+    """Real-time capacity estimator for discharges in progress. method='direct': one regressor per depth
+    bucket, trained on exactly the information available at that depth. method='knn': the paper's
+    reconstruction: the k training cycles closest to the partial curve (Euclidean on the reached points) lend
+    their remaining curve (shifted to join continuously), and the full-depth model is applied to each
+    reconstruction; the spread across neighbours gives the band. Bands are split-conformal per depth."""
+    model_name: str = "Random Forest"
+    method: str = "direct"
+    k: int = 5
+    level: float = 0.9
+    seed: int = 0
+    models: Dict[int, Any] = field(default_factory=dict)
+    q_conf: Dict[int, float] = field(default_factory=dict)
+    library: Optional[np.ndarray] = None
+    train_cells: List[str] = field(default_factory=list)
+
+    def _fit_depth(self, X: np.ndarray, y: np.ndarray) -> Any:
+        Xs, ys, _ = _gp_subsample(self.model_name, X, y, np.ones(len(y)), self.seed)
+        # up to ~70 inputs: a polynomial expansion would explode (degree 3 -> tens of thousands of terms)
+        prm = {"degree": 1} if MODEL_SPECS[self.model_name].poly else None
+        return _StandardisedTarget(make_model(self.model_name, self.seed, prm)).fit(Xs, ys)
+
+    def fit(self, tab: pd.DataFrame) -> "PartialSOHEstimator":
+        if len(tab) < 30:
+            raise ValueError("partial-discharge estimator: fewer than 30 training discharges")
+        Q = tab[QV_COLS].to_numpy(float)
+        S = tab[["I_set", "V_cut_set"]].to_numpy(float)
+        y = tab["Capacity_Ah"].to_numpy(float)
+        g = tab["Cell_ID"].to_numpy()
+        self.train_cells = sorted(set(g))
+        self.library = np.nan_to_num(Q, nan=0.0)
+        self.library_S = S
+        rng = np.random.default_rng(self.seed)
+        cells = np.array(self.train_cells)
+        if len(cells) >= 3:                                  # split-conformal calibration by battery
+            cal = np.isin(g, rng.choice(cells, size=max(1, len(cells) // 3), replace=False))
+        else:
+            cal = rng.random(len(y)) < 0.2
+        full = len(QV_COLS)
+        depths = PARTIAL_DEPTHS if self.method == "direct" else (full,)
+        cal_models = {}
+        for jd in depths:
+            cal_models[jd] = self._fit_depth(_prefix_X(Q[~cal], jd, S[~cal]), y[~cal])
+            if self.method == "direct":
+                r = np.abs(cal_models[jd].predict(_prefix_X(Q[cal], jd, S[cal])) - y[cal])
+                self.q_conf[jd] = float(np.quantile(r, min(1.0, self.level * (1 + 1 / max(len(r), 1)))))
+            self.models[jd] = self._fit_depth(_prefix_X(Q, jd, S), y)
+        if self.method == "knn":
+            # calibrate the reconstruction route on held-out batteries, neighbours drawn from the other batteries
+            idx = np.nonzero(cal)[0]
+            idx = idx[rng.permutation(len(idx))[:200]]
+            lib_mask = ~cal
+            for jd in PARTIAL_DEPTHS:
+                mu = self._knn_batch(Q[idx], S[idx], jd, cal_models[full], lib_mask)[0]
+                r = np.abs(mu - y[idx])
+                self.q_conf[jd] = float(np.quantile(r, min(1.0, self.level * (1 + 1 / max(len(r), 1))))) if len(r) else 0.05
+        return self
+
+    def _bucket(self, j: int) -> int:
+        ok = [d for d in PARTIAL_DEPTHS if d <= j]
+        return ok[-1] if ok else PARTIAL_DEPTHS[0]
+
+    def _knn_batch(self, Qp: np.ndarray, Sp: np.ndarray, j: int, model: Any,
+                   lib_mask: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """Batched reconstruction for many partial curves: k nearest library cycles on the first j points (same
+        settings preferred), their remainder shifted to join continuously, full-curve model on each, mean and sd."""
+        lib = self.library if lib_mask is None else self.library[lib_mask]
+        libS = self.library_S if lib_mask is None else self.library_S[lib_mask]
+        q = np.nan_to_num(Qp[:, :j], nan=0.0)
+        d2 = ((q[:, None, :] - lib[None, :, :j]) ** 2).sum(axis=2)
+        d2 = d2 + 10.0 * ((Sp[:, None, :] - libS[None, :, :]) ** 2).sum(axis=2)   # prefer the same settings
+        nn = np.argsort(d2, axis=1)[:, : self.k]
+        full = lib.shape[1]
+        R = np.empty((len(q) * self.k, full))
+        SR = np.repeat(Sp, self.k, axis=0)
+        for a in range(len(q)):
+            for b, i in enumerate(nn[a]):
+                tail = lib[i, j:] - lib[i, j - 1] + q[a, -1] if j < full else np.array([])
+                R[a * self.k + b] = np.concatenate([q[a], tail])
+        p = model.predict(_prefix_X(R, full, SR)).reshape(len(q), self.k)
+        return p.mean(axis=1), p.std(axis=1)
+
+    def predict(self, q_full: np.ndarray, j: int, settings: Optional[np.ndarray] = None) -> Tuple[float, float, float]:
+        """Capacity estimate (Ah) and band after reaching the first j grid voltages."""
+        j = int(np.clip(j, 1, len(QV_COLS)))
+        b = self._bucket(j)
+        q = np.asarray(q_full, float)[None, :]
+        S = np.asarray(settings if settings is not None else [2.0, 2.7], float)[None, :]
+        if self.method == "knn":
+            mu, sd = self._knn_batch(q, S, j, self.models[len(QV_COLS)])
+            mu, sd = float(mu[0]), float(sd[0])
+            half = max(self.q_conf.get(b, 0.05), 1.645 * sd)
+        else:
+            mu = float(self.models[b].predict(_prefix_X(q, b, S))[0])
+            half = self.q_conf.get(b, 0.05)
+        return mu, mu - half, mu + half
+
+    def predict_table(self, tab: pd.DataFrame, j: int) -> np.ndarray:
+        """Batched estimates (n x 3: mean, lo, hi) for many discharges at depth j."""
+        Q = tab[QV_COLS].to_numpy(float)
+        S = tab[["I_set", "V_cut_set"]].to_numpy(float)
+        b = self._bucket(j)
+        if self.method == "knn":
+            mu, sd = self._knn_batch(Q, S, j, self.models[len(QV_COLS)])
+            half = np.maximum(self.q_conf.get(b, 0.05), 1.645 * sd)
+        else:
+            mu = self.models[b].predict(_prefix_X(Q, b, S))
+            half = np.full(len(mu), self.q_conf.get(b, 0.05))
+        return np.column_stack([mu, mu - half, mu + half])
+
+
+def partial_depth_evaluation(est: PartialSOHEstimator, tab: pd.DataFrame) -> pd.DataFrame:
+    """Error vs discharge depth on test discharges (the paper's Fig. 11, in the voltage domain): MAE and RMSE
+    of the capacity estimate in SOH points (% of each battery's initial capacity) and band coverage."""
+    rows = []
+    Q = tab[QV_COLS].to_numpy(float)
+    y = tab["Capacity_Ah"].to_numpy(float)
+    cb = tab["C_bol_Ah"].to_numpy(float)
+    frac = np.nanmedian(Q / y[:, None], axis=0)
+    for j in PARTIAL_DEPTHS:
+        pr = est.predict_table(tab, j)
+        e = (pr[:, 0] - y) / cb * 100
+        inside = (y >= pr[:, 1]) & (y <= pr[:, 2])
+        rows.append({"depth": j, "V reached": float(QV_GRID[j - 1]), "fraction discharged": float(frac[j - 1]),
+                     "MAE (SOH %)": float(np.mean(np.abs(e))), "RMSE (SOH %)": float(np.sqrt(np.mean(e ** 2))),
+                     "coverage": float(np.mean(inside)), "discharges": len(tab)})
+    return pd.DataFrame(rows)
+
+
+def depth_needed(ev: pd.DataFrame, tol: float) -> Optional[float]:
+    """Smallest fraction of the discharge after which the MAE stays below `tol` SOH points (None if never)."""
+    ok = ev["MAE (SOH %)"].to_numpy() <= tol
+    for i in range(len(ok)):
+        if ok[i:].all():
+            return float(ev["fraction discharged"].iloc[i])
+    return None
+
+
+def realtime_soh_curve(est: PartialSOHEstimator, row: pd.Series) -> pd.DataFrame:
+    """Within-cycle replay of one discharge (the paper's Fig. 10): SOH estimate and band after each grid
+    voltage reached, against the cycle's true end-of-discharge SOH."""
+    q = row[QV_COLS].to_numpy(float)
+    cap, cb = float(row["Capacity_Ah"]), float(row["C_bol_Ah"])
+    S = np.array([row["I_set"], row["V_cut_set"]], float)
+    out = []
+    for j in range(1, len(QV_COLS) + 1):
+        if not np.isfinite(q[j - 1]):
+            break
+        mu, lo, hi = est.predict(q, j, S)
+        out.append({"depth": j, "V": float(QV_GRID[j - 1]), "fraction discharged": float(q[j - 1] / cap),
+                    "SOH estimate": mu / cb, "lo": lo / cb, "hi": hi / cb, "SOH true": cap / cb})
+    return pd.DataFrame(out)
+
+
+def fit_partial_estimator(ct: pd.DataFrame, train_cells: Sequence[str], model_name: str = "Random Forest",
+                          method: str = "direct", target: Optional[str] = None, n0: Optional[int] = None,
+                          level: float = 0.9, seed: int = 0) -> PartialSOHEstimator:
+    """Fit on the training batteries' discharges, plus the target battery's own discharges up to n0 when given
+    (within-battery scheme). The target's later discharges are the test set."""
+    cells = list(dict.fromkeys(list(train_cells) + ([target] if target and n0 else [])))
+    tab = partial_table(ct, cells, max_n={target: n0} if target and n0 else None)
+    return PartialSOHEstimator(model_name, method, level=level, seed=seed).fit(tab)
+
+
+
+# ---------------------------------------------------------------- phase 3: partial-discharge SOH -> twin
+def partial_capacity_series(est: "PartialSOHEstimator", ct: pd.DataFrame, cell_id: str, depth_frac: float = 0.5,
+                            min_n: Optional[int] = None, relative: bool = False,
+                            relative_sd_factor: float = 1.0) -> Dict[int, Tuple[float, float]]:
+    """Per-cycle capacity pseudo-measurements for the twin: for every discharge of the battery, the real-time
+    estimate after `depth_frac` of the discharge (the grid voltage reached at that share), with sd = band / 1.645.
+    This is what a field battery that is only partly discharged can provide on every cycle."""
+    tab = partial_table(ct, [cell_id], min_n={cell_id: min_n} if min_n else None)
+    if tab.empty:
+        return {}
+    frac = np.nanmedian(tab[QV_COLS].to_numpy(float) / tab["Capacity_Ah"].to_numpy(float)[:, None], axis=0)
+    j = int(np.clip(np.searchsorted(frac, depth_frac) + 1, 1, len(QV_COLS)))
+    pr = est.predict_table(tab, j)
+    sd = np.maximum((pr[:, 2] - pr[:, 1]) / (2 * 1.645), 1e-3)
+    mu = pr[:, 0].copy()
+    if relative:
+        # remove the battery-specific bias of a cross-battery estimator: use the estimated *change* since the
+        # battery's first discharges, anchored on its known initial capacity (spec sheet / first test);
+        # the band then only needs to cover the noise around the trend, not the offset
+        first = tab.sort_values("n").head(5).index
+        mu = mu - float(np.median(mu[tab.index.get_indexer(first)])) + float(tab["C_bol_Ah"].iloc[0])
+        sd = np.maximum(sd * relative_sd_factor, 1e-3)
+    return {int(n): (float(m), float(s_)) for n, m, s_ in zip(tab["n"], mu, sd)}
+
+
+def twin_with_partial_soh(store: "ParquetStore", ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str,
+                          est: "PartialSOHEstimator", depth_frac: float = 0.5,
+                          cfg: Optional[DualTwinConfig] = None, relative: bool = False) -> EKFResult:
+    """Dual-EKF twin whose capacity measurement on every cycle is the real-time partial-discharge estimate
+    (no full capacity checks needed); periodic full checks are switched off."""
+    ov = partial_capacity_series(est, ct, cell_id, depth_frac, relative=relative)
+    base = twin_config_for(ct, cell_id, cfg or DualTwinConfig())
+    return run_dual_twin(store.cell_frame(cell_id), ct, imp, cell_id, TwinParameters(),
+                         replace(base, capacity_every=0, use_capacity=False), capacity_override=ov)
+
+
+def partial_group_study(ct: pd.DataFrame, model_name: str = "Bayesian Ridge", method: str = "direct",
+                        groups: Optional[Sequence[str]] = None, min_cells: int = 2,
+                        progress: ProgressFn = None) -> pd.DataFrame:
+    """Cohort result for Mission 2: per condition group, leave-one-battery-out within the group, the share of
+    the discharge needed before the real-time SOH error stays below 1 and 2 SOH points."""
+    g = condition_groups(ct)
+    todo = [x for x in (groups or GROUP_ORDER) if x in set(g["Group"]) and x not in V2_EXCLUDED_GROUPS]
+    rows = []
+    for k, grp in enumerate(todo):
+        cells = list(g.index[g["Group"] == grp])
+        if len(cells) < min_cells:
+            continue
+        evs = []
+        for c in cells:
+            _report(progress, (k + cells.index(c) / len(cells)) / max(len(todo), 1), f"{grp}: leave out {c}")
+            try:
+                est = fit_partial_estimator(ct, [x for x in cells if x != c], model_name, method)
+                evs.append(partial_depth_evaluation(est, partial_table(ct, [c])))
+            except Exception:
+                continue
+        if not evs:
+            continue
+        ev = pd.concat(evs).groupby("depth", as_index=False).mean(numeric_only=True)
+        d1, d2 = depth_needed(ev, 1.0), depth_needed(ev, 2.0)
+        rows.append({"Group": grp, "batteries": len(evs), "MAE at 50% (SOH pts)": float(np.interp(0.5, ev["fraction discharged"], ev["MAE (SOH %)"])),
+                     "MAE full curve": float(ev["MAE (SOH %)"].iloc[-1]),
+                     "depth for ≤ 1%": d1, "depth for ≤ 2%": d2, "coverage": float(ev["coverage"].mean())})
+    return pd.DataFrame(rows).set_index("Group") if rows else pd.DataFrame()
+
+
+
+# ---------------------------------------------------------------- phase 4: start-anywhere field windows
+def _window_X(Q: np.ndarray, a: np.ndarray, b: np.ndarray, S: np.ndarray,
+              ref_frac: Optional[np.ndarray] = None) -> np.ndarray:
+    """Features of a window [a, b) of grid voltages (any start, any end): the charge delivered between consecutive
+    grid voltages inside the window (zeros elsewhere, absolute charge is unknown when the discharge did not start
+    full), the window position (start / end voltage), its total charge and the discharge settings."""
+    Qn = np.nan_to_num(Q, nan=0.0)
+    dq = np.diff(np.concatenate([np.zeros((len(Qn), 1)), Qn], axis=1), axis=1)
+    idx = np.arange(Q.shape[1])[None, :]
+    mask = (idx >= a[:, None] + 1) & (idx < b[:, None])          # increments fully inside the window
+    dqw = np.where(mask, dq, 0.0)
+    pos = np.column_stack([QV_GRID[a], QV_GRID[np.maximum(b - 1, 0)], (b - a) / Q.shape[1], dqw.sum(axis=1)])
+    feats = [dqw, pos, S]
+    if ref_frac is not None:
+        # capacity proxy: charge in the window / share of capacity a reference battery delivers in that window
+        share = np.maximum(ref_frac[np.maximum(b - 1, 0)] - ref_frac[a], 1e-3)
+        feats.append((dqw.sum(axis=1) / share)[:, None])
+    return np.hstack(feats)
+
+
+@dataclass
+class WindowSOHEstimator:
+    """Capacity from an arbitrary voltage window of a discharge (field cycles that neither start full nor reach
+    the cut-off). Trained on random windows of the training discharges; split-conformal band by battery."""
+    model_name: str = "Bayesian Ridge"
+    windows_per_cycle: int = 6
+    min_width: int = 4
+    level: float = 0.9
+    seed: int = 0
+    model: Any = None
+    q_conf: float = 0.05
+    ref_frac: Optional[np.ndarray] = None
+
+    def _sample(self, tab: pd.DataFrame, rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        K = len(QV_COLS)
+        reps = np.repeat(np.arange(len(tab)), self.windows_per_cycle)
+        a = rng.integers(0, K - self.min_width, size=len(reps))
+        b = np.minimum(a + self.min_width + rng.integers(0, K, size=len(reps)), K)
+        return reps, a, b, tab["Capacity_Ah"].to_numpy(float)[reps]
+
+    def _fit(self, X, y):
+        prm = {"degree": 1} if MODEL_SPECS[self.model_name].poly else None
+        Xs, ys, _ = _gp_subsample(self.model_name, X, y, np.ones(len(y)), self.seed)
+        return _StandardisedTarget(make_model(self.model_name, self.seed, prm)).fit(Xs, ys)
+
+    def fit(self, tab: pd.DataFrame) -> "WindowSOHEstimator":
+        rng = np.random.default_rng(self.seed)
+        Q = tab[QV_COLS].to_numpy(float)
+        S = tab[["I_set", "V_cut_set"]].to_numpy(float)
+        g = tab["Cell_ID"].to_numpy()
+        reps, a, b, y = self._sample(tab, rng)
+        self.ref_frac = np.nanmedian(Q / tab["Capacity_Ah"].to_numpy(float)[:, None], axis=0)
+        X = _window_X(Q[reps], a, b, S[reps], self.ref_frac)
+        cells = np.unique(g)
+        cal = np.isin(g[reps], rng.choice(cells, size=max(1, len(cells) // 3), replace=False)) if len(cells) >= 3 \
+            else rng.random(len(reps)) < 0.2
+        m_cal = self._fit(X[~cal], y[~cal])
+        r = np.abs(m_cal.predict(X[cal]) - y[cal])
+        self.q_conf = float(np.quantile(r, min(1.0, self.level * (1 + 1 / max(len(r), 1))))) if len(r) else 0.05
+        self.model = self._fit(X, y)
+        return self
+
+    def predict_window(self, Q: np.ndarray, a: np.ndarray, b: np.ndarray, S: np.ndarray) -> np.ndarray:
+        mu = self.model.predict(_window_X(Q, a, b, S, self.ref_frac))
+        return np.column_stack([mu, mu - self.q_conf, mu + self.q_conf])
+
+
+def window_evaluation(est: WindowSOHEstimator, tab: pd.DataFrame, n_starts: int = 6, n_widths: int = 6) -> pd.DataFrame:
+    """MAE (SOH points) by window start voltage and window width on test discharges."""
+    K = len(QV_COLS)
+    Q = tab[QV_COLS].to_numpy(float)
+    S = tab[["I_set", "V_cut_set"]].to_numpy(float)
+    y = tab["Capacity_Ah"].to_numpy(float)
+    cb = tab["C_bol_Ah"].to_numpy(float)
+    rows = []
+    for a0 in np.linspace(0, K - est.min_width - 1, n_starts).astype(int):
+        for w in np.linspace(est.min_width, K - a0, n_widths).astype(int):
+            b0 = min(a0 + w, K)
+            pr = est.predict_window(Q, np.full(len(Q), a0), np.full(len(Q), b0), S)
+            e = (pr[:, 0] - y) / cb * 100
+            rows.append({"start V": float(QV_GRID[a0]), "end V": float(QV_GRID[b0 - 1]), "width (grid points)": int(b0 - a0),
+                         "MAE (SOH %)": float(np.mean(np.abs(e))),
+                         "coverage": float(np.mean((y >= pr[:, 1]) & (y <= pr[:, 2])))})
+    return pd.DataFrame(rows)
+
+
+class LiveDischarge:
+    """Within-cycle streaming helper: accumulate (time, voltage, current) samples of the running discharge, keep
+    the charge at each grid-voltage crossing, and return the real-time capacity / SOH estimate after every sample."""
+
+    def __init__(self, est: PartialSOHEstimator, c_bol: float, I_set: float = 2.0, V_cut: float = 2.7):
+        self.est, self.c_bol, self.S = est, c_bol, np.array([I_set, V_cut], float)
+        self.reset()
+
+    def reset(self) -> None:
+        self.q, self.t_last, self.v_min, self.Q = 0.0, None, np.inf, np.full(len(QV_COLS), np.nan)
+
+    def add(self, t_s: float, v: float, i_a: float) -> Dict[str, Any]:
+        if self.t_last is not None and i_a < -0.1:
+            self.q += abs(i_a) * max(t_s - self.t_last, 0.0) / 3600.0
+        self.t_last = t_s
+        if i_a < -0.1:
+            self.v_min = min(self.v_min, v)
+            for j, vg in enumerate(QV_GRID):
+                if np.isnan(self.Q[j]) and self.v_min <= vg:
+                    self.Q[j] = self.q
+        j = int(np.sum(np.isfinite(self.Q)))
+        if j == 0:
+            return {"status": "waiting for the first grid voltage", "depth": 0}
+        mu, lo, hi = self.est.predict(self.Q, j, self.S)
+        return {"status": "estimating", "depth": j, "voltage": float(v), "Ah_so_far": round(self.q, 4),
+                "capacity_Ah": mu, "SOH": mu / self.c_bol, "SOH_band": (lo / self.c_bol, hi / self.c_bol)}
+
+
+# =============================================================================
+# 32. FORECASTING WORKFLOW: one protocol, one registry, one scoreboard
+# =============================================================================
+# Every model is evaluated the same way: within one condition group, each battery is held out in turn (trained on
+# the others plus its own cycles up to the origin), forecasts are made from fixed shares of its life and scored on
+# all its later measured cycles. Errors in SOH points (x100), end-of-life error in cycles, band coverage.
+PROTOCOL_ORIGINS = (0.3, 0.5, 0.7)
+
+
+def fleet_shape_forecast(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float = DEFAULT_EOL_AH,
+                         train_cells: Optional[Sequence[str]] = None, level: float = 0.9,
+                         horizon_factor: float = 1.5) -> ProgForecast:
+    """Baseline 3: the typical fade curve of the training batteries placed at this battery's state and speed. The
+    band comes from how well the same construction forecast each training battery from the same share of life."""
+    pool = [c for c in (train_cells if train_cells is not None else v2_training_pool(ct, cell_id)) if c != cell_id]
+    shape = fleet_shape(ct, pool)
+    if shape is None:
+        raise ValueError("fleet shape: not enough training batteries")
+    good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
+    dc = clean_capacity(ct[(ct["Cell_ID"] == cell_id) & (ct["n"] <= n0)])
+    f0 = state_features(dc, n0, float(good["C_bol_Ah"].iloc[0]))
+    n_grid = np.arange(1, int(good["n"].max() * horizon_factor) + 1)
+    h = np.maximum(n_grid - n0, 0).astype(float)
+    med = f0["soh_now"] + shape_drop(shape, f0["soh_now"], f0["soh_slope_ah"] / 100, f0["ah_cycle"], h)
+    frac = n0 / max(float(good["n"].max()), 1.0)
+    errs = []                                            # leave-one-out error of the construction on the pool
+    for c in pool:
+        try:
+            gc = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
+            k = int(max(10, round(frac * gc["n"].max())))
+            sh_c = fleet_shape(ct, [x for x in pool if x != c])
+            if sh_c is None:
+                continue
+            dcc = clean_capacity(ct[(ct["Cell_ID"] == c) & (ct["n"] <= k)])
+            fc0 = state_features(dcc, k, float(gc["C_bol_Ah"].iloc[0]))
+            fut = gc[gc["n"] > k]
+            p = fc0["soh_now"] + shape_drop(sh_c, fc0["soh_now"], fc0["soh_slope_ah"] / 100, fc0["ah_cycle"],
+                                            (fut["n"] - k).to_numpy(float))
+            errs.append(np.column_stack([(fut["n"] - k).to_numpy(float), np.abs(p - fut["SOH"].to_numpy())]))
+        except Exception:
+            continue
+    if errs:
+        E = np.vstack(errs)
+        bins = np.array([0, 20, 40, 80, 1e9])
+        q = [float(np.quantile(E[(E[:, 0] > a) & (E[:, 0] <= b), 1], level)) if ((E[:, 0] > a) & (E[:, 0] <= b)).sum() >= 5
+             else np.nan for a, b in zip(bins[:-1], bins[1:])]
+        q = pd.Series(q).ffill().bfill().fillna(0.03).to_numpy()
+        half = q[np.clip(np.searchsorted(bins, h, side="left") - 1, 0, len(q) - 1)]
+    else:
+        half = 0.01 + 0.0005 * h
+    past = np.interp(n_grid, good["n"], good["SOH"])
+    fc = ProgForecast("Baseline · fleet shape", n_grid, np.where(n_grid > n0, med, past),
+                      np.where(n_grid > n0, med - half, past), np.where(n_grid > n0, med + half, past), None,
+                      {"pool": pool})
+    return _v2_finish(fc, ct, cell_id, n0, eol_ah, "Baseline · fleet shape")
+
+
+PROTOCOL_MODELS: Dict[str, Tuple[str, str]] = {
+    # key: (family, label)
+    "persistence": ("Baselines", "Persistence (SOH stays)"),
+    "trend": ("Baselines", "Linear trend"),
+    "shape": ("Baselines", "Fleet shape"),
+    "hb": ("Statistical / Bayesian", "Hierarchical Bayes"),
+    "ml:Bayesian Ridge": ("Machine learning", "ML v2 · Bayesian Ridge"),
+    "ml:Random Forest": ("Machine learning", "ML v2 · Random Forest"),
+    "ml:SVM": ("Machine learning", "ML v2 · SVM"),
+    "ml:Gaussian Process": ("Machine learning", "ML v2 · Gaussian Process"),
+    "ml:Decision Tree": ("Machine learning", "ML v2 · Decision Tree"),
+    "ml:XGBoost": ("Machine learning", "ML v2 · XGBoost"),
+    "ml:LightGBM": ("Machine learning", "ML v2 · LightGBM"),
+    "deep:GRU (recurrent network)": ("Deep learning", "GRU"),
+    "deep:Transformer (self-attention)": ("Deep learning", "Transformer"),
+    "process": ("Process model", "Process model f(θ, u), self-updating"),
+    "process_prior": ("Process model", "Process model f(θ, u), fleet prior only"),
+    "spm": ("Physics", "Single-particle model + SEI"),
+    "pinn": ("Physics", "Mechanistic PINN"),
+}
+PROTOCOL_FAMILIES = ("Baselines", "Process model", "Statistical / Bayesian", "Machine learning", "Deep learning",
+                     "Physics")
+_PROCESS_CACHE: Dict[Tuple[int, str], Any] = {}
+
+
+def _protocol_forecast(key: str, store: Any, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n0: int,
+                       train: List[str], eol_ah: float) -> Any:
+    if key == "persistence":
+        return baseline_forecast_v2(ct, cell, n0, "persistence", eol_ah)
+    if key == "trend":
+        return baseline_forecast_v2(ct, cell, n0, "trend", eol_ah)
+    if key == "shape":
+        return fleet_shape_forecast(ct, cell, n0, eol_ah, train)
+    if key == "hb":
+        return hierarchical_bayes_forecast_v2(ct, cell, n0, eol_ah, train_cells=train)
+    if key.startswith("ml:"):
+        f = train_ml_v2(ct, cell, n0, key[3:], eol_ah, train, explain=False)
+        return ProgForecast(f.model, f.n_grid, f.soh_pred, f.soh_lo, f.soh_hi, None, {}, f.metrics)
+    if key.startswith("deep:"):
+        return seq_forecast_v2(ct, cell, n0, key[5:], eol_ah, epochs=120, n_members=1, train_cells=train)
+    if key in ("process", "process_prior"):
+        ck = (id(ct), cell)
+        if ck not in _PROCESS_CACHE:
+            _PROCESS_CACHE.clear() if len(_PROCESS_CACHE) > 64 else None
+            _PROCESS_CACHE[ck] = ProcessModel().fit(ct, imp, v2_training_pool(ct, cell))
+        return process_forecast(_PROCESS_CACHE[ck], ct, imp, cell, n0, eol_ah, update=(key == "process"))["forecast"]
+    if key == "spm":
+        return spm_forecast_v2(ct, cell, n0, eol_ah, train_cells=train)
+    if key == "pinn":
+        return pinn_forecast_v2(ct, imp, cell, n0, PINNConfig(epochs=800, physics="mechanistic"), eol_ah, train)
+    raise ValueError(f"unknown model {key}")
+
+
+def protocol_cells(ct: pd.DataFrame, group: str, min_cycles: int = 25) -> List[str]:
+    g = condition_groups(ct)
+    return [c for c in g.index if g.loc[c, "Group"] == group and g.loc[c, "cycles"] >= min_cycles]
+
+
+def run_protocol(store: Any, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str],
+                 models: Sequence[str], origins: Sequence[float] = PROTOCOL_ORIGINS, eol_ah: float = DEFAULT_EOL_AH,
+                 eol_k: int = 3, progress: ProgressFn = None) -> pd.DataFrame:
+    """Evaluate models with the one protocol: leave-one-battery-out among `cells`, forecasts from each origin
+    (share of the battery's recorded life), scored on all later measured cycles. One row per
+    (battery, origin, model); failures are kept as rows with status (never silently dropped)."""
+    rows = []
+    cells = list(cells)
+    total = max(len(cells) * len(origins) * len(models), 1)
+    k_ = 0
+    for c in cells:
+        good = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
+        n_last = int(good["n"].max())
+        soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
+        eol_true, eol_status = eol_crossing(good["n"].to_numpy(), good["SOH"].to_numpy(), soh_eol, eol_k)
+        train = [x for x in cells if x != c]
+        for o in origins:
+            n0 = int(max(10, round(o * n_last)))
+            fut = good[good["n"] > n0]
+            for key in models:
+                k_ += 1
+                _report(progress, k_ / total, f"{c} · {int(100 * o)}% · {PROTOCOL_MODELS.get(key, (None, key))[1]}")
+                fam, label = PROTOCOL_MODELS.get(key, ("Other", key))
+                row = {"Cell_ID": c, "origin": o, "n0": n0, "model": label, "key": key, "family": fam,
+                       "test cycles": len(fut), "EOL true": eol_true}
+                if len(fut) < 5:
+                    rows.append({**row, "status": "too few test cycles"})
+                    continue
+                try:
+                    f = _protocol_forecast(key, store, ct, imp, c, n0, train, eol_ah)
+                    p = np.interp(fut["n"], f.n_grid, f.soh)
+                    e = (p - fut["SOH"].to_numpy()) * 100
+                    cov = np.nan
+                    if f.lo is not None and f.hi is not None:
+                        lo, hi = np.interp(fut["n"], f.n_grid, f.lo), np.interp(fut["n"], f.n_grid, f.hi)
+                        cov = float(np.mean((fut["SOH"] >= lo) & (fut["SOH"] <= hi)))
+                    fut_pred = f.n_grid > n0
+                    cross = np.nonzero(fut_pred & (f.soh < soh_eol))[0]
+                    eol_pred = int(f.n_grid[cross[0]]) if len(cross) else None
+                    eol_err = (eol_pred - eol_true) if (eol_pred is not None and eol_true is not None and eol_true > n0) else np.nan
+                    rows.append({**row, "status": "ok", "RMSE (SOH pts)": float(np.sqrt(np.mean(e ** 2))),
+                                 "MAE (SOH pts)": float(np.mean(np.abs(e))), "bias (SOH pts)": float(np.mean(e)),
+                                 "coverage": cov, "EOL pred": eol_pred, "EOL error (cycles)": eol_err,
+                                 "EOL status": eol_status if eol_true is None else ("before origin" if eol_true <= n0 else "scored")})
+                except Exception as exc:
+                    rows.append({**row, "status": f"failed: {type(exc).__name__}: {str(exc)[:80]}"})
+    _report(progress, 1.0, "protocol done")
+    return pd.DataFrame(rows)
+
+
+def protocol_scoreboard(res: pd.DataFrame, baseline_label: Optional[str] = None) -> pd.DataFrame:
+    """One row per model: error averaged per battery first (no pseudo-replication), mean with a 95 % t-interval
+    across batteries, end-of-life error, coverage, and whether it beats the best baseline on the same batteries
+    (paired per battery; Wilcoxon p-value when >= 5 batteries)."""
+    from scipy.stats import t as t_dist, wilcoxon
+
+    ok = res[res["status"] == "ok"]
+    if ok.empty:
+        return pd.DataFrame()
+    per = ok.groupby(["model", "family", "Cell_ID"]).agg(rmse=("RMSE (SOH pts)", "mean"),
+                                                         eol=("EOL error (cycles)", lambda x: float(np.nanmean(np.abs(x))) if x.notna().any() else np.nan),
+                                                         cov=("coverage", "mean")).reset_index()
+    base = per[per["family"] == "Baselines"].groupby("model")["rmse"].mean()
+    best_base = baseline_label or (base.idxmin() if len(base) else None)
+    bpc = per[per["model"] == best_base].set_index("Cell_ID")["rmse"] if best_base else pd.Series(dtype=float)
+    rows = []
+    for (m, fam), d in per.groupby(["model", "family"]):
+        x = d["rmse"].to_numpy()
+        n = len(x)
+        half = float(t_dist.ppf(0.975, n - 1) * x.std(ddof=1) / np.sqrt(n)) if n >= 2 else np.nan
+        paired = d.set_index("Cell_ID")["rmse"].reindex(bpc.index).dropna()
+        b = bpc.reindex(paired.index)
+        diff = (paired - b).to_numpy()
+        if m == best_base or not len(diff):
+            verdict, p = ("reference" if m == best_base else "—"), np.nan
+        else:
+            p = float(wilcoxon(paired, b).pvalue) if len(diff) >= 5 and np.any(diff != 0) else np.nan
+            wins = int(np.sum(diff < 0))
+            if np.isfinite(p) and p < 0.05:
+                verdict = "better than baseline" if np.median(diff) < 0 else "worse than baseline"
+            else:
+                verdict = f"no clear difference ({wins}/{len(diff)} batteries better)"
+        fails = int(((res["model"] == m) & (res["status"] != "ok")).sum())
+        rows.append({"Model": m, "Family": fam, "Batteries": n, "RMSE (SOH pts)": float(x.mean()), "95% CI ±": half,
+                     "EOL |error| (cycles)": float(np.nanmean(d["eol"])) if d["eol"].notna().any() else np.nan,
+                     "Coverage": float(np.nanmean(d["cov"])) if d["cov"].notna().any() else np.nan,
+                     "vs best baseline": verdict, "p (Wilcoxon)": p, "Failed runs": fails})
+    out = pd.DataFrame(rows).sort_values("RMSE (SOH pts)").set_index("Model")
+    out.attrs["best_baseline"] = best_base
+    return out
+
+
+def estimation_protocol(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], models: Sequence[str],
+                        features: Sequence[str], progress: ProgressFn = None) -> pd.DataFrame:
+    """SOH-now estimation with the same discipline: each battery of the group held out in turn (trained on the
+    others), features chosen from the Diagnostics health-indicator ranking (capacity-derived ones excluded)."""
+    feats = [f for f in features if f not in CAPACITY_LEAKS]
+    rows = []
+    cells = list(cells)
+    for i, c in enumerate(cells):
+        for m in models:
+            _report(progress, (i + models.index(m) / len(models)) / max(len(cells), 1), f"estimation · {c} · {m}")
+            try:
+                r = train_soh_estimator(ct, imp, m, features=tuple(feats), split="by_cell",
+                                        train_cells=[x for x in cells if x != c], test_cells=[c])
+                te_p = r.predictions[r.predictions["set"] == "test"]
+                e = (te_p["SOH_pred"] - te_p["SOH"]).to_numpy() * 100
+                rows.append({"Cell_ID": c, "model": m, "RMSE (SOH pts)": float(np.sqrt(np.mean(e ** 2))),
+                             "MAE (SOH pts)": float(np.mean(np.abs(e))), "cycles": len(te_p), "status": "ok"})
+            except Exception as exc:
+                rows.append({"Cell_ID": c, "model": m, "status": f"failed: {str(exc)[:80]}"})
+    return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 33. PROCESS MODEL  theta(k+1) = f(theta(k), u(k))  (research plan: one common, self-updating model)
+# =============================================================================
+# State theta = [SOH, R_int / R_int0, R_ct / R_ct0]; inputs u = cell temperature, discharge current, cut-off.
+# Each state's change per Ah of throughput is modelled from the state and the inputs:
+#   d SOH / dAh      = - exp( b0 + b_T x_T + b_C x_C + b_I x_I + b_L (1 - SOH) + beta_c )
+#   d R_rel / dAh    =   g0 + g_T x_T + g_C x_C + g_I x_I + g_L (1 - SOH)        (same for R_ct)
+# with x_T = 1000 (1/T_ref - 1/T) (Arrhenius: b_T x 8.314 = activation energy in kJ/mol), x_C = max(0, 15 C - T)/10
+# (cold / lithium-plating term: without it, fast cold ageing biases the Arrhenius estimate), x_I = ln(I / 2 A).
+# (A cut-off term and a resistance-level term were tested and dropped: not identifiable with ~10 batteries.) The fleet coefficients are fitted across all comparable batteries (conditions vary between
+# groups, so their effects are identifiable only across groups); beta_c is the battery's own rate factor:
+# prior N(0, tau^2) from the spread between batteries, updated with every cycle the battery delivers.
+PROCESS_STATES = ("SOH", "R_int", "R_ct")
+PROCESS_TERMS = ("intercept", "temperature (Arrhenius)", "cold (plating, per 10 K below 15 °C)", "current ln(I/2A)",
+                 "accumulated loss")
+T_COLD_C = 15.0
+
+
+def _process_windows(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], w: int = 10, step: int = 5,
+                     max_n: Optional[Dict[str, int]] = None) -> pd.DataFrame:
+    """Rates of the three states over windows of `w` valid cycles (cleaned SOH; rolling-median resistances
+    relative to their initial value) with the inputs and the state at the window start."""
+    cte = attach_eis(ct, imp) if imp is not None else ct
+    rows = []
+    for c in cells:
+        d = cte[(cte["Cell_ID"] == c) & ~cte["outlier"]].sort_values("n")
+        if max_n and c in max_n:
+            d = d[d["n"] <= max_n[c]]
+        if len(d) < w + 3:
+            continue
+        dc = clean_capacity(d)
+        d = d.loc[dc.index].assign(SOHc=dc["SOH_clean"].to_numpy())
+        def rel(col):
+            if col not in d or d[col].notna().sum() < 5:
+                return np.full(len(d), np.nan)
+            v = d[col].astype(float).interpolate(limit_direction="both").rolling(7, center=True, min_periods=1).median().to_numpy()
+            base = float(np.nanmedian(v[:3]))
+            return v / base if base and np.isfinite(base) else np.full(len(d), np.nan)
+        rr, rc = rel("R_dc_ohm"), rel("Rct_ohm")
+        A = d["cum_Ah"].to_numpy(float)
+        S = d["SOHc"].to_numpy(float)
+        T = d["T_mean_C"].astype(float).ffill().bfill().to_numpy() + 273.15
+        I = d["I_dis_A"].astype(float).ffill().bfill().to_numpy()
+        Vc = float(d["V_min_V"].median())
+        for a in range(0, len(d) - w, step):
+            b = a + w
+            dA = A[b] - A[a]
+            if dA <= 0:
+                continue
+            Tm = float(np.mean(T[a:b + 1]))
+            rows.append({"Cell_ID": c, "n": int(d["n"].iloc[a]),
+                         "x_T": 1e3 * (1 / 298.15 - 1 / Tm), "x_C": max(0.0, T_COLD_C - (Tm - 273.15)) / 10,
+                         "x_I": math.log(max(float(np.mean(I[a:b + 1])), 0.1) / 2.0), "x_V": Vc - 2.7,
+                         "loss": 1.0 - S[a], "r_lvl": (rr[a] - 1.0) if np.isfinite(rr[a]) else 0.0,
+                         "rate_SOH": (S[b] - S[a]) / dA, "rate_R_int": (rr[b] - rr[a]) / dA if np.isfinite(rr[b] - rr[a]) else np.nan,
+                         "rate_R_ct": (rc[b] - rc[a]) / dA if np.isfinite(rc[b] - rc[a]) else np.nan,
+                         "dAh": dA / w})
+    return pd.DataFrame(rows)
+
+
+def _design(df: pd.DataFrame, with_r: bool = True) -> np.ndarray:
+    return np.column_stack([np.ones(len(df)), df["x_T"], df["x_C"], df["x_I"], df["loss"]]).astype(float)
+
+
+def _ridge(X: np.ndarray, y: np.ndarray, lam: float = 1e-3) -> np.ndarray:
+    pen = lam * np.eye(X.shape[1])
+    pen[0, 0] = 0.0
+    return np.linalg.solve(X.T @ X + pen, X.T @ y)
+
+
+@dataclass
+class ProcessModel:
+    """Fleet process model theta(k+1) = f(theta(k), u(k)) with a self-updating battery rate factor."""
+    coef_soh: np.ndarray = None
+    coef_rint: Optional[np.ndarray] = None
+    coef_rct: Optional[np.ndarray] = None
+    tau2: float = 0.1                  # between-battery variance of the log-rate factor
+    sigma2: float = 0.3                # window-level noise of the log fade rate
+    cells: List[str] = field(default_factory=list)
+    boot: Optional[np.ndarray] = None  # bootstrap (over batteries) of coef_soh
+    fit_r2: Dict[str, float] = field(default_factory=dict)
+    windows: Optional[pd.DataFrame] = None
+
+    def fit(self, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], n_boot: int = 60,
+            seed: int = 0) -> "ProcessModel":
+        W = _process_windows(ct, imp, cells)
+        W = W[W["rate_SOH"] < 0] if "rate_SOH" in W else W    # fading windows (cleaned SOH is non-increasing)
+        if W.empty or W["Cell_ID"].nunique() < 3 or len(W) < 20:
+            raise ValueError("process model: needs at least 3 batteries with measurable fade")
+        self.windows, self.cells = W, sorted(W["Cell_ID"].unique())
+        X = _design(W)
+        y = np.log(-W["rate_SOH"].to_numpy())
+        self.coef_soh = _ridge(X, y)
+        res = y - X @ self.coef_soh
+        per = pd.Series(res).groupby(W["Cell_ID"].to_numpy())
+        within = float(np.mean([np.var(v) for _, v in per if len(v) > 1])) if per.ngroups else 0.3
+        between = float(np.var(per.mean().to_numpy()) - within / max(per.size().mean(), 1))
+        self.sigma2, self.tau2 = max(within, 1e-3), max(between, 0.01)
+        self.fit_r2["SOH"] = float(1 - np.var(res) / np.var(y)) if np.var(y) > 0 else np.nan
+        for st_, attr in (("R_int", "coef_rint"), ("R_ct", "coef_rct")):
+            Wm = W[np.isfinite(W[f"rate_{st_}"])]
+            if len(Wm) >= 20 and Wm["Cell_ID"].nunique() >= 3:
+                Xr, yr = _design(Wm, with_r=False), Wm[f"rate_{st_}"].to_numpy()
+                g = _ridge(Xr, yr, 1e-2)
+                setattr(self, attr, g)
+                self.fit_r2[st_] = float(1 - np.var(yr - Xr @ g) / np.var(yr)) if np.var(yr) > 0 else np.nan
+        rng = np.random.default_rng(seed)
+        B = []
+        for _ in range(n_boot):                                # bootstrap over batteries
+            pick = rng.choice(self.cells, size=len(self.cells), replace=True)
+            Wb = pd.concat([W[W["Cell_ID"] == c] for c in pick])
+            try:
+                B.append(_ridge(_design(Wb), np.log(-Wb["rate_SOH"].to_numpy())))
+            except np.linalg.LinAlgError:
+                continue
+        self.boot = np.array(B) if B else None
+        return self
+
+    def effects(self) -> pd.DataFrame:
+        """Fleet effects with 90 % bootstrap intervals, in physical units where possible."""
+        conv = {1: ("Activation energy", "kJ/mol", R_GAS / 1.0),
+                2: ("Cold (plating) effect", "ln-rate per 10 K below 15 °C", 1.0), 3: ("Current exponent", "–", 1.0),
+                4: ("Acceleration with accumulated loss", "ln-rate per SOH", 1.0)}
+        rows = []
+        for j, (name, unit, f) in conv.items():
+            est = float(self.coef_soh[j]) * f
+            lo = hi = np.nan
+            if self.boot is not None and len(self.boot) > 5:
+                lo, hi = (np.quantile(self.boot[:, j], [0.05, 0.95]) * f).tolist()
+            rows.append({"Effect": name, "Estimate": est, "90% low": lo, "90% high": hi, "Unit": unit,
+                         "Identified": bool(np.isfinite(lo) and (lo > 0 or hi < 0))})
+        return pd.DataFrame(rows).set_index("Effect")
+
+    def battery_factor(self, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n0: int) -> Tuple[float, float, int]:
+        """Self-updating step: posterior of the battery's log-rate factor from its own windows up to n0
+        (prior N(0, tau^2) = the fleet; each window adds sigma^-2 of precision). Returns (mean, var, windows used)."""
+        W = _process_windows(ct, imp, [cell], max_n={cell: n0})
+        if W.empty or "rate_SOH" not in W:                    # too few cycles yet: the fleet prior
+            return 0.0, self.tau2, 0
+        W = W[W["rate_SOH"] < 0]
+        if W.empty:
+            return 0.0, self.tau2, 0
+        r = np.log(-W["rate_SOH"].to_numpy()) - _design(W) @ self.coef_soh
+        prec = 1 / self.tau2 + len(r) / self.sigma2
+        return float(r.sum() / self.sigma2 / prec), float(1 / prec), len(r)
+
+    def rates(self, soh: np.ndarray, r_rel: np.ndarray, T_C: float, I_A: float, V_cut: float, b: np.ndarray
+              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        x_T, x_I = 1e3 * (1 / 298.15 - 1 / (T_C + 273.15)), math.log(max(I_A, 0.1) / 2.0)
+        x_C = max(0.0, T_COLD_C - T_C) / 10
+        X = np.column_stack([np.ones_like(soh), np.full_like(soh, x_T), np.full_like(soh, x_C), np.full_like(soh, x_I),
+                             1 - soh])
+        d_soh = -np.exp(np.clip(X @ self.coef_soh + b, -20, 5))
+        Xr = X
+        d_ri = Xr @ self.coef_rint if self.coef_rint is not None else np.zeros_like(soh)
+        d_rc = Xr @ self.coef_rct if self.coef_rct is not None else np.zeros_like(soh)
+        return d_soh, d_ri, d_rc
+
+    def simulate(self, soh0: float, rint0: float, rct0: float, T_C: float, I_A: float, V_cut: float, dah: float,
+                 n_cycles: int, b: np.ndarray, rw_scale: float = 0.0, rw_seed: int = 0) -> Dict[str, np.ndarray]:
+        """Roll theta forward cycle by cycle under constant inputs, one path per sample of the battery factor b."""
+        b = np.atleast_1d(np.asarray(b, float))
+        s, ri, rc = np.full(len(b), soh0), np.full(len(b), rint0), np.full(len(b), rct0)
+        out = {k: np.empty((len(b), n_cycles)) for k in PROCESS_STATES}
+        rng = np.random.default_rng(rw_seed)
+        drift = np.zeros(len(b))
+        q = math.sqrt(self.sigma2) * rw_scale / math.sqrt(10.0)          # per-cycle step of the log-rate random walk
+        for t in range(n_cycles):
+            if rw_scale > 0:
+                drift = drift + q * rng.standard_normal(len(b))
+            ds, dri, drc = self.rates(s, ri, T_C, I_A, V_cut, b + drift)
+            dA = dah * np.clip(s, 0.05, 1.2)                   # charge per cycle shrinks with capacity
+            s, ri, rc = np.clip(s + ds * dA, 0, 1.2), ri + dri * dA, rc + drc * dA
+            out["SOH"][:, t], out["R_int"][:, t], out["R_ct"][:, t] = s, ri, rc
+        return out
+
+
+def process_state_at(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n0: int) -> Dict[str, float]:
+    """State theta and inputs u of a battery at cycle n0 (causal: only cycles up to n0)."""
+    cte = attach_eis(ct, imp) if imp is not None else ct
+    d = cte[(cte["Cell_ID"] == cell) & ~cte["outlier"] & (cte["n"] <= n0)].sort_values("n")
+    dc = clean_capacity(d)
+    def rel(col):
+        if col not in d or d[col].notna().sum() < 3:
+            return 1.0
+        v = d[col].astype(float).interpolate(limit_direction="both")
+        base = float(v.head(3).median())
+        return float(v.tail(5).median() / base) if base else 1.0
+    tail = d.tail(15)
+    da = np.diff(d["cum_Ah"].to_numpy())
+    return {"SOH": float(dc["SOH_causal"].iloc[-1]), "R_int": rel("R_dc_ohm"), "R_ct": rel("Rct_ohm"),
+            "T_C": float(tail["T_mean_C"].median()), "I_A": float(tail["I_dis_A"].median()),
+            "V_cut": float(d["V_min_V"].median()), "dah": float(np.median(da[da > 0])) / max(float(dc["SOH_causal"].iloc[-1]), 0.3)
+            if (da > 0).any() else 2.0}
+
+
+def process_forecast(pm: ProcessModel, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n0: int,
+                     eol_ah: float = DEFAULT_EOL_AH, u: Optional[Dict[str, float]] = None, update: bool = True,
+                     n_samples: int = 300, level: float = 0.9, horizon_factor: float = 1.5, seed: int = 0,
+                     rw_scale: float = 0.5) -> Dict[str, Any]:
+    """Forecast SOH, R_int and R_ct from cycle n0 with the process model. update=True: the battery factor is
+    estimated from its own cycles up to n0 (self-updating); False: the fleet prior only (open loop). `u`
+    overrides the future operating inputs (what-if / Mission 3)."""
+    good = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]].sort_values("n")
+    st0 = process_state_at(ct, imp, cell, n0)
+    uu = {k: st0[k] for k in ("T_C", "I_A", "V_cut")}
+    uu.update(u or {})
+    m, v, nw = pm.battery_factor(ct, imp, cell, n0) if update else (0.0, pm.tau2, 0)
+    rng = np.random.default_rng(seed)
+    b = m + np.sqrt(v) * rng.standard_normal(n_samples)
+    n_max = int(good["n"].max() * horizon_factor)
+    steps = max(n_max - n0, 1)
+    sim = pm.simulate(st0["SOH"], st0["R_int"], st0["R_ct"], uu["T_C"], uu["I_A"], uu["V_cut"], st0["dah"], steps, b,
+                      rw_scale=rw_scale, rw_seed=seed)
+    noise = math.sqrt(pm.sigma2) * 0.004
+    n_grid = np.arange(1, n_max + 1)
+    past = np.interp(n_grid, good["n"], good["SOH"])
+    qa, qb = (1 - level) / 2, 1 - (1 - level) / 2
+    fut = n_grid > n0
+    def stat(k, f):
+        a = np.full(len(n_grid), np.nan)
+        a[fut] = f(sim[k][:, : fut.sum()])
+        return a
+    med = np.where(fut, stat("SOH", lambda z: np.median(z, axis=0)), past)
+    lo = np.where(fut, stat("SOH", lambda z: np.quantile(z, qa, axis=0) - noise), past)
+    hi = np.where(fut, stat("SOH", lambda z: np.quantile(z, qb, axis=0) + noise), past)
+    soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
+    fc = ProgForecast("Process model f(θ, u)" + ("" if update else " (fleet prior)"), n_grid, med, lo, hi, None,
+                      {"battery factor": m, "factor sd": math.sqrt(v), "windows used": nw, **uu})
+    fc.metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), n_grid, med, n0, soh_eol, lo, hi, 0.2)
+    return {"forecast": fc, "R_int": stat("R_int", lambda z: np.median(z, axis=0)),
+            "R_ct": stat("R_ct", lambda z: np.median(z, axis=0)), "state0": st0, "u": uu, "factor": (m, v, nw)}
+
+
+def process_plant(pm: ProcessModel, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str,
+                  base: Optional[CellPhysics] = None) -> Tuple[CellPhysics, pd.DataFrame]:
+    """Mission 3 with the common model: the Operations plant takes its degradation law from the process model
+    (activation energy, current exponent, rate at reference including this battery's updated factor, resistance
+    growth per SOH lost), so the optimiser uses the model that was fitted and validated in Models."""
+    q, tab = calibrate_plant(ct, imp, cell, base)
+    n0 = int(ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]]["n"].max())
+    m, _, _ = pm.battery_factor(ct, imp, cell, n0)
+    st0 = process_state_at(ct, imp, cell, n0)
+    Ea = float(pm.coef_soh[1]) * R_GAS * 1e3
+    alpha = float(pm.coef_soh[3])
+    k_ref = float(np.exp(pm.coef_soh[0] + m))
+    upd = {"Ea_J_mol": float(np.clip(Ea, 5e3, 90e3)), "alpha_c": float(np.clip(alpha, 0.0, 2.0)),
+           # cold multiplier exp(b_C x_C) linearised per kelvin below the cold threshold
+           "k_cold": float(np.clip((math.exp(float(pm.coef_soh[2])) - 1) / 10.0, 0.0, 2.0))}
+    q2 = replace(q, **{k: v for k, v in upd.items() if k in CellPhysics.__dataclass_fields__})
+    stress = float(degradation_stress(25.0, 2.0, q2))
+    q2 = replace(q2, k_ah=float(np.clip(k_ref / max(stress, 1e-9), 1e-6, 5e-2)))
+    rows = [("Ea_J_mol", q2.Ea_J_mol, "process model (fleet)"), ("alpha_c", q2.alpha_c, "process model (fleet)"),
+            ("k_cold", getattr(q2, "k_cold", np.nan), "process model (fleet)"),
+            ("k_ah", q2.k_ah, f"process model, battery factor {m:+.2f}")]
+    rate_s = -math.exp(float(pm.coef_soh[0] + m))
+    for coef, fld in ((pm.coef_rint, "beta_int"), (pm.coef_rct, "beta_ct")):
+        if coef is not None and fld in CellPhysics.__dataclass_fields__ and rate_s < 0:
+            beta = float(np.clip(coef[0] / -rate_s, 0.0, 10.0))
+            q2 = replace(q2, **{fld: beta})
+            rows.append((fld, beta, "process model: resistance growth per SOH lost"))
+    t2 = pd.concat([tab[~tab.index.isin([r[0] for r in rows])],
+                    pd.DataFrame(rows, columns=["Parameter", "Value", "Source"]).set_index("Parameter")])
+    return q2, t2
