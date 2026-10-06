@@ -1,28 +1,8 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v6.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.6)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
-
-## Research-plan alignment (v6.1)
-
-The plan's model θ(k+1) = f(θ(k), u(k)), θ = [SOH, R_int, R_ct], u = operating conditions, is now the core
-(`ProcessModel`, Models view, top four sections):
-- M1 · degradation model v1: fade rate per Ah from cell temperature (Arrhenius + cold/plating term), current and
-  accumulated loss, fitted across all comparable batteries; resistance growth equations for R_int and R_ct;
-  effects with bootstrap intervals over batteries (`effects`). A cut-off and a resistance-level term were tested
-  and dropped (not identifiable with ~10 batteries).
-- M2 · self-updating: each battery's rate factor, prior from the between-battery spread, Bayesian update with
-  every cycle (`battery_factor`); `process_forecast` for SOH, R_int, R_ct with what-if inputs.
-- M2 · prediction-accuracy assessment: `run_protocol` / `protocol_scoreboard` (each battery of a group held out,
-  several origins, per-battery averaging, 95 % CI, paired test vs the best baseline), with the process model
-  (`process`, `process_prior`) next to baselines and any other model.
-- M3 · one common model: Operations uses `process_plant` (activation energy, cold and current effects, the
-  battery's updated rate factor, resistance growth per SOH lost) when the Models switch is on (default).
-Synthetic check (10 batteries, 4-43 °C): activation energy 32 kJ/mol [20, 49] vs 30 true; self-updating
-forecast RMSE 0.0081 / 0.0063 SOH from 20 / 40 % of life vs 0.0245 / 0.0194 with the fleet prior only
-(coverage 89-93 %); assessment on 6 held-out batteries: 0.52 ± 0.26 SOH points vs 0.99 ± 0.32 for the best
-baseline (better on 5/6; not significant at n = 6). Resistance equations explain little (R² 0.05 / 0.36).
 
 ## Study objectives (Missions)
 
@@ -37,7 +17,7 @@ baseline (better on 5/6; not significant at n = 6). Resistance equations explain
 ```bash
 pip install -r requirements.txt
 streamlit run app.py                     # "Load synthetic demo cohort" works without data
-pytest                                   # 74 tests (pip install -r requirements-dev.txt)
+pytest                                   # 70 tests (pip install -r requirements-dev.txt)
 python study.py --master data/battery_master_data.parquet --imp data/impedance.parquet --out results/study
 python study.py --synthetic --out results/study_demo
 pip install -r requirements-service.txt && uvicorn service:app --port 8000   # streaming REST service
@@ -56,7 +36,7 @@ on the engine version, so engine updates always recompute.
 | `study.py` | Offline cohort study → CSVs, `summary.md`, manifest |
 | `service.py` | Streaming twin: framework-free `TwinRegistry` + optional FastAPI endpoints |
 | `benchmark.py` | Offline forecast-origin sweep (ML, Twin, PINN, HB) |
-| `tests/test_twin_engine.py` | 74 tests: gradient checks, synthetic-truth recovery, every model and study function |
+| `tests/test_twin_engine.py` | 70 tests: gradient checks, synthetic-truth recovery, every model and study function |
 
 ## Views
 
@@ -134,7 +114,7 @@ on the engine version, so engine updates always recompute.
   - B0025–B0028: square-wave load, pulse-aware twin;
   - erratic 4 °C runs: outlier flags.
 
-## ML v2 (v6.1)
+## ML v2 (v5.6)
 
 `train_ml_v2`: forecast = the battery's own robust recent trend + a learned deviation. Features at the origin:
 level and 10-cycle trend of cleaned SOH, load-step resistance, temperature rise, CV-charge time, mean voltage,

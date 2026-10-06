@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "6.1"
+REQUIRED_ENGINE = "5.6"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -558,10 +558,6 @@ EXPLAIN: Dict[str, str] = {
     "abl_fig": "The twin re-run with different measurement sets: the gap between open loop and voltage-only is the information the sensors add (Mission 2).",
     "uf_fig": "Tracking accuracy when the twin is updated every m cycles: it shows how rarely the twin can be updated without losing accuracy (Mission 2).",
     # models
-    "pm_parity": "Each point is a 10-cycle window of one battery: the fade rate predicted by f(θ, u) from its temperature, current and state against the measured one. Points on the diagonal are explained by the operating conditions; the spread is battery-to-battery variation that self-updating learns.",
-    "pm_forecast": "Forecast of the whole health state from the cycles seen so far: the fleet prior alone (dashed) and after learning this battery's own rate factor (blue, with 90% band). Change the future temperature or current to see the what-if used by Mission 3.",
-    "pm_factor": "The self-updating parameter: how much faster or slower this battery ages than the fleet predicts for its conditions, learned as cycles arrive. The band narrows as evidence accumulates.",
-    "acc_board": "The prediction-accuracy assessment of Mission 2: every model with the same held-out batteries and origins. Bars: mean error ± 95% CI; dashed line: the best baseline.",
     "lad_base": "Level 1 references: 'nothing changes' (persistence) and 'the recent straight line continues' (linear trend). A model is only useful if it beats these.",
     "lad_deep": "Level 4 deep sequence models (GRU, Transformer) read a window of past SOH values and predict the next cycle, repeatedly, to build the forecast.",
     "lad_hybrid": "Level 5 hybrid models combine physics equations with learning: the mechanistic PINN obeys the degradation kinetics; hierarchical Bayes combines a physics law with fleet knowledge.",
@@ -569,11 +565,7 @@ EXPLAIN: Dict[str, str] = {
     "lad_spm_curves": "Simulated discharge curves of the single-particle model: the effect of lost lithium, higher current and cold on voltage and delivered capacity.",
     "lad_board": "All models run so far on this battery and forecast origin, from the simplest to the most advanced, scored on the same future cycles. The best is highlighted.",
     "ml_fig": "Forecasts of the selected ML models from the forecast origin (dotted line), with their uncertainty bands, against the measured SOH.",
-    "ml_v2_fig": "ML v2 forecasts. The grey line is the baseline: by default the typical fade curve of comparable batteries, placed at this battery's state and speed; the models add only what they learned beyond it, and only as far as that helped on held-out batteries.",
-    "pt_depth": "Error of the real-time SOH estimate against how much of the discharge has run (test batteries only). The lower and the further left a curve crosses the 1% line, the earlier a partial discharge reveals the battery's health.",
-    "pt_vi": "Where the ageing information sits within a discharge: blue = how much the charge delivered at each voltage varies over the battery's life (the paper's attention), purple = how strongly it tracks capacity. The highlighted window is what the estimators rely on.",
-    "pt_wmap": "SOH error for discharges that only cover a voltage window (rows: where it starts, columns: where it stops). Wide windows across the main voltage region give the best estimates; short ones carry little capacity information.",
-    "pt_cycle": "One discharge replayed sample by sample: the estimate (blue) and its 90% band converge towards the true end-of-discharge SOH (dashed, grey = ±1%) as more of the curve is seen.",
+    "ml_v2_fig": "ML v2 forecasts: each battery's own recent trend, corrected by what the models learned from the training batteries about acceleration and knees.",
     "ml_v2_shap": "Shapley values: how much each measurement pushed this battery's forecast (SOH change at +40 cycles) above (blue) or below (purple) the average forecast. They add up to the difference from the average.",
     "ml_v2_imp": "Which measurements drive the v2 forecast: how much the error grows when one feature is shuffled (on held-out batteries, 40-cycle horizon). This answers which variables are most informative.",
     "ml_board": "Leaderboard of the ML models on the held-out cycles (fade skill: 1 = perfect, 0 = no better than assuming no further fade).",
@@ -2209,18 +2201,9 @@ def est_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, model:
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def replay_cached(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str,
-                  soh_eol: float, level: float, cap_every: int = 10, partial_depth: float = 0.0,
-                  partial_relative: bool = False) -> Tuple[te.EKFResult, pd.DataFrame]:
-    if partial_depth > 0:
-        # field mode: every cycle, the real-time partial-discharge estimate replaces the full capacity check
-        est = te.fit_partial_estimator(_ct, te.v2_training_pool(_ct, cell), "Bayesian Ridge", "direct")
-        ov = te.partial_capacity_series(est, _ct, cell, partial_depth, relative=partial_relative)
-        base = te.twin_config_for(_ct, cell, te.DualTwinConfig())
-        r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(),
-                             replace(base, capacity_every=0, use_capacity=False), capacity_override=ov)
-    else:
-        r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(),
-                             te.twin_config_for(_ct, cell, te.DualTwinConfig(capacity_every=cap_every)))
+                  soh_eol: float, level: float, cap_every: int = 10) -> Tuple[te.EKFResult, pd.DataFrame]:
+    r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(),
+                         te.twin_config_for(_ct, cell, te.DualTwinConfig(capacity_every=cap_every)))
     n_max = int(r.per_cycle["n"].max() * 1.6)
     rows = []
     for n in r.per_cycle["n"].astype(int):
@@ -3204,19 +3187,6 @@ def view_study() -> None:
         st.markdown("**How often should the twin update?** (tracking RMSE when updating every 1, 5 or 20 cycles)")
         show_table(res["update"].set_index("Cell_ID").style.format("{:.4f}", subset=[c for c in res["update"].columns
                                                                                    if c.startswith("RMSE")]))
-    st.markdown("**How deep must a field discharge go?** (real-time partial-discharge SOH, leave-one-battery-out "
-                "within each condition group)")
-    if st.button("Run the partial-discharge study", key="st_partial", icon=":material/bolt:"):
-        with st.spinner("Leave-one-battery-out per group…"):
-            res["partial"] = te.partial_group_study(ct)
-    pg = res.get("partial")
-    if pg is not None and len(pg):
-        show_table(pg.style.format({"MAE at 50% (SOH pts)": "{:.2f}", "MAE full curve": "{:.2f}",
-                                    "depth for ≤ 1%": lambda v: "never" if v is None or not np.isfinite(v) else f"{100 * v:.0f}%",
-                                    "depth for ≤ 2%": lambda v: "never" if v is None or not np.isfinite(v) else f"{100 * v:.0f}%",
-                                    "coverage": "{:.0%}"}, na_rep="never"),
-                   note="Mission 2 for the field: the share of a discharge needed before the SOH estimate stays within "
-                        "1 or 2 SOH points, per operating condition (Bayesian ridge, direct estimator).")
     section("Mission 3 · Integrated operation and maintenance")
     card("Answers", A["M3"])
     try:
@@ -3258,27 +3228,10 @@ def view_replay() -> None:
                 "cycle, updates SOH, resistances and the personal degradation rate *k*, and re-forecasts the "
                 "remaining life. Nothing after the cursor is visible to the twin.")
     level = 0.9
-    cap_src = st.radio("Capacity information for the twin", ["full", "partial", "none"], horizontal=True, key="rp_capsrc",
-                       format_func={"full": "Full capacity checks (lab)",
-                                    "partial": "Real-time partial-discharge estimate (field)",
-                                    "none": "None (operando only)"}.get)
-    cap_every, p_depth, p_rel = 0, 0.0, False
-    if cap_src == "full":
-        cap_every = st.select_slider("Full capacity check every N cycles", [5, 10, 20, 50], value=10, key="rp_cap",
-                                     help="Between checks the twin sees only partial-window voltage and load-step resistance.")
-    elif cap_src == "partial":
-        c_a, c_b = st.columns([2, 1])
-        p_depth = c_a.select_slider("Each discharge is seen only up to this share", [0.2, 0.3, 0.4, 0.5, 0.7, 0.9],
-                                    value=0.4, key="rp_pdepth", format_func=lambda v: f"{100 * v:.0f}%",
-                                    help="The real-time SOH estimate at this depth (trained on comparable batteries) "
-                                         "becomes the twin's capacity measurement on every cycle, with its own "
-                                         "uncertainty. No full discharge is ever needed.")
-        p_rel = c_b.toggle("Bias-cancelling (relative)", value=False, key="rp_prel",
-                           help="Use the change since the battery's first discharges, anchored on its initial capacity. "
-                                "Helps when the estimator has a constant offset for this battery, hurts when its "
-                                "error grows over life: compare both.")
-        st.caption("Field mode: the twin never sees a full capacity measurement; it relies on operando voltage, "
-                   "resistance and the partial-discharge estimate.")
+    cap_every = st.select_slider("Reference capacity check every N cycles (0 = operando only)", [0, 5, 10, 20, 50],
+                                 value=10, key="rp_cap",
+                                 help="Between checks the twin sees only partial-window voltage and load-step "
+                                      "resistance. Set 0 to watch pure operando tracking, including its drift.")
     show_models = st.multiselect(
         "Live models", list(te.LIVE_MODELS),
         default=[m for m in ("twin", "mech", "pf", "trend", "ens") if m in te.LIVE_MODELS], key="rp_models",
@@ -3290,11 +3243,10 @@ def view_replay() -> None:
              "Live ensemble: weights every model by its recent 5-cycle-ahead error.")
     with st.spinner("Streaming the battery through all models (runs once, then animates)…"):
         res, _track_old = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol),
-                                        level, int(cap_every), float(p_depth), bool(p_rel))
+                                        level, int(cap_every))
         st.session_state["ekf"] = {"key": (DATA_KEY, cell, "live"), "res": res}     # feeds Operations initialisation
         run_models = ("twin", "mech", "pf", "trend", "hb")
-        frames, track = live_cached(res, ct, imp, DATA_KEY + f"|{cap_src}|{p_depth}|{p_rel}", cell, float(soh_eol), level,
-                                    int(cap_every), run_models)
+        frames, track = live_cached(res, ct, imp, DATA_KEY, cell, float(soh_eol), level, int(cap_every), run_models)
     pc = res.per_cycle
     ns = pc["n"].astype(int).tolist()
     if len(ns) < 6:
@@ -3960,19 +3912,6 @@ def ml_v2_panel(res: Sequence[Any], target: str) -> None:
     st.markdown(f"**ML v2 on {target}** · trend of the battery's own recent fade + a learned deviation")
     entries = [{"name": r.model, "level": te.MODEL_SPECS[r.model.split(" · ")[1]].level, "n_grid": r.n_grid,
                 "soh": r.soh_pred, "lo": r.soh_lo, "hi": r.soh_hi, "m": r.metrics, "target": target} for r in res]
-    bl = res[0].options.get("baseline", "trend")
-    if res[0].baseline_curve is not None:
-        entries.append({"name": "Fleet-shape baseline" if bl == "shape" else "Straight-trend baseline", "level": 1,
-                        "n_grid": res[0].n_grid, "soh": res[0].baseline_curve, "lo": None, "hi": None, "m": None,
-                        "target": target})
-    trust = [np.nanmean([v for v in r.correction_weight.values() if np.isfinite(v)] or [0.0]) for r in res]
-    chips = " · ".join(f"{r.model.split(' · ')[1]} {100 * t:.0f}%" for r, t in zip(res, trust))
-    st.markdown(f"**Baseline:** {'fleet shape of comparable batteries' if bl == 'shape' else 'straight recent trend'} · "
-                f"**correction trusted (mean over horizons):** {chips}")
-    if max(trust) < 0.1:
-        note("The learned corrections did not beat the baseline on held-out batteries, so the forecasts follow the "
-             "baseline (grey). With the fleet shape that is a curved, physically typical path; with the straight "
-             "trend it is a line: switch the baseline in Advanced ML options to compare.")
     show(fig_ladder(entries, res[0].n0, P, "ML v2 forecasts", target), key="ml_v2_fig", export=False)
     rows = []
     for r in res:
@@ -4061,11 +4000,6 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
                                                   "battery, not only of single cycles."),
             "explain": o[1].toggle("Shapley explanation of the forecast", value=True, key="ml_o_shap",
                                    help="How each feature pushed this battery's 40-cycle forecast up or down."),
-            "baseline": o[2].radio("Baseline", ["shape", "trend"], horizontal=True, key="ml_o_base",
-                                   format_func={"shape": "Fleet shape", "trend": "Straight trend"}.get,
-                                   help="Fleet shape: the typical fade curve of comparable batteries, placed at this "
-                                        "battery's state and speed (bends at the end of the early plateau and at "
-                                        "knees). Straight trend: the last cycles' slope continued."),
         }
         st.caption("On synthetic test batteries these options changed the error only slightly (augmentation: "
                    "0.0351 → 0.0345); they target battery-to-battery variation and irrelevant features, which "
@@ -4646,7 +4580,6 @@ def fig_ladder(entries: Sequence[Dict[str, Any]], n0: int, P: Palette, title: st
 
 def _ladder_table(entries: Sequence[Dict[str, Any]]) -> pd.DataFrame:
     """Per model: metrics averaged over the test batteries (one row per model)."""
-    entries = [e for e in entries if e.get("m") is not None]
     rows = [{"Level": f"L{e['level']} · {LEVEL_INFO[e['level']][0]}", "Model": e["name"], "Battery": e["target"],
              "Accuracy (%)": e["m"].accuracy, "RMSE": e["m"].rmse, "Fade skill": e["m"].fade_skill,
              "Coverage": e["m"].coverage, "RUL error": e["m"].rul_error} for e in entries if e["m"] is not None]
@@ -4878,384 +4811,8 @@ def ladder_leaderboard() -> None:
         st.rerun()
 
 
-def fig_partial_depth(evs: Dict[str, pd.DataFrame], P: Palette) -> go.Figure:
-    fig = go.Figure()
-    for i, (name, ev) in enumerate(evs.items()):
-        col = CELL_COLORS[i % len(CELL_COLORS)]
-        fig.add_trace(go.Scatter(x=100 * ev["fraction discharged"], y=ev["MAE (SOH %)"], mode="lines+markers", name=name,
-                                 line=dict(color=col, width=2.6, dash=DASHES[i % len(DASHES)]), marker=dict(size=7),
-                                 customdata=np.column_stack([ev["V reached"], ev["coverage"]]),
-                                 hovertemplate="%{x:.0f}% discharged (V = %{customdata[0]:.2f})<br>MAE %{y:.2f} SOH points"
-                                               "<br>coverage %{customdata[1]:.0%}<extra>" + html.escape(name) + "</extra>"))
-    for tol, dash in ((1.0, "dash"), (2.0, "dot")):
-        fig.add_hline(y=tol, line_dash=dash, line_color=P.muted, annotation_text=f"{tol:.0f}% SOH",
-                      annotation_font=dict(color=P.muted))
-    fig.update_xaxes(title_text="Share of the discharge completed (%)", range=[0, 100])
-    fig.update_yaxes(title_text="Mean absolute SOH error (SOH points)", rangemode="tozero")
-    return style_fig(fig, P, 480, "How far must a discharge run before its SOH is known? (test batteries)")
-
-
-def fig_voltage_importance(vi: pd.DataFrame, P: Palette) -> go.Figure:
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=vi["V"], y=vi["importance"], mode="lines+markers", name="Importance (spread across cycles)",
-                             line=dict(color="#0072B2", width=2.6), hovertemplate="%{x:.2f} V: %{y:.2f}<extra></extra>"))
-    fig.add_trace(go.Scatter(x=vi["V"], y=vi["abs_corr_with_capacity"], mode="lines+markers",
-                             name="|correlation| with capacity", line=dict(color="#AA4499", width=2.2, dash="dash"),
-                             hovertemplate="%{x:.2f} V: %{y:.2f}<extra></extra>"))
-    imp = vi[vi["important"]]
-    if len(imp):
-        fig.add_vrect(x0=float(imp["V"].min()), x1=float(imp["V"].max()), fillcolor=rgba("#56B4E9", 0.12), line_width=0,
-                      annotation_text="important window", annotation_font=dict(color=P.muted))
-    fig.update_xaxes(title_text="Voltage reached during the discharge (V)", autorange="reversed")
-    fig.update_yaxes(title_text="normalised value", range=[0, 1.05])
-    return style_fig(fig, P, 420, "Where in the discharge is the ageing information? (paper's time attention, in volts)")
-
-
-def fig_realtime_cycle(cur: pd.DataFrame, P: Palette, title: str) -> go.Figure:
-    fig = go.Figure()
-    x = 100 * cur["fraction discharged"]
-    add_band(fig, x.to_numpy(), cur["lo"].to_numpy(), cur["hi"].to_numpy(), "#0072B2", "90% band", group="est", alpha=0.18)
-    t = float(cur["SOH true"].iloc[0])
-    fig.add_hrect(y0=t - 0.01, y1=t + 0.01, fillcolor=rgba(P.muted, 0.12), line_width=0)
-    fig.add_hline(y=t, line_color=P.measured, line_dash="dash", annotation_text=f"true SOH {100 * t:.1f}% (end of discharge)",
-                  annotation_font=dict(color=P.measured))
-    fig.add_trace(go.Scatter(x=x, y=cur["SOH estimate"], mode="lines+markers", name="Real-time SOH estimate", legendgroup="est",
-                             line=dict(color="#0072B2", width=3), hovertemplate="%{x:.0f}% discharged: %{y:.2%}<extra></extra>"))
-    fig.update_xaxes(title_text="Share of the discharge completed (%)", range=[0, 100])
-    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%")
-    return style_fig(fig, P, 440, title)
-
-
-def partial_section() -> None:
-    section("Real-time SOH from partial discharges", icon=":material/bolt:")
-    st.markdown("Field batteries are rarely discharged completely. Following Qin, Arunan & Yuen (IEEE TII, 2023), the "
-                "app estimates capacity **while a discharge is still running**, from the part already seen. Discharges "
-                "are aligned on voltage (charge delivered at fixed voltages), the constant-current equivalent of the "
-                "paper's energy-preserving time warping. Two estimators: **direct** (one model per discharge depth) "
-                "and the paper's **nearest-cycle reconstruction**.")
-    sc = scheme()
-    if sc["mode"] == "within":
-        pool = te.v2_training_pool(ct, cell)
-        train, tests, n0 = pool, [cell], sc["n0"][cell]
-        st.caption(f"Within scheme: trained on {len(pool)} comparable batteries plus {cell}'s discharges up to cycle {n0}; "
-                   f"tested on {cell}'s later discharges.")
-    else:
-        train, tests, n0 = list(sc["train"]), list(sc["targets"]), None
-        st.caption(f"Trained on {len(train)} batteries' discharges, tested on all discharges of {len(tests)} other battery(ies).")
-    avail = list(te.available_models())
-    c1, c2 = st.columns(2)
-    mdls = c1.multiselect("Models", avail, default=[m for m in ("Bayesian Ridge", "Gaussian Process", "SVM", "LightGBM")
-                                                    if m in avail][:3], key="pt_models",
-                          help="Linear and kernel models extrapolate to unseen batteries; tree models cannot predict "
-                               "capacities outside the training range.")
-    meths = c2.multiselect("Estimators", list(te.PARTIAL_METHODS), default=["direct", "knn"], key="pt_methods",
-                           format_func=te.PARTIAL_METHODS.get)
-    if st.button("Train real-time estimators", key="pt_go", type="primary", icon=":material/bolt:",
-                 disabled=not (mdls and meths and train and tests)):
-        prog = st.progress(0.0)
-        out, k_ = {}, 0
-        test_tab = te.partial_table(ct, tests, min_n={cell: n0} if n0 else None)
-        for mdl in mdls:
-            for mt in meths:
-                prog.progress(k_ / (len(mdls) * len(meths)), text=f"{mdl} · {mt}")
-                k_ += 1
-                try:
-                    est = te.fit_partial_estimator(ct, train, mdl, mt, target=cell if n0 else None, n0=n0)
-                    out[f"{mdl} · {mt}"] = (est, te.partial_depth_evaluation(est, test_tab))
-                except Exception as exc:
-                    st.warning(f"{mdl} · {mt}: {exc}")
-        prog.empty()
-        vi = te.voltage_importance(te.partial_table(ct, train)) if train else None
-        st.session_state["partial"] = {"res": out, "test": test_tab, "vi": vi, "key": (DATA_KEY, tuple(train), tuple(tests), n0)}
-    saved = st.session_state.get("partial")
-    if not saved or not saved["res"]:
-        placeholder("Press 'Train real-time estimators': the error-vs-depth chart, the voltage importance and a "
-                    "within-cycle replay appear here.")
-        return
-    res, test_tab = saved["res"], saved["test"]
-    evs = {k: v[1] for k, v in res.items()}
-    show(fig_partial_depth(evs, P), key="pt_depth", data=pd.concat([e.assign(estimator=k) for k, e in evs.items()]))
-    rows = []
-    for k, ev in evs.items():
-        f = 100 * ev["fraction discharged"].to_numpy()
-        mae = ev["MAE (SOH %)"].to_numpy()
-        d1, d2 = te.depth_needed(ev, 1.0), te.depth_needed(ev, 2.0)
-        rows.append({"Estimator": k, "MAE at 25%": float(np.interp(25, f, mae)), "MAE at 50%": float(np.interp(50, f, mae)),
-                     "MAE at 75%": float(np.interp(75, f, mae)), "MAE full curve": float(mae[-1]),
-                     "≤ 1% from": f"{100 * d1:.0f}% discharged" if d1 is not None else "never",
-                     "≤ 2% from": f"{100 * d2:.0f}% discharged" if d2 is not None else "never",
-                     "Coverage": float(ev["coverage"].mean())})
-    tbl = pd.DataFrame(rows).set_index("Estimator").sort_values("MAE at 50%")
-    show_table(tbl.style.format({c: "{:.2f}" for c in tbl.columns if c.startswith("MAE")} | {"Coverage": "{:.0%}"})
-               .highlight_min(subset=["MAE at 50%"], props="background-color: rgba(0,114,178,0.22); font-weight: 700;"),
-               note="Errors in SOH points (% of each battery's initial capacity) on the test batteries' discharges, "
-                    "read at 25 / 50 / 75 % of the discharge. '≤ 1% from' is the depth after which the error stays "
-                    "within 1 SOH point: the headline result for field use.")
-    if saved.get("vi") is not None:
-        show(fig_voltage_importance(saved["vi"], P), key="pt_vi", export=False)
-    best = tbl.index[0]
-    est = res[best][0]
-    c1, c2 = st.columns([1, 2])
-    bat = c1.selectbox("Test battery", sorted(test_tab["Cell_ID"].unique()), key="pt_bat")
-    cyc = test_tab[test_tab["Cell_ID"] == bat].sort_values("n")
-    n_pick = c2.select_slider("Discharge (cycle n)", cyc["n"].astype(int).tolist(),
-                              value=int(cyc["n"].iloc[len(cyc) // 2]), key="pt_cyc")
-    cur = te.realtime_soh_curve(est, cyc[cyc["n"] == n_pick].iloc[0])
-    show(fig_realtime_cycle(cur, P, f"Within-cycle replay · {bat}, cycle {n_pick} · {best}"), key="pt_cycle", export=False)
-    partial_field_windows(saved)
-
-
-def fig_window_map(ev: pd.DataFrame, P: Palette) -> go.Figure:
-    piv = ev.pivot_table(index="start V", columns="end V", values="MAE (SOH %)").sort_index(ascending=False)
-    piv = piv[sorted(piv.columns, reverse=True)]
-    fig = go.Figure(go.Heatmap(z=piv.to_numpy(), x=[f"{v:.2f}" for v in piv.columns], y=[f"{v:.2f}" for v in piv.index],
-                               colorscale=[[0, "#0072B2"], [0.35, "#56B4E9"], [0.7, "#CC79A7"], [1, "#882255"]],
-                               colorbar=dict(title=dict(text="MAE (SOH pts)", font=dict(color=P.text)), tickfont=dict(color=P.muted)),
-                               hovertemplate="window %{y} V → %{x} V<br>MAE %{z:.2f} SOH points<extra></extra>",
-                               text=np.round(piv.to_numpy(), 1), texttemplate="%{text}"))
-    fig.update_xaxes(title_text="Window ends at (V)")
-    fig.update_yaxes(title_text="Window starts at (V)")
-    return style_fig(fig, P, 460, "Field cycles: SOH error by the voltage window a discharge happens to cover",
-                     hovermode="closest")
-
-
-def partial_field_windows(saved: Dict[str, Any]) -> None:
-    with st.expander("Field cycles that start anywhere (beyond the paper)", icon=":material/open_in_full:"):
-        st.markdown("Field discharges rarely start full or reach the cut-off. Here the estimator sees only the charge "
-                    "delivered between the voltages inside a random window, plus where the window lies; a capacity "
-                    "proxy (window charge ÷ the share of capacity a reference battery delivers in that window) "
-                    "carries the physics.")
-        mdl = st.selectbox("Model", [m for m in ("Gaussian Process", "SVM", "Bayesian Ridge") if m in te.available_models()],
-                           key="pt_w_model", help="On synthetic tests the Gaussian process was best for windows.")
-        if st.button("Evaluate field windows", key="pt_w_go", icon=":material/grid_on:"):
-            sc_ = scheme()
-            train = list(saved["key"][1])
-            test_tab = saved["test"]
-            try:
-                w = te.WindowSOHEstimator(mdl).fit(te.partial_table(ct, train))
-                st.session_state["pt_windows"] = te.window_evaluation(w, test_tab)
-            except Exception as exc:
-                report_error("Window evaluation failed", exc, debug)
-        ev = st.session_state.get("pt_windows")
-        if ev is not None and len(ev):
-            show(fig_window_map(ev, P), key="pt_wmap", export=False)
-            show_table(ev.sort_values("MAE (SOH %)").head(8).set_index(["start V", "end V"])
-                       .style.format({"MAE (SOH %)": "{:.2f}", "coverage": "{:.0%}"}),
-                       note="The most informative windows: where a partial field discharge should run to reveal the "
-                            "battery's health best.")
-
-
-FAMILY_COLORS = {"Baselines": "#8C8C8C", "Process model": "#0072B2", "Statistical / Bayesian": "#56B4E9",
-                 "Machine learning": "#332288", "Deep learning": "#AA4499", "Physics": "#882255"}
-
-
-@st.cache_resource(show_spinner=False, max_entries=8)
-def process_model_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...]) -> Any:
-    return te.ProcessModel().fit(_ct, _imp, list(cells))
-
-
-def fig_process_parity(pm: Any, P: Palette) -> go.Figure:
-    W = pm.windows
-    pred = te._design(W) @ pm.coef_soh
-    obs = np.log(-W["rate_SOH"].to_numpy())
-    grp = te.condition_groups(ct)["Group"]
-    fig = go.Figure()
-    for i, (g, d) in enumerate(W.assign(pred=pred, obs=obs, grp=W["Cell_ID"].map(grp)).groupby("grp")):
-        fig.add_trace(go.Scatter(x=np.exp(d["pred"]) * 1e4, y=np.exp(d["obs"]) * 1e4, mode="markers", name=g,
-                                 marker=dict(size=7, color=CELL_COLORS[i % len(CELL_COLORS)], opacity=0.75),
-                                 text=d["Cell_ID"], hovertemplate="%{text}<br>model %{x:.2f} · measured %{y:.2f}"
-                                                                  " (×10⁻⁴ SOH/Ah)<extra></extra>"))
-    lim = [float(np.exp(min(pred.min(), obs.min())) * 1e4 * 0.8), float(np.exp(max(pred.max(), obs.max())) * 1e4 * 1.2)]
-    fig.add_trace(go.Scatter(x=lim, y=lim, mode="lines", name="perfect", line=dict(color=P.muted, dash="dash")))
-    fig.update_xaxes(title_text="Fade rate from the model (×10⁻⁴ SOH per Ah)", type="log")
-    fig.update_yaxes(title_text="Measured fade rate (×10⁻⁴ SOH per Ah)", type="log")
-    return style_fig(fig, P, 460, "Does f(θ, u) explain how fast each battery fades under its conditions?", hovermode="closest")
-
-
-def fig_process_forecast(r_upd: Dict[str, Any], r_pri: Dict[str, Any], P: Palette, n0: int) -> go.Figure:
-    cte = te.attach_eis(ct, imp) if imp is not None else ct
-    g = cte[(cte["Cell_ID"] == cell) & ~cte["outlier"]].sort_values("n")
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07,
-                        subplot_titles=("SOH", "Internal resistance (relative to new)", "Charge-transfer resistance (relative to new)"))
-    _style_subplot_titles(fig, P)
-    f = r_upd["forecast"]
-    grid = f.n_grid
-    fut = grid > n0
-    add_band(fig, grid[fut], f.lo[fut], f.hi[fut], "#0072B2", "90% band (self-updating)", group="u", alpha=0.15, row=1, col=1)
-    fig.add_trace(go.Scatter(x=g["n"], y=g["SOH"], mode="markers", name="Measured", marker=dict(color=P.measured, size=4)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=grid[fut], y=r_pri["forecast"].soh[fut], mode="lines", name="Fleet prior only",
-                             line=dict(color=P.muted, width=2, dash="dash")), row=1, col=1)
-    fig.add_trace(go.Scatter(x=grid[fut], y=f.soh[fut], mode="lines", name="Self-updating f(θ, u)", legendgroup="u",
-                             line=dict(color="#0072B2", width=3)), row=1, col=1)
-    for row, col_, key in ((2, "R_dc_ohm", "R_int"), (3, "Rct_ohm", "R_ct")):
-        if col_ in g and g[col_].notna().sum() >= 3:
-            base = float(g[col_].dropna().head(3).median())
-            fig.add_trace(go.Scatter(x=g["n"], y=g[col_] / base, mode="markers", showlegend=False,
-                                     marker=dict(color=P.measured, size=4)), row=row, col=1)
-        fig.add_trace(go.Scatter(x=grid[fut], y=r_upd[key][fut], mode="lines", showlegend=False,
-                                 line=dict(color="#0072B2", width=3)), row=row, col=1)
-    fig.add_vline(x=n0, line_dash="dot", line_color=P.muted)
-    fig.update_yaxes(title_text="SOH", tickformat=".0%", row=1, col=1)
-    fig.update_yaxes(title_text="R / R₀", row=2, col=1)
-    fig.update_yaxes(title_text="R / R₀", row=3, col=1)
-    fig.update_xaxes(title_text="Discharge cycle n", row=3, col=1)
-    return style_fig(fig, P, 780, None)
-
-
-def fig_factor_convergence(pm: Any, P: Palette) -> go.Figure:
-    g = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]]
-    ns = np.unique(np.linspace(12, int(g["n"].max()), 14).astype(int))
-    vals = [pm.battery_factor(ct, imp, cell, int(n)) for n in ns]
-    m = np.array([v[0] for v in vals])
-    sd = np.sqrt([v[1] for v in vals])
-    fig = go.Figure()
-    add_band(fig, ns, np.exp(m - 2 * sd), np.exp(m + 2 * sd), "#0072B2", "±2σ", group="f", alpha=0.18)
-    fig.add_trace(go.Scatter(x=ns, y=np.exp(m), mode="lines+markers", name="Battery rate factor", legendgroup="f",
-                             line=dict(color="#0072B2", width=3)))
-    fig.add_hline(y=1.0, line_dash="dash", line_color=P.muted, annotation_text="fleet average",
-                  annotation_font=dict(color=P.muted))
-    fig.update_xaxes(title_text="Cycles of this battery seen so far")
-    fig.update_yaxes(title_text="Fade rate ÷ fleet prediction")
-    return style_fig(fig, P, 380, f"Self-updating: {cell}'s own ageing speed, learned cycle by cycle")
-
-
-def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
-    d = sb.iloc[::-1]
-    fig = go.Figure(go.Bar(y=d.index, x=d["RMSE (SOH pts)"], orientation="h",
-                           marker=dict(color=[FAMILY_COLORS.get(f, P.text) for f in d["Family"]]),
-                           error_x=dict(type="data", array=d["95% CI ±"].fillna(0), color=P.muted),
-                           customdata=np.column_stack([d["Family"], d["Batteries"], d["vs best baseline"]]),
-                           hovertemplate="%{y}<br>%{x:.2f} SOH points<br>%{customdata[0]} · %{customdata[1]} batteries"
-                                         "<br>%{customdata[2]}<extra></extra>"))
-    bb = sb.attrs.get("best_baseline")
-    if bb in sb.index:
-        fig.add_vline(x=float(sb.loc[bb, "RMSE (SOH pts)"]), line_dash="dash", line_color=P.muted,
-                      annotation_text=f"best baseline: {bb}", annotation_font=dict(color=P.muted))
-    fig.update_xaxes(title_text="Forecast error, RMSE (SOH points), mean over held-out batteries ± 95% CI", rangemode="tozero")
-    return style_fig(fig, P, 140 + 36 * len(sb), "Prediction-accuracy assessment: same batteries, same protocol",
-                     hovermode="closest")
-
-
-def plan_sections() -> None:
-    pool = tuple(sorted(set(te.v2_training_pool(ct, cell)) | {cell}))
-    # ------------------------------------------------------------------ M1
-    section("Mission 1 · Degradation model v1: the process model θ(k+1) = f(θ(k), u(k))")
-    st.markdown("The research plan's model: the health state **θ = [SOH, R_int, R_ct]** evolves cycle by cycle as a "
-                "function of the state and the **operating conditions u** (cell temperature, discharge current). It is "
-                f"fitted across **all comparable batteries** ({len(pool)}), because condition effects can only be learned "
-                "across conditions. The same model is updated for each battery (Mission 2) and optimised (Mission 3).")
-    with st.expander("Model equations", icon=":material/functions:"):
-        st.latex(r"\frac{d\,\mathrm{SOH}}{d\mathrm{Ah}} = -\exp\!\Big(b_0 + b_T\,1000\big(\tfrac{1}{T_\mathrm{ref}}-\tfrac{1}{T}\big)"
-                 r" + b_C\,\tfrac{\max(0,\,15^\circ\mathrm{C}-T)}{10} + b_I \ln\tfrac{I}{2\,\mathrm{A}} + b_L\,(1-\mathrm{SOH})"
-                 r" + \beta_\mathrm{battery}\Big)")
-        st.latex(r"\frac{d(R/R_0)}{d\mathrm{Ah}} = g_0 + g_T x_T + g_C x_C + g_I x_I + g_L (1-\mathrm{SOH}) \quad"
-                 r"\text{(for } R_\mathrm{int} \text{ and } R_\mathrm{ct})")
-        st.caption("Activation energy = b_T × 8.314 kJ/mol. β_battery is each battery's own rate factor: prior from the "
-                   "spread between batteries, updated with every cycle it delivers.")
-    try:
-        pm = process_model_cached(ct, imp, DATA_KEY, pool)
-    except Exception as exc:
-        report_error("Process model could not be fitted", exc, debug)
-        return
-    eff = pm.effects()
-    k = st.columns(4)
-    k[0].metric("Batteries in the fit", len(pm.cells))
-    k[1].metric("Explained variance of fade rates", fmt(100 * pm.fit_r2.get("SOH", np.nan), ".0f", "%"))
-    ea = eff.loc["Activation energy"]
-    k[2].metric("Activation energy", f"{ea['Estimate']:.0f} kJ/mol", delta=f"90%: {ea['90% low']:.0f} – {ea['90% high']:.0f}",
-                delta_color="off")
-    k[3].metric("Battery-to-battery spread", f"×{np.exp(np.sqrt(pm.tau2)):.2f}",
-                help="Typical factor between one battery's fade rate and the fleet's under the same conditions.")
-    show_table(eff.style.format({"Estimate": "{:.2f}", "90% low": "{:.2f}", "90% high": "{:.2f}"}, na_rep="—"),
-               note="How operating conditions change the fade rate (Mission 1). 'Identified' = the 90% interval (bootstrap "
-                    "over batteries) excludes zero; effects that are not identified cannot be claimed with these batteries.")
-    r2 = ", ".join(f"{k_} {100 * v:.0f}%" for k_, v in pm.fit_r2.items())
-    st.caption(f"Share of variance explained per state equation: {r2}. Resistance changes from cycle to cycle are "
-               "mostly measurement noise, so their equations explain less.")
-    show(fig_process_parity(pm, P), key="pm_parity", data=pm.windows)
-    # ------------------------------------------------------------------ M2 forecast
-    section(f"Mission 2 · Self-updating forecast of θ for {cell}")
-    g = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]]
-    c1, c2, c3 = st.columns(3)
-    frac = c1.slider("Cycles seen so far (share of life)", 0.1, 0.9, 0.4, 0.05, key="pm_frac")
-    T_new = c2.number_input("Future cell temperature (°C, what-if)", -10.0, 60.0, float(round(meta.loc[cell, "T_mean_C"], 1)), 1.0,
-                            key="pm_T")
-    I_new = c3.number_input("Future discharge current (A, what-if)", 0.5, 6.0, float(round(meta.loc[cell, "I_dis_A"], 1)), 0.5,
-                            key="pm_I")
-    n0 = int(max(12, round(frac * g["n"].max())))
-    u = {"T_C": float(T_new), "I_A": float(I_new)}
-    if cell not in pm.cells or True:
-        pm_t = process_model_cached(ct, imp, DATA_KEY, tuple(c for c in pool if c != cell))   # never trained on itself
-    r_upd = te.process_forecast(pm_t, ct, imp, cell, n0, float(eol_ah), u=u, update=True)
-    r_pri = te.process_forecast(pm_t, ct, imp, cell, n0, float(eol_ah), u=u, update=False)
-    k = st.columns(4)
-    m_, v_, nw = r_upd["factor"]
-    k[0].metric("Forecast error (self-updating)", fmt(100 * r_upd["forecast"].metrics.rmse, ".2f", " SOH pts"))
-    k[1].metric("Forecast error (fleet prior only)", fmt(100 * r_pri["forecast"].metrics.rmse, ".2f", " SOH pts"))
-    k[2].metric("This battery's rate factor", f"×{np.exp(m_):.2f}", delta=f"from {nw} windows", delta_color="off")
-    k[3].metric("Band coverage", fmt(100 * r_upd["forecast"].metrics.coverage, ".0f", "%"))
-    show(fig_process_forecast(r_upd, r_pri, P, n0), key="pm_forecast", export=False)
-    show(fig_factor_convergence(pm_t, P), key="pm_factor", export=False)
-    st.caption("The battery is never part of its own training set here. 'How often should the model update?' and "
-               "'which variables are most informative?' are answered by the update-frequency study and the measurement "
-               "ablation in the **Live twin** view.")
-    # ------------------------------------------------------------------ M2 accuracy assessment
-    section("Mission 2 · Prediction-accuracy assessment (one protocol for every model)")
-    groups = te.condition_groups(ct)
-    usable = [gname for gname in te.GROUP_ORDER if gname in set(groups["Group"]) and gname not in te.V2_EXCLUDED_GROUPS]
-    my = groups.loc[cell, "Group"] if cell in groups.index and groups.loc[cell, "Group"] in usable else (usable[0] if usable else None)
-    if my is None:
-        st.info("No usable condition group for the assessment.")
-    else:
-        c1, c2 = st.columns(2)
-        grp = c1.selectbox("Condition group", usable, index=usable.index(my), key="acc_group",
-                           format_func=lambda x: f"{x} · {len(te.protocol_cells(ct, x))} batteries")
-        origins = c2.multiselect("Forecast origins", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7], default=[0.3, 0.5], key="acc_origins",
-                                 format_func=lambda v: f"{100 * v:.0f}%")
-        av = te.available_models()
-        keys = st.multiselect("Models", list(te.PROTOCOL_MODELS),
-                              default=["persistence", "trend", "shape", "process_prior", "process", "ml:Bayesian Ridge"],
-                              key="acc_models", format_func=lambda k_: te.PROTOCOL_MODELS[k_][1],
-                              help="Baselines, the process model (fleet prior and self-updating), and any other model.")
-        keys = [k_ for k_ in keys if not k_.startswith("ml:") or k_[3:] in av]
-        cells_g = te.protocol_cells(ct, grp)
-        if st.button(f"Run the assessment ({len(cells_g) * len(origins) * len(keys)} forecasts)", key="acc_go",
-                     type="primary", icon=":material/fact_check:", disabled=len(cells_g) < 3 or not keys or not origins):
-            prog = st.progress(0.0)
-            st.session_state["acc_res"] = te.run_protocol(store, ct, imp, cells_g, keys, tuple(sorted(origins)), float(eol_ah),
-                                                          progress=lambda f_, m__: prog.progress(min(max(float(f_), 0), 1), text=m__))
-            st.session_state["acc_key"] = (DATA_KEY, grp)
-            prog.empty()
-        res = st.session_state.get("acc_res")
-        if res is not None and len(res) and st.session_state.get("acc_key") == (DATA_KEY, grp):
-            sb = te.protocol_scoreboard(res)
-            show(fig_scoreboard(sb, P), key="acc_board", data=sb.reset_index())
-            show_table(sb.style.format({"RMSE (SOH pts)": "{:.2f}", "95% CI ±": "{:.2f}", "EOL |error| (cycles)": "{:.1f}",
-                                        "Coverage": "{:.0%}", "p (Wilcoxon)": "{:.3f}"}, na_rep="—"),
-                       note="Each battery of the group held out in turn, forecast from each origin, scored on all its later "
-                            "measured cycles. Errors averaged per battery first, then across batteries (95% CI); paired "
-                            "comparison with the best baseline (Wilcoxon from 5 batteries).")
-            bad = res[res["status"] != "ok"]
-            if len(bad):
-                st.caption(f"{len(bad)} forecasts failed and are listed as failures: "
-                           + "; ".join(sorted(set(bad["status"].str[:60]))[:3]))
-        else:
-            placeholder("Press 'Run the assessment' to compare the process model with the baselines and other models.")
-    # ------------------------------------------------------------------ M3 link
-    section("Mission 3 · One common model for operation and maintenance")
-    st.toggle("Use this process model as the Operations plant", value=True, key="use_process_plant",
-              help="Operations & control then optimises with the degradation law fitted and validated here "
-                   "(activation energy, cold and current effects, this battery's updated rate factor).")
-    st.caption("The research plan requires a common adaptive model: with this switch on, the trade-offs in Operations "
-               "(aggressive operation vs faster degradation vs delayed maintenance) are computed with f(θ, u).")
-    st.session_state["_process_pool"] = pool
-
-
 def view_models() -> None:
     recommendations("models")
-    plan_sections()
-    st.markdown("---")
-    st.markdown("### Further models and tools (exploration)")
     section("Learning ladder: from simple references to first principles")
     sc = scheme_controls()
     if not sc["targets"]:
@@ -5268,7 +4825,6 @@ def view_models() -> None:
     ladder_hybrid()
     ladder_first_principles()
     ladder_leaderboard()
-    partial_section()
     early_life_section()
     cross_cell_section()
 
@@ -5329,12 +4885,7 @@ def view_ops() -> None:
                            "18650 cell.")
     if calib:
         try:
-            if st.session_state.get("use_process_plant", True):
-                pool_ = st.session_state.get("_process_pool") or tuple(sorted(set(te.v2_training_pool(ct, cell)) | {cell}))
-                pm_ = process_model_cached(ct, imp, DATA_KEY, tuple(pool_))
-                phys, calib_tab = te.process_plant(pm_, ct, imp, cell)
-            else:
-                phys, calib_tab = calibrated_plant_cached(ct, imp, DATA_KEY, cell)
+            phys, calib_tab = calibrated_plant_cached(ct, imp, DATA_KEY, cell)
             with st.expander(f"Calibrated plant for {cell}", icon=":material/tune:"):
                 show_table(calib_tab.style.format({"Value": "{:.4g}"}))
                 st.caption("Mission 1–2 results feed Mission 3: the optimiser now plans for this battery's measured "
