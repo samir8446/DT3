@@ -3452,14 +3452,14 @@ def _reco_items(view: str) -> List[Tuple[str, str]]:
             items.append(("swap_horiz", "Pick a cold or hot battery in the control bar to see the mechanistic model take over."))
     elif view == "models":
         done = {e["level"] for e in ladder_entries()}
-        nxt = next((lv for lv in LEVEL_INFO if lv not in done and lv not in (2, 3)), None)
         if not done:
             items.append(("flag", "Start with **Level 1 · Baselines**: every other model must beat the linear trend."))
-        elif nxt:
-            items.append(("trending_up", f"Next: **Level {nxt} · {LEVEL_INFO[nxt][0]}**, then compare in the leaderboard."))
+        elif not (done & {2, 3}):
+            items.append(("trending_up", "Next: the **machine-learning workbench**, then compare in the leaderboard."))
         if not ss.get("ml"):
             items.append(("model_training", "In the ML workbench, press **Auto-tune** before judging the tree and boosting models."))
-        items.append(("fact_check", "One battery is an anecdote: confirm the ranking in the **cross-cell benchmark** or the Study results."))
+        items.append(("fact_check", "One battery is an anecdote: confirm the ranking with the **Same operating conditions** "
+                                    "or **Across batteries** scheme and several test batteries."))
     elif view == "ops":
         if not ss.get("ops_calib", True):
             items.append(("tune", "Turn on **Calibrate the plant** so the optimisation plans for this real battery."))
@@ -3882,7 +3882,7 @@ def tuning_block(task: str, models: Sequence[str], params: Dict[str, Dict[str, A
                 st.caption("Score = mean + 0.5 SD of the validation RMSE (consistency across batteries is "
                            "rewarded). Defaults are always a candidate, so tuned ≤ default on validation. The "
                            "test data are never used, so tuned settings can still be worse on one particular "
-                           "battery: judge them on the leaderboard and the cross-cell benchmark.")
+                           "battery: judge them on the leaderboard with several test batteries.")
     out = dict(params)
     if use:
         out.update({m: r.best_params for m, r in tuned.items() if m in models})
@@ -4471,7 +4471,7 @@ def scheme_controls() -> Dict[str, Any]:
             st.caption(f"Learning from {len(train)} batteries, forecasting {len(test)}: each test battery is seen for its "
                        f"first {100 * frac:.0f}% of life. Baselines, the PINN and the first-principles model only need "
                        "the test battery itself; the other levels learn from the training batteries.")
-    gen = st.radio("Model generation (applies to every level)", ["v2", "v1", "both"], horizontal=True, key="gen",
+    gen = st.radio("Model generation (applies to both sections)", ["v2", "v1", "both"], horizontal=True, key="gen",
                    format_func={"v2": "v2 · cleaned data, physical limits, state features (recommended)",
                                 "v1": "v1 · original models", "both": "both · compare on the leaderboard"}.get,
                    help="v2 removes capacity-recovery jumps (causally for the test battery), trains on comparable "
@@ -4588,10 +4588,11 @@ def ladder_intro() -> None:
     done = {e["level"] for e in ladder_entries()}
     steps = "".join(
         f'<div class="bt-step{" bt-step-done" if lv in done else ""}"><div class="bt-step-n">{lv}</div>'
-        f'<div class="bt-step-t">{html.escape(LEVEL_INFO[lv][0])}</div></div>' for lv in LEVEL_INFO)
+        f'<div class="bt-step-t">{html.escape(LEVEL_INFO[lv][0])}</div></div>' for lv in ACTIVE_LEVELS)
     st.markdown(f'<div class="bt-ladder">{steps}</div>', unsafe_allow_html=True)
-    st.caption("Work top to bottom: every level adds one idea. A level is ticked once one of its models has run on the "
-               "displayed battery; the leaderboard at the end compares them all on the same test cycles.")
+    st.caption("Work top to bottom: first the baselines, then the machine-learning models. A level is ticked once one of "
+               "its models has run on the displayed battery; the leaderboard at the end compares them on the same test "
+               "cycles. Advanced models (deep learning, hybrid, first principles) are added once these are validated.")
 
 
 def ladder_baselines() -> None:
@@ -4764,9 +4765,12 @@ def ladder_leaderboard() -> None:
         st.rerun()
 
 
+ACTIVE_LEVELS = (1, 2, 3)        # advanced levels (deep learning, hybrid, first principles) are added back step by step
+
+
 def view_models() -> None:
     recommendations("models")
-    section("Learning ladder: from simple references to first principles")
+    section("Forecasting models: baselines and machine learning (levels 1–3)")
     sc = scheme_controls()
     if not sc["targets"]:
         return
@@ -4774,12 +4778,7 @@ def view_models() -> None:
     ml_methods_panel()
     ladder_baselines()
     ml_section()
-    ladder_deep()
-    ladder_hybrid()
-    ladder_first_principles()
     ladder_leaderboard()
-    early_life_section()
-    cross_cell_section()
 
 
 # =============================================================================

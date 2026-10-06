@@ -1,8 +1,16 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.5)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.5.1)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
+
+
+## Models view in v5.5.1
+
+Restored from v5.5 and reduced to Level 1 · Baselines and Levels 1–3 · the machine-learning workbench (plus their
+leaderboard). Advanced levels (deep learning, hybrid, first principles), early-life prediction and the cross-cell
+benchmark are hidden from the view (the engine keeps them) and will be added back step by step once the ML models
+are developed and validated.
 
 ## Study objectives (Missions)
 
@@ -114,7 +122,7 @@ on the engine version, so engine updates always recompute.
   - B0025–B0028: square-wave load, pulse-aware twin;
   - erratic 4 °C runs: outlier flags.
 
-## ML v2 (v5.5)
+## ML v2 (v6.1)
 
 `train_ml_v2`: forecast = the battery's own robust recent trend + a learned deviation. Features at the origin:
 level and 10-cycle trend of cleaned SOH, load-step resistance, temperature rise, CV-charge time, mean voltage,

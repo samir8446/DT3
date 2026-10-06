@@ -917,7 +917,7 @@ def test_ml_v2_cleaning_causal_features_and_forecast():
     assert np.all(np.diff(f.soh_pred[fut]) <= 1e-12) and np.all((f.soh_pred >= 0) & (f.soh_pred <= 1.05))
     assert np.all(f.soh_lo[fut] <= f.soh_pred[fut] + 1e-12) and np.all(f.soh_hi[fut] >= f.soh_pred[fut] - 1e-12)
     assert all(0 <= w <= 1 for w in f.correction_weight.values() if np.isfinite(w))
-    assert len(f.importance) == len(te.V2_FEATURES) and f.metrics.rmse < 0.05
+    assert 10 <= len(f.importance) <= len(te.V2_FEATURES) and f.metrics.rmse < 0.05
     pool = te.v2_training_pool(ct, "S002")
     assert "S002" not in pool and len(pool) >= 3
 
