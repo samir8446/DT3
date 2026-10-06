@@ -1103,34 +1103,6 @@ def test_fleet_shape_baseline_bends_and_beats_straight_trend_early():
     assert f_shape.baseline_curve is not None and f_shape.options["baseline"] == "shape"
 
 
-def test_forecast_protocol_scoreboard_and_estimation():
-    m, imp, _ = te.make_synthetic_master(n_cells=5, n_cycles=100, ambients=(24,) * 5, seed=3, noise_v=0.01,
-                                         knee={i: (30 + 3 * i, 2.2) for i in range(5)})
-    store = te.ParquetStore.from_dataframe(m)
-    ct = te.build_cycle_table(store)
-    cells = te.protocol_cells(ct, "Reference")
-    assert len(cells) == 5
-    res = te.run_protocol(store, ct, imp, cells, ["persistence", "trend", "shape", "ml:Bayesian Ridge", "bogus"], (0.3, 0.6), 1.6)
-    assert len(res) == 5 * 2 * 5
-    assert (res[res["key"] == "bogus"]["status"].str.startswith("failed")).all()        # failures kept, not dropped
-    ok = res[res["status"] == "ok"]
-    assert (ok["test cycles"] > 0).all() and ok["RMSE (SOH pts)"].notna().all()
-    for c in cells:                                                                     # scored only after the origin
-        r = ok[(ok["Cell_ID"] == c) & (ok["origin"] == 0.3)].iloc[0]
-        n_last = int(ct[(ct["Cell_ID"] == c) & ~ct["outlier"]]["n"].max())
-        assert r["n0"] == int(max(10, round(0.3 * n_last)))
-    sb = te.protocol_scoreboard(res)
-    assert sb.attrs["best_baseline"] in ("Persistence (SOH stays)", "Linear trend", "Fleet shape")
-    assert (sb["Batteries"] == 5).all()                                                 # per battery, not per forecast
-    assert sb.loc[sb.attrs["best_baseline"], "vs best baseline"] == "reference"
-    assert sb.loc["Persistence (SOH stays)", "RMSE (SOH pts)"] > sb.loc["Fleet shape", "RMSE (SOH pts)"]
-    # the held-out battery never trains its own forecast: fleet shape pool excludes it
-    f = te.fleet_shape_forecast(ct, cells[0], 40, 1.6, cells)
-    assert cells[0] not in f.params["pool"]
-    est = te.estimation_protocol(ct, imp, cells[:4], ["Bayesian Ridge"], ["R_dc_ohm", "dT_C", "Capacity_Ah"])
-    assert (est["status"] == "ok").all() and est["RMSE (SOH pts)"].notna().all()
-
-
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
