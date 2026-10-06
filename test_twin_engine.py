@@ -1082,6 +1082,58 @@ def test_partial_soh_feeds_twin_windows_and_live_streaming():
     assert abs(end["SOH"] - final["SOH"]) < 1e-9 and last["battery_id"] == "S003"
 
 
+def test_fleet_shape_baseline_bends_and_beats_straight_trend_early():
+    m, imp, _ = te.make_synthetic_master(n_cells=5, n_cycles=120, ambients=(24,) * 5, seed=3, noise_v=0.01,
+                                         knee={i: (25 + 3 * i, 2.3) for i in range(5)})
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    shape = te.fleet_shape(ct, ["S002", "S003", "S004", "S005"])
+    A, F = shape
+    assert np.all(np.diff(F) <= 1e-12) and F[0] > 0.95
+    # a battery at the fleet's start, fading at the fleet's own early speed, follows the fleet curve
+    w = 15 * 2.0
+    fs = float((te._shape_at(shape, [w])[0] - te._shape_at(shape, [0.0])[0]) / w)
+    hz = np.array([10.0, 40.0, 80.0])
+    d = te.shape_drop(shape, float(F[0]), fs, 2.0, hz)
+    assert np.allclose(d, te._shape_at(shape, 2.0 * hz) - F[0], atol=1e-9)
+    assert d[2] / hz[2] < d[0] / hz[0]                                   # bends: faster fade later (knee)
+    n0 = 18
+    f_shape = te.train_ml_v2(ct, "S001", n0, "Bayesian Ridge", eol_ah=1.6, baseline="shape", explain=False)
+    f_trend = te.train_ml_v2(ct, "S001", n0, "Bayesian Ridge", eol_ah=1.6, baseline="trend", explain=False)
+    assert f_shape.metrics.rmse < f_trend.metrics.rmse
+    assert f_shape.baseline_curve is not None and f_shape.options["baseline"] == "shape"
+
+
+def test_process_model_recovers_physics_updates_itself_and_drives_operations():
+    m, imp, _ = te.make_synthetic_master(n_cells=10, n_cycles=120, ambients=(24, 34, 43, 4, 24, 34, 43, 24, 4, 34),
+                                         currents=(2,) * 10, seed=0, noise_v=0.01)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    train = [c for c in ct["Cell_ID"].unique() if c != "S005"]
+    pm = te.ProcessModel().fit(ct, imp, train)
+    assert "S005" not in pm.cells and pm.fit_r2["SOH"] > 0.4
+    ea = pm.effects().loc["Activation energy"]
+    true_ea = te.CellPhysics().Ea_J_mol / 1e3
+    assert ea["90% low"] < true_ea < ea["90% high"] and bool(ea["Identified"])
+    g = ct[(ct["Cell_ID"] == "S005") & ~ct["outlier"]]
+    n0 = int(0.4 * g["n"].max())
+    upd = te.process_forecast(pm, ct, imp, "S005", n0, 1.6, update=True)
+    pri = te.process_forecast(pm, ct, imp, "S005", n0, 1.6, update=False)
+    assert upd["forecast"].metrics.rmse < pri["forecast"].metrics.rmse
+    assert upd["factor"][1] < pm.tau2 and upd["factor"][2] > 0                    # evidence narrows the factor
+    f = upd["forecast"]
+    fut = f.n_grid > n0
+    assert np.all(f.lo[fut] <= f.soh[fut] + 1e-12) and np.isfinite(upd["R_int"][fut]).all()
+    assert pm.battery_factor(ct, imp, "S005", 8) == (0.0, pm.tau2, 0)              # too few cycles: the prior
+    hot = te.process_forecast(pm, ct, imp, "S005", n0, 1.6, u={"T_C": 45.0})["forecast"].soh[-1]
+    assert hot < f.soh[-1]                                                         # what-if: hotter ages faster
+    q, tab = te.process_plant(pm, ct, imp, "S005")
+    assert abs(q.Ea_J_mol - ea["Estimate"] * 1e3) < 1.0 and "process model" in tab.loc["k_ah", "Source"]
+    res = te.run_protocol(store, ct, imp, te.protocol_cells(ct, "Reference")[:4], ["shape", "process"], (0.4,), 1.6)
+    assert (res["status"] == "ok").all()
+    sb = te.protocol_scoreboard(res)
+    assert "Process model f(θ, u), self-updating" in sb.index
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
