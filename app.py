@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.6"
+REQUIRED_ENGINE = "5.5"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -566,7 +566,6 @@ EXPLAIN: Dict[str, str] = {
     "lad_board": "All models run so far on this battery and forecast origin, from the simplest to the most advanced, scored on the same future cycles. The best is highlighted.",
     "ml_fig": "Forecasts of the selected ML models from the forecast origin (dotted line), with their uncertainty bands, against the measured SOH.",
     "ml_v2_fig": "ML v2 forecasts: each battery's own recent trend, corrected by what the models learned from the training batteries about acceleration and knees.",
-    "ml_v2_shap": "Shapley values: how much each measurement pushed this battery's forecast (SOH change at +40 cycles) above (blue) or below (purple) the average forecast. They add up to the difference from the average.",
     "ml_v2_imp": "Which measurements drive the v2 forecast: how much the error grows when one feature is shuffled (on held-out batteries, 40-cycle horizon). This answers which variables are most informative.",
     "ml_board": "Leaderboard of the ML models on the held-out cycles (fade skill: 1 = perfect, 0 = no better than assuming no further fade).",
     "ml_parity": "Predicted against measured SOH on the test cycles: points on the diagonal are perfect predictions.",
@@ -2262,10 +2261,11 @@ def update_cohort_cached(_store: Any, _ct: pd.DataFrame, _imp: Optional[pd.DataF
 
 @st.cache_data(show_spinner=False, max_entries=64)
 def ml_v2_cached(_ct: pd.DataFrame, key: str, cell: str, n0: int, model: str, eol_ah: float, level: float,
-                 train_cells: Optional[Tuple[str, ...]], params_json: str, opts_json: str = "{}") -> Any:
+                 train_cells: Optional[Tuple[str, ...]], params_json: str) -> Any:
     tc = None if train_cells is None else list(train_cells)
-    return te.train_ml_v2(_ct, cell, n0, model, eol_ah, tc, json.loads(params_json) or None, level,
-                          **json.loads(opts_json))
+    if tc == []:
+        tc = []                                          # 'this battery only': its own history
+    return te.train_ml_v2(_ct, cell, n0, model, eol_ah, tc, json.loads(params_json) or None, level)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -3855,10 +3855,6 @@ def tuning_block(task: str, models: Sequence[str], params: Dict[str, Dict[str, A
     tuned: Dict[str, Any] = st.session_state.setdefault(store_key, {})
     c1, c2, c3 = st.columns([1.4, 1.2, 2])
     n_iter = c2.select_slider("Candidates per model", [8, 12, 16, 24, 32], value=12, key=f"{task}_niter")
-    method = c2.radio("Search", list(te.TUNING_METHODS), horizontal=True, key=f"{task}_method", index=1,
-                      format_func={"random": "Random", "bayesian": "Bayesian optimisation"}.get,
-                      help="Bayesian: a surrogate model of the validation score proposes each next candidate.")
-    st.session_state["_tune_method"] = method
     if c1.button("Auto-tune hyperparameters", key=f"{task}_tune", icon=":material/auto_fix_high:",
                  disabled=not models, help="Random search validated without touching the test data."):
         prog = st.progress(0.0)
@@ -3893,20 +3889,6 @@ def tuning_block(task: str, models: Sequence[str], params: Dict[str, Dict[str, A
     return out
 
 
-def fig_shapley(sh: pd.DataFrame, P: Palette, model: str, target: str, top: int = 12) -> go.Figure:
-    """Why this forecast: Shapley contributions of each feature to the 40-cycle SOH change (largest first)."""
-    d = sh.head(top).iloc[::-1]
-    vals = d["Shapley (SOH at +40 cycles)"].to_numpy() * 100
-    cols = ["#0072B2" if v >= 0 else "#AA4499" for v in vals]
-    labels = [f"{f} = {v:.3g}" for f, v in zip(d["Feature"], d["Value"])]
-    fig = go.Figure(go.Bar(y=labels, x=vals, orientation="h", marker=dict(color=cols),
-                           hovertemplate="%{y}<br>%{x:+.3f} SOH points<extra></extra>"))
-    fig.add_vline(x=0, line_color=P.muted, line_width=1)
-    fig.update_xaxes(title_text="Contribution to the SOH change at +40 cycles (SOH points; − = faster fade)")
-    return style_fig(fig, P, max(380, 34 * len(d) + 140),
-                     f"Why this forecast? {model.split(' · ')[-1]} on {target} (Shapley values)", hovermode="closest")
-
-
 def ml_v2_panel(res: Sequence[Any], target: str) -> None:
     """ML v2 results: forecasts, how much each horizon trusted its correction, and which measurements matter."""
     st.markdown(f"**ML v2 on {target}** · trend of the battery's own recent fade + a learned deviation")
@@ -3934,12 +3916,6 @@ def ml_v2_panel(res: Sequence[Any], target: str) -> None:
                     + ", ".join(f"{k.split(' · ')[1]} {v:.2f}" for k, v in wt.items()))
         note("The ensemble weights each model by its error on held-out batteries (never on this test battery), so "
              "the most reliable models count most.")
-    sh = next((r for r in res if r.shap is not None and len(r.shap)), None)
-    if sh is not None:
-        show(fig_shapley(sh.shap, P, sh.model, target), key="ml_v2_shap", export=False)
-    sel = next((r for r in res if r.options.get("select_features")), None)
-    if sel is not None:
-        st.caption("Features kept by automatic selection: " + ", ".join(te.V2_FEATURES[f] for f in sel.selected))
     imp = next((r.importance for r in res if len(r.importance)), None)
     if imp is not None:
         show(fig_importance(imp, P, res[0].model.split(" · ")[1]), key="ml_v2_imp", export=False)
@@ -3974,8 +3950,7 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
     use_pop = source == "cohort"
     params = tuning_block(f"fc_{show_t}_{n0_show}_{source}", models, params,
                           lambda m, k: te.tune_ml_forecast(ct, show_t, n0_show, m, n_iter=k,
-                                                           use_population=source != "own", train_cells=train_cells,
-                                                           method=st.session_state.get("_tune_method", "random")))
+                                                           use_population=source != "own", train_cells=train_cells))
     ml_cfg = dict(cell=show_t, n0=n0_show, targets=tuple(sc["targets"]), models=tuple(models), source=source,
                   train_cells=train_cells, eol_ah=float(eol_ah), strategy=strategy, conformal_cells=conf,
                   band_level=level, params={m: params.get(m) for m in models})
@@ -3983,27 +3958,6 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
     st.caption({"v2": "Generation v2: state features at the origin, the battery's own trend + a learned, "
                       "cross-validated deviation.", "v1": "Generation v1: fade-rate law of SOH and conditions.",
                 "both": "Both generations run; compare them on the leaderboard."}[version])
-    with st.expander("Advanced ML options (v2)", icon=":material/tune:"):
-        o = st.columns(3)
-        v2_opts = {
-            "monotone": o[0].toggle("Monotonic constraints (XGBoost, LightGBM)", value=True, key="ml_o_mono",
-                                    help="Faster resistance, heating or CV-time growth, higher temperature and C-rate "
-                                         "can only make the forecast worse: no physically wrong predictions."),
-            "select_features": o[1].toggle("Automatic feature selection", value=False, key="ml_o_sel",
-                                           help="Keeps the features whose importance on held-out batteries is "
-                                                "positive, then refits (about 2x slower)."),
-            "augment": o[2].toggle("Time-warp augmentation", value=False, key="ml_o_aug",
-                                   help="Adds copies of each training battery ageing 15% faster and slower "
-                                        "(about 3x more training data, slower)."),
-            "battery_conformal": o[0].toggle("Battery-level conformal bands", value=True, key="ml_o_conf",
-                                             help="The band must also cover the typical error of a whole held-out "
-                                                  "battery, not only of single cycles."),
-            "explain": o[1].toggle("Shapley explanation of the forecast", value=True, key="ml_o_shap",
-                                   help="How each feature pushed this battery's 40-cycle forecast up or down."),
-        }
-        st.caption("On synthetic test batteries these options changed the error only slightly (augmentation: "
-                   "0.0351 → 0.0345); they target battery-to-battery variation and irrelevant features, which "
-                   "are larger in real data. Compare with them on and off on the leaderboard.")
     ready = bool(models) and (source != "cross" or bool(train_cells))
     n_runs = len(models) * len(sc["targets"]) * (2 if version == "both" else 1)
     if st.button(f"Train and forecast ({n_runs} run{'s' if n_runs > 1 else ''})", type="primary", key="ml_go",
@@ -4030,8 +3984,7 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
                     try:
                         v2 = ml_v2_cached(ct, DATA_KEY, t, sc["n0"][t], mname, float(eol_ah), level,
                                           train_cells if source == "cross" else (None if source == "cohort" else ()),
-                                          json.dumps(params.get(mname, {}) if version == "v2" else {}, sort_keys=True),
-                                          json.dumps(v2_opts, sort_keys=True))
+                                          json.dumps(params.get(mname, {}) if version == "v2" else {}, sort_keys=True))
                         v2_by_target.setdefault(t, []).append(v2)
                         ladder_add(v2.model, lvl, sc["n0"][t], v2.n_grid, v2.soh_pred, v2.soh_lo, v2.soh_hi,
                                    v2.metrics, t)
@@ -4134,7 +4087,7 @@ def ml_estimation_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) 
     params = tuning_block(f"est_{split}_{test_frac}_{hash((tr_cells, te_cells, tuple(feats))) % 10**6}", models, params,
                           lambda m, k: te.tune_soh_estimator(ct, imp, m, tuple(feats), split, float(test_frac),
                                                              list(tr_cells) or None, list(te_cells) or None, normalise,
-                                                             n_iter=k, method=st.session_state.get("_tune_method", "random")))
+                                                             n_iter=k))
     cfg = dict(models=tuple(models), feats=tuple(feats), split=split, test_frac=test_frac, train=tr_cells,
                test=te_cells, normalise=normalise, params={m: params.get(m) for m in models})
     ready = bool(models) and bool(feats) and (split != "by_cell" or (tr_cells and te_cells))

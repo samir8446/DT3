@@ -8,13 +8,11 @@ from sklearn.ensemble import GradientBoostingRegressor
 
 class _Shim(GradientBoostingRegressor):
     def __init__(self, n_estimators=100, learning_rate=0.1, max_depth=3, subsample=1.0, reg_lambda=1.0,
-                 num_leaves=31, min_child_samples=20, random_state=None, n_jobs=None, verbosity=0, verbose=0,
-                 monotone_constraints=None):
+                 num_leaves=31, min_child_samples=20, random_state=None, n_jobs=None, verbosity=0, verbose=0):
         super().__init__(n_estimators=n_estimators, learning_rate=learning_rate, max_depth=max_depth,
                          subsample=subsample, random_state=random_state)
         self.reg_lambda, self.num_leaves, self.min_child_samples = reg_lambda, num_leaves, min_child_samples
         self.n_jobs, self.verbosity, self.verbose = n_jobs, verbosity, verbose
-        self.monotone_constraints = monotone_constraints              # accepted (not enforced by the stand-in)
 
     def get_params(self, deep=True):
         p = super().get_params(deep)

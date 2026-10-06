@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.6.0"
+ENGINE_VERSION = "5.5.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -1015,8 +1015,7 @@ def validate_params(name: str, params: Optional[Dict[str, Any]]) -> Dict[str, An
     return out
 
 
-def make_model(name: str, seed: int = 0, params: Optional[Dict[str, Any]] = None,
-               monotone: Optional[Sequence[int]] = None):
+def make_model(name: str, seed: int = 0, params: Optional[Dict[str, Any]] = None):
     """Factory for the regressors in MODEL_SPECS, with validated hyperparameters. Every model
     is wrapped with median imputation (health indicators can have gaps) and standardisation
     or polynomial expansion where the family needs it."""
@@ -1041,15 +1040,13 @@ def make_model(name: str, seed: int = 0, params: Optional[Dict[str, Any]] = None
         raise ValueError(f"{name} is not installed on this server: add '{OPTIONAL_ML[name]}' to requirements.txt.")
     elif name == "XGBoost":
         from xgboost import XGBRegressor
-        kw = {"monotone_constraints": "(" + ",".join(str(int(v)) for v in monotone) + ")"} if monotone is not None else {}
         est = XGBRegressor(n_estimators=p["n_estimators"], learning_rate=p["learning_rate"], max_depth=p["max_depth"],
                            subsample=p["subsample"], reg_lambda=p["reg_lambda"], random_state=seed, n_jobs=2,
-                           verbosity=0, **kw)
+                           verbosity=0)
     elif name == "LightGBM":
         from lightgbm import LGBMRegressor
-        kw = {"monotone_constraints": [int(v) for v in monotone]} if monotone is not None else {}
         est = LGBMRegressor(n_estimators=p["n_estimators"], learning_rate=p["learning_rate"], num_leaves=p["num_leaves"],
-                            min_child_samples=p["min_child_samples"], random_state=seed, verbose=-1, **kw)
+                            min_child_samples=p["min_child_samples"], random_state=seed, verbose=-1)
     elif name == "SVM":
         from sklearn.svm import SVR
         est = SVR(C=p["C"], epsilon=p["epsilon"], gamma=p["gamma"], kernel=p["kernel"], degree=3)
@@ -5358,68 +5355,9 @@ def _robust_score(errs: Sequence[float]) -> Tuple[float, float, float]:
     return float(e.mean() + 0.5 * e.std()), float(e.mean()), float(e.std())
 
 
-TUNING_METHODS = ("random", "bayesian")
-
-
-def _encode(name: str, prm: Dict[str, Any]) -> np.ndarray:
-    """Hyperparameters -> point in [0, 1]^d (log scale for 'log', index for choices)."""
-    out = []
-    for h in MODEL_SPECS[name].params:
-        v = prm[h.key]
-        if h.kind == "choice":
-            out.append(h.options.index(v) / max(len(h.options) - 1, 1) if v in h.options else 0.0)
-        elif h.kind == "log":
-            out.append((math.log(v) - math.log(h.low)) / (math.log(h.high) - math.log(h.low)))
-        elif h.kind in ("int", "float"):
-            out.append((float(v) - h.low) / max(h.high - h.low, 1e-12))
-        else:
-            out.append(0.0)
-    return np.clip(np.array(out, float), 0, 1)
-
-
-def _search(name: str, n_iter: int, evaluate: Callable[[Dict[str, Any]], Tuple[float, float, float]],
-            rng: np.random.Generator, method: str = "random", progress: ProgressFn = None) -> List[Dict[str, Any]]:
-    """Hyperparameter search. The defaults are always candidate 0 (tuning can never be worse than the defaults on
-    validation). 'random': the remaining candidates are drawn from the search space. 'bayesian': after a few
-    random starts, a Gaussian-process surrogate of the validation score proposes each next candidate by expected
-    improvement among 400 random proposals (sequential model-based optimisation)."""
-    from scipy.stats import norm
-    from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
-
-    rows: List[Dict[str, Any]] = []
-    n_init = 4 if method == "bayesian" else n_iter
-    for j in range(max(n_iter, 1)):
-        _report(progress, j / max(n_iter, 1), f"{name}: candidate {j + 1}/{n_iter} ({method})")
-        if j == 0:
-            prm = default_params(name)
-        elif j < n_init or not MODEL_SPECS[name].params:
-            prm = sample_params(name, rng)
-        else:
-            done = [r for r in rows if np.isfinite(r["score"])]
-            Xo = np.array([_encode(name, r["params"]) for r in done])
-            yo = np.array([r["score"] for r in done])
-            try:
-                gp = GaussianProcessRegressor(ConstantKernel(1.0) * Matern(length_scale=0.3, nu=2.5) + WhiteKernel(1e-4),
-                                              normalize_y=True, random_state=0).fit(Xo, yo)
-                props = [sample_params(name, rng) for _ in range(400)]
-                Xp = np.array([_encode(name, q) for q in props])
-                mu, sd = gp.predict(Xp, return_std=True)
-                best = yo.min()
-                z = (best - mu) / np.maximum(sd, 1e-12)
-                ei = (best - mu) * norm.cdf(z) + sd * norm.pdf(z)
-                prm = props[int(np.argmax(ei))]
-            except Exception:
-                prm = sample_params(name, rng)
-        sc, mu_, sd_ = evaluate(prm)
-        rows.append({"candidate": j, "score": sc, "mean RMSE": mu_, "sd RMSE": sd_, "params": prm,
-                     "is_default": j == 0, "method": method})
-    return rows
-
-
 def tune_ml_forecast(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str, n_iter: int = 15, n_val: int = 3,
                      use_population: bool = True, train_cells: Optional[Sequence[str]] = None, seed: int = 0,
-                     progress: ProgressFn = None, method: str = "random") -> TuningResult:
+                     progress: ProgressFn = None) -> TuningResult:
     """Random-search hyperparameter tuning for the fade-rate forecaster, validated by *forecast
     backtests on other batteries*: every candidate forecasts the n_val cohort cells closest in
     operating conditions (never the target) from the same fraction of life, trained exactly as the
@@ -5435,7 +5373,10 @@ def tune_ml_forecast(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str, n
     if not val:
         raise ValueError("Tuning needs at least one other battery for validation.")
     rng = np.random.default_rng(seed)
-    def evaluate(prm):
+    cands = [default_params(model_name)] + [sample_params(model_name, rng) for _ in range(max(n_iter - 1, 0))]
+    rows = []
+    for j, prm in enumerate(cands):
+        _report(progress, j / len(cands), f"{model_name}: candidate {j + 1}/{len(cands)}")
         errs = []
         for c in val:
             cyc = int(meta.loc[c, "cycles"])
@@ -5449,23 +5390,22 @@ def tune_ml_forecast(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str, n
                     errs.append(float(np.sqrt(np.mean((np.interp(d["n"], n_g, p_g) - d["SOH"]) ** 2))))
             except Exception:
                 errs.append(float("inf"))
-        return _robust_score(errs)
-
-    rows = _search(model_name, n_iter, evaluate, rng, method, progress)
+        sc, mu, sd = _robust_score(errs)
+        rows.append({"candidate": j, "score": sc, "mean RMSE": mu, "sd RMSE": sd, "params": prm,
+                     "is_default": j == 0})
     _report(progress, 1.0, "tuning done")
     tab = pd.DataFrame(rows).sort_values("score").reset_index(drop=True)
     best = tab.iloc[0]
     return TuningResult(model_name, dict(best["params"]), default_params(model_name), float(best["score"]),
                         float(tab.loc[tab["is_default"], "score"].iloc[0]), tab,
-                        f"{method} search · forecast backtest on {', '.join(val)} from {100 * frac:.0f}% of life",
-                        time.time() - t0)
+                        f"forecast backtest on {', '.join(val)} from {100 * frac:.0f}% of life", time.time() - t0)
 
 
 def tune_soh_estimator(ct: pd.DataFrame, imp: Optional[pd.DataFrame], model_name: str,
                        features: Sequence[str] = DEFAULT_EST_FEATURES, split: str = "chronological",
                        test_frac: float = 0.3, train_cells: Optional[Sequence[str]] = None,
                        test_cells: Optional[Sequence[str]] = None, normalise: bool = True, n_iter: int = 20,
-                       seed: int = 0, progress: ProgressFn = None, method: str = "random") -> TuningResult:
+                       seed: int = 0, progress: ProgressFn = None) -> TuningResult:
     """Random-search tuning for the SOH estimator with grouped cross-validation *inside the training
     set only* (folds = batteries, so a model is always scored on batteries it has not seen; the
     test set of the chosen split is never touched). Falls back to 5-fold CV over cycles when the
@@ -5488,7 +5428,10 @@ def tune_soh_estimator(ct: pd.DataFrame, imp: Optional[pd.DataFrame], model_name
         folds = list(KFold(5, shuffle=True, random_state=seed).split(X))
         scheme = "5-fold CV over training cycles"
     rng = np.random.default_rng(seed)
-    def evaluate(prm):
+    cands = [default_params(model_name)] + [sample_params(model_name, rng) for _ in range(max(n_iter - 1, 0))]
+    rows = []
+    for j, prm in enumerate(cands):
+        _report(progress, j / len(cands), f"{model_name}: candidate {j + 1}/{len(cands)}")
         errs = []
         for a, b in folds:
             try:
@@ -5497,15 +5440,14 @@ def tune_soh_estimator(ct: pd.DataFrame, imp: Optional[pd.DataFrame], model_name
                 errs.append(float(np.sqrt(np.mean((mdl.predict(X[b]) - y[b]) ** 2))))
             except Exception:
                 errs.append(float("inf"))
-        return _robust_score(errs)
-
-    rows = _search(model_name, n_iter, evaluate, rng, method, progress)
+        sc, mu, sd = _robust_score(errs)
+        rows.append({"candidate": j, "score": sc, "mean RMSE": mu, "sd RMSE": sd, "params": prm,
+                     "is_default": j == 0})
     _report(progress, 1.0, "tuning done")
     tab = pd.DataFrame(rows).sort_values("score").reset_index(drop=True)
     best = tab.iloc[0]
     return TuningResult(model_name, dict(best["params"]), default_params(model_name), float(best["score"]),
-                        float(tab.loc[tab["is_default"], "score"].iloc[0]), tab, f"{method} search · {scheme}",
-                        time.time() - t0)
+                        float(tab.loc[tab["is_default"], "score"].iloc[0]), tab, scheme, time.time() - t0)
 
 
 # =============================================================================
@@ -6664,12 +6606,7 @@ V2_FEATURES = {
     "cum_ah": "Cumulative throughput (Ah)", "ah_cycle": "Ah per cycle",
     "arrhenius": "Arrhenius factor (cell temperature)", "c_rate": "C-rate", "v_cut": "Cut-off voltage",
     "dq_logvar": "ΔQ(V) variance (log10), cycle 2 → now",
-    "ica_h_rel": "ICA main-peak height now / new", "ica_v_shift": "ICA main-peak voltage shift (V)",
-    "ica_h_slope": "ICA peak-height trend", "cum_heat": "Cumulative heating (Σ temperature rise)",
-    "rest_h": "Rest before recent cycles (h)",
 }
-# expected sign of each feature's effect on the v2 target (deviation of the future drop; negative = faster fade)
-V2_MONOTONE = {"r_slope": -1, "dT_slope": -1, "tcv_slope": -1, "arrhenius": -1, "c_rate": -1, "ica_h_slope": 1}
 
 
 def clean_capacity(d: pd.DataFrame, after: int = 2) -> pd.DataFrame:
@@ -6696,31 +6633,6 @@ def clean_capacity(d: pd.DataFrame, after: int = 2) -> pd.DataFrame:
 def _slope(x: np.ndarray, y: np.ndarray) -> float:
     m = np.isfinite(x) & np.isfinite(y)
     return float(np.polyfit(x[m], y[m], 1)[0]) if m.sum() >= 3 and np.ptp(x[m]) > 0 else 0.0
-
-
-def _ica_peaks(rows: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    """Main incremental-capacity peak (height dQ/dV, Ah/V, and its voltage) per cycle from the stored Q(V) grid."""
-    if QV_COLS[0] not in rows:
-        return np.full(len(rows), np.nan), np.full(len(rows), np.nan)
-    Q = rows[QV_COLS].to_numpy(float)
-    dq = np.diff(Q, axis=1) / np.abs(np.diff(QV_GRID))[None, :]
-    vmid = 0.5 * (QV_GRID[1:] + QV_GRID[:-1])
-    dq = np.where(np.isfinite(dq), dq, -np.inf)
-    j = np.argmax(dq, axis=1)
-    h = dq[np.arange(len(rows)), j]
-    ok = np.isfinite(h)
-    return np.where(ok, h, np.nan), np.where(ok, vmid[j], np.nan)
-
-
-def _ica_state(h: pd.DataFrame) -> Dict[str, float]:
-    if QV_COLS[0] not in h or len(h) < 6:
-        return {"ica_h_rel": np.nan, "ica_v_shift": np.nan, "ica_h_slope": np.nan}
-    hh, vv = _ica_peaks(h)
-    first_h, first_v = np.nanmedian(hh[:3]), np.nanmedian(vv[:3])
-    last = slice(max(0, len(h) - 10), len(h))
-    rel = np.nanmedian(hh[last][-5:]) / first_h if np.isfinite(first_h) and first_h > 0 else np.nan
-    return {"ica_h_rel": float(rel), "ica_v_shift": float(np.nanmedian(vv[last][-5:]) - first_v),
-            "ica_h_slope": 100 * _slope(h["n"].to_numpy(float)[last], hh[last] / (first_h or 1.0))}
 
 
 def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> Dict[str, float]:
@@ -6759,44 +6671,34 @@ def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> 
             "ah_cycle": float(np.median(da[da > 0])) if (da > 0).any() else 2.0,
             "arrhenius": math.exp(30e3 / R_GAS * (1 / 298.15 - 1 / T)), "c_rate": I / max(c_bol, 1e-6),
             "v_cut": float(h["V_min_V"].median()) if "V_min_V" in h else 2.7,
-            "dq_logvar": delta_q_stats(h, 2, k)["dq_logvar"] if k >= 6 else np.nan,
-            **_ica_state(h), "cum_heat": float(h["dT_C"].clip(lower=0).sum()) if "dT_C" in h else np.nan,
-            "rest_h": float(last["rest_h"].median()) if "rest_h" in h and last["rest_h"].notna().any() else np.nan}
+            "dq_logvar": delta_q_stats(h, 2, k)["dq_logvar"] if k >= 6 else np.nan}
 
 
-def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], step: int = 3, k_min: int = 8,
-                augment: Sequence[float] = (), target: Optional[str] = None) -> pd.DataFrame:
-    """Training table: for every cell and origin k, the state features at k and, per horizon, how far the true
-    SOH drop departs from the cell's own recent trend. `augment` adds time-warped copies of every training
-    battery (ageing per cycle x 1/f: cycle index and throughput stretched by f); copies keep the original
-    Cell_ID so cross-validation never splits a battery from its copies."""
+def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], step: int = 3, k_min: int = 8
+                ) -> pd.DataFrame:
+    """Training table: for every cell and origin k, the state features at k and the SOH drop at each horizon."""
     rows = []
     for c in cells:
         d = ct[ct["Cell_ID"] == c]
         if d.empty:
             continue
-        dc0 = clean_capacity(d)
+        dc = clean_capacity(d)
+        lim = limits.get(c, int(dc["n"].max()))
+        n_arr, s_arr = dc["n"].to_numpy(float), dc["SOH_clean"].to_numpy(float)
         c_bol = float(d["C_bol_Ah"].iloc[0])
-        factors = [1.0] + ([f for f in augment if f != 1.0] if c != target else [])
-        for fct in factors:
-            dc = dc0.copy()
-            if fct != 1.0:
-                dc["n"] = dc["n"] * fct
-                dc["cum_Ah"] = dc["cum_Ah"].iloc[0] + (dc["cum_Ah"] - dc["cum_Ah"].iloc[0]) * fct
-            lim = limits.get(c, float(dc["n"].max()))
-            n_arr, s_arr = dc["n"].to_numpy(float), dc["SOH_clean"].to_numpy(float)
-            for k in range(k_min, int(min(lim, n_arr.max())) - min(V2_HORIZONS) + 1, step):
-                try:
-                    f = state_features(dc, k, c_bol)
-                except ValueError:
-                    continue
-                s_k = float(f["soh_now"])
-                rate = f["soh_slope"] / 100.0
-                row = {"Cell_ID": c, "k": k, "aug": fct, **f}
-                for hz in V2_HORIZONS:
-                    row[f"y{hz}"] = (float(np.interp(k + hz, n_arr, s_arr)) - s_k - rate * hz) \
-                        if k + hz <= min(lim, n_arr.max()) else np.nan
-                rows.append(row)
+        for k in range(k_min, int(min(lim, n_arr.max())) - min(V2_HORIZONS) + 1, step):
+            try:
+                f = state_features(dc, k, c_bol)
+            except ValueError:
+                continue
+            s_k = float(f["soh_now"])
+            rate = f["soh_slope"] / 100.0
+            row = {"Cell_ID": c, "k": k, **f}
+            for hz in V2_HORIZONS:
+                # label = deviation of the true drop from "the recent trend continues"
+                row[f"y{hz}"] = (float(np.interp(k + hz, n_arr, s_arr)) - s_k - rate * hz) \
+                    if k + hz <= min(lim, n_arr.max()) else np.nan
+            rows.append(row)
     return pd.DataFrame(rows)
 
 
@@ -6825,162 +6727,103 @@ class V2Forecast:
     fit_seconds: float
     correction_weight: Dict[int, float] = field(default_factory=dict)   # per horizon: 0 = pure trend, 1 = full ML
     cv_rmse: float = float("nan")      # held-out-battery error of the final (shrunk) predictor, SOH units
-    shap: Optional[pd.DataFrame] = None    # Shapley contribution of each feature to the 40-cycle forecast
-    selected: List[str] = field(default_factory=list)
-    options: Dict[str, Any] = field(default_factory=dict)
-
-
-def shapley_values(predict: Callable[[np.ndarray], np.ndarray], x0: np.ndarray, background: np.ndarray,
-                   n_perm: int = 150, seed: int = 0) -> Tuple[np.ndarray, float]:
-    """Monte-Carlo Shapley values of one prediction (model-agnostic, Strumbelj & Kononenko 2014): average
-    marginal contribution of each feature over random feature orders and background samples. Returns
-    (phi per feature, base value); phi sums to f(x0) - base."""
-    rng = np.random.default_rng(seed)
-    p = x0.shape[0]
-    pts = np.empty((n_perm * (p + 1), p))
-    orders = []
-    for m in range(n_perm):
-        z = background[rng.integers(len(background))].copy()
-        order = rng.permutation(p)
-        orders.append(order)
-        pts[m * (p + 1)] = z
-        for t, j in enumerate(order):
-            z[j] = x0[j]
-            pts[m * (p + 1) + t + 1] = z
-    f = predict(pts).reshape(n_perm, p + 1)
-    phi = np.zeros(p)
-    for m, order in enumerate(orders):
-        phi[order] += np.diff(f[m])
-    base = float(np.mean(f[:, 0]))
-    return phi / n_perm, base
 
 
 def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Random Forest",
                 eol_ah: float = DEFAULT_EOL_AH, train_cells: Optional[Sequence[str]] = None,
                 model_params: Optional[Dict[str, Any]] = None, level: float = 0.9, cv_folds: int = 3,
-                seed: int = 0, horizon_factor: float = 1.5, alpha: float = 0.2, monotone: bool = True,
-                select_features: bool = False, augment: bool = False, battery_conformal: bool = True,
-                explain: bool = True) -> V2Forecast:
+                seed: int = 0, horizon_factor: float = 1.5, alpha: float = 0.2) -> V2Forecast:
     """ML v2 forecaster. Forecast = the battery's own robust recent trend + a learned deviation: one regressor
     per horizon h predicts how far the true drop SOH(n0 + h) - SOH(n0) departs from "the last-15-cycle trend
-    continues", from the state features at n0. Grouped cross-validation by battery sets (a) how much of the
-    correction is trusted per horizon (0 = trend only), (b) the band, (c) feature importance.
-    Options: `monotone` (XGBoost / LightGBM: physically signed effects, V2_MONOTONE), `select_features`
-    (keep the features whose permutation importance on held-out batteries is positive, then refit),
-    `augment` (time-warped copies of the training batteries, x0.85 and x1.15), `battery_conformal`
-    (band also covers the typical error of a whole held-out battery, not only of single rows), `explain`
-    (Shapley values of the 40-cycle forecast)."""
+    continues", from the state features at n0. With few training batteries a regularised model falls back to
+    the trend instead of copying another battery. Direct per-horizon prediction (no chained one-step rates):
+    no error pile-up, no fixed points. Features use a causally cleaned history (no look-ahead). The
+    target battery contributes its own history up to n0. Bands come from grouped (by battery) cross-validation
+    residuals per horizon; the drop is forced to be non-increasing with the horizon. Permutation importance
+    (at the 40-cycle horizon, on the cross-validation folds) shows which measurements drive the forecast."""
     t0 = time.time()
     if model_params is None and MODEL_SPECS.get(model_name) and MODEL_SPECS[model_name].poly:
-        model_params = {"degree": 1}                    # many features: polynomial expansion would overfit
+        model_params = {"degree": 1}                    # 15 features: polynomial expansion would overfit
     model_params = validate_params(model_name, model_params)
     good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
     pool = v2_training_pool(ct, cell_id, train_cells)
-    tab = _v2_samples(ct, pool + [cell_id], {cell_id: n0}, augment=(0.85, 1.15) if augment else (), target=cell_id)
-    all_feats = [f for f in V2_FEATURES if f in tab.columns and tab[f].notna().mean() > 0.3]
+    tab = _v2_samples(ct, pool + [cell_id], {cell_id: n0})
+    feats = list(V2_FEATURES)
     if len(tab) < 20:
         raise ValueError("ML v2: not enough training origins (choose more training batteries).")
+    med = tab[feats].median()
+    X_all = tab[feats].fillna(med).to_numpy(float)
     dc_t = clean_capacity(ct[ct["Cell_ID"] == cell_id])
     f0 = state_features(dc_t[dc_t["n"] <= n0], n0, float(good["C_bol_Ah"].iloc[0]))
+    x0 = pd.Series(f0)[feats].fillna(med).to_numpy(float)[None, :]
     groups = tab["Cell_ID"].to_numpy()
+    uniq = np.unique(groups)
+    z = 1.6449 if abs(level - 0.9) < 1e-9 else 1.96
+    preds, his, los, imp_rows, shrink_w, cv_sq = [], [], [], None, [], []
     rng = np.random.default_rng(seed)
-    gu_all = np.unique(groups)
-    fold_ids = np.array_split(rng.permutation(gu_all), min(cv_folds, len(gu_all))) if len(gu_all) >= 2 else []
-    use_mono = monotone and MODEL_SPECS[model_name].requires in ("xgboost", "lightgbm")
-
-    def fit(X, y, feats_):
-        mono = [V2_MONOTONE.get(f, 0) for f in feats_] if use_mono else None
-        Xs, ys, _ = _gp_subsample(model_name, X, y, np.ones(len(y)), seed)
-        return _StandardisedTarget(make_model(model_name, seed, model_params, monotone=mono)).fit(Xs, ys)
-
-    def run(feats_, want_imp):
-        med = tab[feats_].median()
-        X_all = tab[feats_].fillna(med).to_numpy(float)
-        x0 = pd.Series(f0)[feats_].astype(float).fillna(med).to_numpy(float)[None, :]
-        out = {"preds": [], "los": [], "his": [], "w": [], "cv_sq": [], "imp": None, "models": {}, "X40": None}
-        for hz in V2_HORIZONS:
-            y = tab[f"y{hz}"].to_numpy(float)
-            m = np.isfinite(y)
-            if m.sum() < 15:
-                for k_ in ("preds", "los", "his", "w"):
-                    out[k_].append(np.nan)
+    for hz in V2_HORIZONS:
+        y = tab[f"y{hz}"].to_numpy(float)
+        m = np.isfinite(y)
+        if m.sum() < 15:
+            shrink_w.append(np.nan)
+            preds.append(np.nan)
+            his.append(np.nan)
+            los.append(np.nan)
+            continue
+        X, yy, g = X_all[m], y[m], groups[m]
+        mdl = _StandardisedTarget(make_model(model_name, seed, model_params)).fit(*_gp_subsample(model_name, X, yy, np.ones(len(yy)), seed)[:2])
+        p = float(mdl.predict(x0)[0])
+        # grouped cross-validation: residuals for the band and the skill-based shrinkage weight
+        res, Xv, yv, mv, cv_pred, cv_true = [], [], [], [], [], []
+        gu = np.unique(g)
+        folds = np.array_split(rng.permutation(gu), min(cv_folds, len(gu))) if len(gu) >= 2 else []
+        for fold in folds:
+            te_m = np.isin(g, fold)
+            if te_m.all() or not te_m.any():
                 continue
-            X, yy, g = X_all[m], y[m], groups[m]
-            mdl = fit(X, yy, feats_)
-            p = float(mdl.predict(x0)[0])
-            cp, cy, cg, Xv, yv, mv = [], [], [], [], [], []
-            for fold in fold_ids:
-                te_m = np.isin(g, fold)
-                if te_m.all() or not te_m.any():
-                    continue
-                mm = fit(X[~te_m], yy[~te_m], feats_)
-                cp.append(mm.predict(X[te_m])); cy.append(yy[te_m]); cg.append(g[te_m])
-                if hz == 40:
-                    Xv.append(X[te_m]); yv.append(yy[te_m]); mv.append(mm)
-            if cp:
-                cp_, cy_, cg_ = np.concatenate(cp), np.concatenate(cy), np.concatenate(cg)
-                e_m, e_0 = float(np.mean((cy_ - cp_) ** 2)), float(np.mean(cy_ ** 2))
-                w_h = float(np.clip(1 - e_m / e_0, 0.0, 1.0)) if e_0 > 0 else 0.0
-                r = cy_ - w_h * cp_
-                n_r = len(r)
-                q = float(np.quantile(np.abs(r), min(1.0, level * (1 + 1 / max(n_r, 1)))))
-                if battery_conformal:
-                    per_b = pd.Series(np.abs(r)).groupby(cg_).median().to_numpy()
-                    if len(per_b) >= 3:
-                        q = max(q, float(np.quantile(per_b, min(1.0, level * (1 + 1 / len(per_b))))))
-                out["cv_sq"].append(float(np.mean(r ** 2)))
-            else:
-                w_h, q = 0.0, 0.01
-            out["preds"].append(w_h * p); out["los"].append(w_h * p - q); out["his"].append(w_h * p + q)
-            out["w"].append(w_h)
-            out["models"][hz] = (mdl, w_h)
+            mm = _StandardisedTarget(make_model(model_name, seed, model_params)).fit(
+                *_gp_subsample(model_name, X[~te_m], yy[~te_m], np.ones((~te_m).sum()), seed)[:2])
+            pr = mm.predict(X[te_m])
+            cv_pred.append(pr)
+            cv_true.append(yy[te_m])
             if hz == 40:
-                out["X40"] = X
-                if want_imp and Xv:
-                    base = np.mean([np.sqrt(np.mean((mm.predict(xv) - yv_) ** 2)) for mm, xv, yv_ in zip(mv, Xv, yv)])
-                    vals = []
-                    for jj in range(len(feats_)):
-                        deltas = []
-                        for mm, xv, yv_ in zip(mv, Xv, yv):
-                            xp = xv.copy()
-                            xp[:, jj] = xp[rng.permutation(len(xp)), jj]
-                            deltas.append(np.sqrt(np.mean((mm.predict(xp) - yv_) ** 2)))
-                        vals.append(float(np.mean(deltas) - base))
-                    out["imp"] = pd.DataFrame({"key": feats_, "Indicator": [V2_FEATURES[f] for f in feats_],
-                                               "Importance (ΔRMSE)": vals, "std": 0.0}).sort_values(
-                        "Importance (ΔRMSE)", ascending=False)
-        out["x0"] = x0
-        return out
-
-    feats = all_feats
-    res = run(feats, True)
-    if select_features and res["imp"] is not None:
-        keep = res["imp"][res["imp"]["Importance (ΔRMSE)"] > 0]["key"].tolist()
-        if len(keep) < 4:
-            keep = res["imp"]["key"].head(4).tolist()
-        feats = [f for f in all_feats if f in keep]
-        imp_full = res["imp"]
-        res = run(feats, False)
-        res["imp"] = imp_full
-    shap_df = None
-    if explain and 40 in res["models"] and res["X40"] is not None:
-        mdl40, w40 = res["models"][40]
-        bg = res["X40"][rng.choice(len(res["X40"]), size=min(60, len(res["X40"])), replace=False)]
-        phi, base = shapley_values(lambda Z: w40 * mdl40.predict(Z), res["x0"][0], bg, seed=seed)
-        shap_df = pd.DataFrame({"key": feats, "Feature": [V2_FEATURES[f] for f in feats], "Value": res["x0"][0],
-                                "Shapley (SOH at +40 cycles)": phi}).sort_values("Shapley (SOH at +40 cycles)",
-                                                                                  key=np.abs, ascending=False)
-        shap_df.attrs["base"] = base
+                Xv.append(X[te_m]); yv.append(yy[te_m]); mv.append(mm)
+        if cv_pred:
+            cp, cy = np.concatenate(cv_pred), np.concatenate(cv_true)
+            mse_model, mse_zero = float(np.mean((cy - cp) ** 2)), float(np.mean(cy ** 2))
+            w_h = float(np.clip(1 - mse_model / mse_zero, 0.0, 1.0)) if mse_zero > 0 else 0.0
+            r = cy - w_h * cp                         # residuals of the shrunk predictor
+            cv_sq.append(float(np.mean(r ** 2)))
+        else:
+            w_h, r = 0.0, np.array([0.01])
+        shrink_w.append(w_h)
+        q = float(np.quantile(np.abs(r), level))
+        p = w_h * p                                   # correction used only as far as it beat 'no correction'
+        preds.append(p)
+        los.append(p - q)
+        his.append(p + q)
+        if hz == 40 and Xv:
+            base = np.mean([np.sqrt(np.mean((mm.predict(xv) - yv_) ** 2)) for mm, xv, yv_ in zip(mv, Xv, yv)])
+            vals = []
+            for j, f in enumerate(feats):
+                deltas = []
+                for mm, xv, yv_ in zip(mv, Xv, yv):
+                    xp = xv.copy()
+                    xp[:, j] = xp[rng.permutation(len(xp)), j]
+                    deltas.append(np.sqrt(np.mean((mm.predict(xp) - yv_) ** 2)))
+                vals.append(float(np.mean(deltas) - base))
+            imp_rows = pd.DataFrame({"key": feats, "Indicator": [V2_FEATURES[f] for f in feats],
+                                     "Importance (ΔRMSE)": vals, "std": 0.0}).sort_values("Importance (ΔRMSE)", ascending=False)
     hz = np.array(V2_HORIZONS, float)
     rate0 = f0["soh_slope"] / 100.0
-    P_ = np.array(res["preds"], float) + rate0 * hz
-    L0 = np.array(res["los"], float) + rate0 * hz
-    H0 = np.array(res["his"], float) + rate0 * hz
+    P_ = np.array(preds, float) + rate0 * hz            # recent trend + learned deviation (acceleration, knees)
+    los = list(np.array(los, float) + rate0 * hz)
+    his = list(np.array(his, float) + rate0 * hz)
     ok = np.isfinite(P_)
     if ok.sum() < 2:
         raise ValueError("ML v2: too few horizons could be trained.")
-    hz, P_, L_, H_ = hz[ok], P_[ok], L0[ok], H0[ok]
-    P_ = np.minimum.accumulate(np.minimum(P_, 0.0))
+    hz, P_, L_, H_ = hz[ok], P_[ok], np.array(los, float)[ok], np.array(his, float)[ok]
+    P_ = np.minimum.accumulate(np.minimum(P_, 0.0))                 # drops only grow with the horizon
     L_ = np.minimum.accumulate(np.minimum(L_, P_))
     H_ = np.minimum(np.maximum(H_, P_), 0.0)
     s0 = float(f0["soh_now"])
@@ -6990,10 +6833,10 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
 
     def curve(vals):
         xs, ys = np.concatenate([[0.0], hz]), np.concatenate([[0.0], vals])
-        out_ = np.interp(h_f, xs, ys)
+        out = np.interp(h_f, xs, ys)
         beyond = h_f > xs[-1]
-        out_[beyond] = ys[-1] + min(tail_rate, 0.0) * (h_f[beyond] - xs[-1])
-        return out_
+        out[beyond] = ys[-1] + min(tail_rate, 0.0) * (h_f[beyond] - xs[-1])
+        return out
 
     past = np.interp(n_grid, good["n"], good["SOH"])
     med_c = np.where(n_grid > n0, np.clip(s0 + curve(P_), 0.0, 1.05), past)
@@ -7001,12 +6844,9 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
     hi_c = np.where(n_grid > n0, np.clip(s0 + curve(H_), 0.0, 1.05), past)
     soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
     metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), n_grid, med_c, n0, soh_eol, lo_c, hi_c, alpha)
-    cv = float(np.sqrt(np.mean(res["cv_sq"]))) if res["cv_sq"] else float("nan")
     return V2Forecast(f"ML v2 · {model_name}", cell_id, n0, n_grid, med_c, lo_c, hi_c, metrics,
-                      res["imp"] if res["imp"] is not None else pd.DataFrame(), f0, pool, time.time() - t0,
-                      dict(zip(V2_HORIZONS, res["w"])), cv, shap_df, feats,
-                      {"monotone": bool(use_mono), "select_features": select_features, "augment": augment,
-                       "battery_conformal": battery_conformal})
+                      imp_rows if imp_rows is not None else pd.DataFrame(), f0, pool, time.time() - t0,
+                      dict(zip(V2_HORIZONS, shrink_w)), float(np.sqrt(np.mean(cv_sq))) if cv_sq else float("nan"))
 
 
 # =============================================================================
