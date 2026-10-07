@@ -1030,6 +1030,40 @@ def test_trajectory_models_per_cycle_no_leakage_and_assessment():
         assert abs(f.soh[i] - f.soh[i - 1]) < 0.01
 
 
+def test_round_fixes_pool_shape_slope_gp_and_verdict():
+    m, imp, _ = te.make_synthetic_master(n_cells=8, n_cycles=110, ambients=(24, 24, 24, 24, 24, 43, 43, 4),
+                                         currents=(2, 2, 2, 2, 2, 4, 4, 1), seed=3, noise_v=0.01)
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    g = te.condition_groups(ct)["Group"]
+    pool = te.v2_training_pool(ct, "S001")
+    assert pool and all(g[c] == g["S001"] for c in pool)                          # same group by default
+    assert len(te.v2_training_pool(ct, "S006")) > 1                               # small group: falls back to all
+    A, F = te.fleet_shape(ct, pool)
+    assert np.all(np.diff(F) <= 1e-12) and (F[-1] - F[-20]) < -1e-4               # the extension keeps fading
+    # a recovery jump just before the origin barely changes the measured fade speed
+    m2 = m.copy()
+    cis = sorted(m2[(m2.Cell_ID == "S002") & (m2.Cycle_Type == "discharge")].Cycle_Index.unique())
+    for j, a in enumerate((0.025, 0.012)):
+        sel = (m2.Cell_ID == "S002") & (m2.Cycle_Index == cis[37 + j]) & (m2.Cycle_Type == "discharge")
+        m2.loc[sel, "Capacity_Ah"] *= 1 + a
+    ct2 = te.build_cycle_table(te.ParquetStore.from_dataframe(m2))
+    s_ref = te.state_features(te.clean_capacity(ct[(ct.Cell_ID == "S002") & (ct.n <= 42)]), 42, 2.0)["soh_slope_ah"]
+    s_jump = te.state_features(te.clean_capacity(ct2[(ct2.Cell_ID == "S002") & (ct2.n <= 42)]), 42, 2.0)["soh_slope_ah"]
+    assert abs(s_jump - s_ref) < 0.5 * abs(s_ref)
+    gp = te.make_model("Gaussian Process", 0)
+    X = np.random.default_rng(0).normal(size=(80, 4))
+    gp.fit(X, X[:, 0] * 2 + 0.1 * X[:, 1])
+    assert np.corrcoef(gp.predict(X), X[:, 0] * 2)[0, 1] > 0.95
+    rows = []
+    for c, base, mdl in (("a", 1.0, 3.0), ("b", 1.2, 2.5), ("c", 0.9, 2.0), ("d", 1.1, 3.1), ("e", 1.0, 1.9)):
+        rows += [{"Cell_ID": c, "origin": 0.3, "model": "Fleet shape", "key": "shape", "family": "Baselines",
+                  "status": "ok", "RMSE (SOH pts)": base, "EOL error (cycles)": np.nan, "coverage": 0.9},
+                 {"Cell_ID": c, "origin": 0.3, "model": "Bad", "key": "x", "family": "Machine learning (forecast)",
+                  "status": "ok", "RMSE (SOH pts)": mdl, "EOL error (cycles)": np.nan, "coverage": 0.9}]
+    sb = te.protocol_scoreboard(pd.DataFrame(rows))
+    assert sb.loc["Bad", "vs best baseline"].startswith("worse on all 5 batteries")
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

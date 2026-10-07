@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.5.4"
+REQUIRED_ENGINE = "5.5.5"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -4910,8 +4910,10 @@ def trajectory_section() -> None:
                    "(forecast mode: the SOH change since the origin). EIS resistances are interpolated between tests.")
     if sc["mode"] == "within":
         train = None
-        st.caption("Within scheme: trained on all comparable batteries (conditions are inputs, so batteries from other "
-                   "groups teach the condition effects) plus this battery's cycles up to the origin.")
+        pool = te.v2_training_pool(ct, cell)
+        st.caption(f"Within scheme: trained on {len(pool)} batteries ({', '.join(pool[:6])}{'…' if len(pool) > 6 else ''}): "
+                   "the same condition group when it has at least 3 other batteries, otherwise all comparable batteries, "
+                   "plus this battery's own cycles up to the origin.")
     else:
         train = list(sc["train"])
     if st.button(f"Train trajectory models ({len(mdls) * len(sc['targets'])} runs)", key="tr_go", type="primary",

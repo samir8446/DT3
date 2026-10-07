@@ -1,9 +1,26 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.5.4)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.5.5)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Fixes after the first real assessment (v5.5.5)
+
+- Training pool (`v2_training_pool`): the battery's own condition group when it has >= 3 other batteries, otherwise all
+  comparable batteries (fleet shape, Level 2 and the within scheme).
+- Fade speed at the origin: Theil-Sen on the actual SOH (3-cycle median) of the transient-free cycles, instead of the
+  running-minimum curve that stayed flat after a recovery jump; the target's prepared history uses the same values.
+- Fleet shape: beyond the range covered by >= 2 batteries it continues with the median of the batteries' own
+  late-life fade rates (it used to level off); its band is interpolated between horizon bins (no steps).
+- Gaussian Process: one length scale per input plus a linear term (it collapsed to the mean on real data), at most
+  400 training rows, bounded optimiser.
+- Measured mode: trailing 5-cycle median of the predictions (causal).
+- Scoreboard verdict: "better / worse on all N batteries", noting when N is too small for any test to reach 5 %
+  (two-sided Wilcoxon minimum p = 2 / 2^N, i.e. 0.0625 with 5 batteries).
+Synthetic Reference-like group (5 batteries, recovery jump before the 30 % origin), RMSE / bias / |EOL error|:
+fleet shape 2.47 / +0.16 / 4.8 -> 2.57 / -0.72 / 3.8; Gaussian Process 5.97 -> 4.71; Random Forest, Bayesian
+Ridge, SVM unchanged within 0.3; linear trend stays ~9 points optimistic (a straight line cannot anticipate a knee).
 
 ## Two independent levels (v5.5.4)
 

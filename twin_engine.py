@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.5.4"
+ENGINE_VERSION = "5.5.5"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -954,9 +954,10 @@ MODEL_SPECS: Dict[str, ModelSpec] = {m.name: m for m in (
               (_P("C", "C (regularisation inverse)", "log", 10.0, 0.01, 1000.0), _P("epsilon", "Epsilon (tolerated error)", "log", 0.01, 1e-4, 0.5),
                _P("gamma", "Kernel width γ", "log", 0.1, 1e-3, 10.0),
                _P("kernel", "Kernel", "choice", "rbf", options=("rbf", "poly", "linear"))), scaled=True, level=2),
-    ModelSpec("Gaussian Process", "Kernel / Bayesian", "Smooth non-parametric fit with native uncertainty (O(n³)).",
+    ModelSpec("Gaussian Process", "Kernel / Bayesian", "Smooth fit with native uncertainty: one length scale per input "
+              "(scaled inputs) plus a linear trend term, so it follows trends instead of reverting to the mean (O(n³)).",
               (_P("length_scale", "Initial RBF length scale", "log", 1.0, 0.05, 20.0), _P("noise", "Initial noise level", "log", 0.1, 1e-4, 1.0),
-               _P("restarts", "Optimiser restarts", "int", 1, 0, 5))),
+               _P("restarts", "Optimiser restarts", "int", 1, 0, 5)), scaled=True),
     ModelSpec("Bayesian Ridge", "Linear (polynomial)", "Polynomial features, evidence-maximised shrinkage.",
               (_P("degree", "Polynomial degree", "int", 3, 1, 5),), poly=True, level=1),
 )}
@@ -1015,6 +1016,44 @@ def validate_params(name: str, params: Optional[Dict[str, Any]]) -> Dict[str, An
     return out
 
 
+from sklearn.base import BaseEstimator as _SkBase, RegressorMixin as _SkRegressor
+
+ARD_GP_MAX_ROWS = 400        # per-input length scales: keep the optimisation affordable
+
+
+class _ARDGaussianProcess(_SkRegressor, _SkBase):
+    """Gaussian process with one RBF length scale per input (automatic relevance determination) plus a linear
+    (dot-product) term: the isotropic kernel on mixed-scale inputs collapsed to the mean; the linear term lets
+    the GP extrapolate trends beyond the training range. Expects scaled inputs (the ModelSpec scales them)."""
+
+    def __init__(self, length_scale: float = 1.0, noise: float = 0.1, restarts: int = 1, seed: int = 0):
+        self.length_scale, self.noise, self.restarts, self.seed = length_scale, noise, restarts, seed
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "_ARDGaussianProcess":
+        from sklearn.gaussian_process import GaussianProcessRegressor
+        from sklearn.gaussian_process.kernels import ConstantKernel, DotProduct, RBF, WhiteKernel
+        d = X.shape[1]
+        kern = (ConstantKernel(1.0, (1e-2, 1e2)) * RBF(length_scale=np.full(d, self.length_scale),
+                                                        length_scale_bounds=(1e-2, 1e3))
+                + ConstantKernel(0.1, (1e-4, 1e1)) * DotProduct(sigma_0=1.0, sigma_0_bounds=(1e-3, 1e2))
+                + WhiteKernel(self.noise, (1e-6, 1.0)))
+        if len(y) > ARD_GP_MAX_ROWS:                     # O(n^3) per optimiser step x one length scale per input
+            idx = np.random.default_rng(self.seed).choice(len(y), ARD_GP_MAX_ROWS, replace=False)
+            X, y = X[idx], y[idx]
+
+        def _opt(obj_func, initial_theta, bounds):
+            from scipy.optimize import minimize
+            r = minimize(obj_func, initial_theta, method="L-BFGS-B", jac=True, bounds=bounds, options={"maxiter": 60})
+            return r.x, r.fun
+
+        self.gp_ = GaussianProcessRegressor(kernel=kern, n_restarts_optimizer=0, random_state=self.seed,
+                                            normalize_y=True, optimizer=_opt).fit(X, y)
+        return self
+
+    def predict(self, X: np.ndarray, return_std: bool = False) -> Any:
+        return self.gp_.predict(X, return_std=return_std)
+
+
 def make_model(name: str, seed: int = 0, params: Optional[Dict[str, Any]] = None):
     """Factory for the regressors in MODEL_SPECS, with validated hyperparameters. Every model
     is wrapped with median imputation (health indicators can have gaps) and standardisation
@@ -1051,11 +1090,7 @@ def make_model(name: str, seed: int = 0, params: Optional[Dict[str, Any]] = None
         from sklearn.svm import SVR
         est = SVR(C=p["C"], epsilon=p["epsilon"], gamma=p["gamma"], kernel=p["kernel"], degree=3)
     elif name == "Gaussian Process":
-        from sklearn.gaussian_process import GaussianProcessRegressor
-        from sklearn.gaussian_process.kernels import ConstantKernel, RBF, WhiteKernel
-        kern = ConstantKernel(1.0, (1e-2, 1e2)) * RBF(length_scale=p["length_scale"], length_scale_bounds=(1e-2, 1e2)) \
-            + WhiteKernel(p["noise"], (1e-6, 1.0))
-        est = GaussianProcessRegressor(kernel=kern, n_restarts_optimizer=p["restarts"], random_state=seed)
+        est = _ARDGaussianProcess(p["length_scale"], p["noise"], p["restarts"], seed)
     elif name == "Bayesian Ridge":
         est = LM.BayesianRidge()
     steps = [SimpleImputer(strategy="median")]
@@ -6643,13 +6678,16 @@ def _slope_ah(h: pd.DataFrame, window: int = 20) -> float:
     t = h.tail(window)
     if len(t) < 5 or "cum_Ah" not in t or np.ptp(t["cum_Ah"]) <= 0:
         return 0.0
-    col = "SOH_causal" if "SOH_causal" in t else "SOH"
-    return 100 * min(float(theilslopes(t[col], t["cum_Ah"])[0]), 0.0)
+    # the rows of a cleaned history exclude recovery jumps and their transients; the running-minimum curve would be
+    # held flat after a jump and underestimate the fade, so the slope uses the actual SOH (3-cycle median)
+    col = "SOH" if "SOH" in t else "SOH_causal"
+    y = t[col].rolling(3, center=True, min_periods=1).median()
+    return 100 * min(float(theilslopes(y, t["cum_Ah"])[0]), 0.0)
 
 
 def fleet_shape(ct: pd.DataFrame, cells: Sequence[str], n_grid: int = 300) -> Optional[Tuple[np.ndarray, np.ndarray]]:
-    """Typical fade shape of comparable batteries: median cleaned SOH against Ah throughput (where at least two
-    batteries have data), extended beyond the longest history with the final slope, non-increasing."""
+    """Typical fade shape of the training batteries: median cleaned SOH against Ah throughput (where at least two
+    batteries have data), extended beyond that range with the median of the batteries' own late-life fade rates."""
     curves = []
     for c in cells:
         d = ct[ct["Cell_ID"] == c]
@@ -6673,6 +6711,18 @@ def fleet_shape(ct: pd.DataFrame, cells: Sequence[str], n_grid: int = 300) -> Op
     if ok.sum() < 5:
         return None
     grid, F = grid[ok], np.minimum.accumulate(F[ok])
+    # beyond the median's range, continue with the median of each battery's own late-life fade rate (last quarter of
+    # its throughput); the median curve's last points flatten when few batteries remain, which made forecasts level off
+    tails = []
+    for A, S in curves:
+        late = A >= 0.75 * A.max()
+        if late.sum() >= 4 and np.ptp(A[late]) > 0:
+            tails.append(min(float(np.polyfit(A[late], S[late], 1)[0]), 0.0))
+    if tails:
+        slope = float(np.median(tails))
+        ext = np.linspace(grid[-1], grid[-1] + max(0.5 * a_max, 1.0), 61)[1:]
+        grid = np.concatenate([grid, ext])
+        F = np.concatenate([F, F[-1] + slope * (ext - ext[0] + (ext[1] - ext[0]))])
     return grid, F
 
 
@@ -6731,7 +6781,8 @@ def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> 
     da = np.diff(h["cum_Ah"].to_numpy(float))
     from scipy.stats import theilslopes
     tl = h.tail(15)
-    trend_rate = float(theilslopes(tl["SOH_causal"], tl["n"])[0]) if len(tl) >= 5 else 0.0
+    trend_rate = (float(theilslopes(tl["SOH"].rolling(3, center=True, min_periods=1).median(), tl["n"])[0])
+                  if len(tl) >= 5 else 0.0)                     # actual SOH on transient-free cycles (see _slope_ah)
     return {"soh_now": float(last["SOH_causal"].iloc[-1]), "soh_slope": 100 * min(trend_rate, 0.0),
             "r_rel": rel("R_dc_ohm"), "r_slope": trend("R_dc_ohm"), "dT_now": float(last["dT_C"].tail(5).median()) if "dT_C" in h else np.nan,
             "dT_slope": trend("dT_C", norm=False), "tcv_rel": rel("t_cv_s"), "tcv_slope": trend("t_cv_s"),
@@ -6775,13 +6826,20 @@ def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], 
     return pd.DataFrame(rows)
 
 
-def v2_training_pool(ct: pd.DataFrame, target: str, train_cells: Optional[Sequence[str]] = None) -> List[str]:
-    """Comparable batteries: the explicit list when given, otherwise every cell except the target and the
-    mixed-condition, corrupted-logging and pulsed-load groups (their capacity behaves differently)."""
+def v2_training_pool(ct: pd.DataFrame, target: str, train_cells: Optional[Sequence[str]] = None,
+                     same_group: bool = True, min_same: int = 3) -> List[str]:
+    """Training batteries: the explicit list when given; otherwise the target's own condition group when it has at
+    least `min_same` other batteries, else every comparable battery (all but the mixed-condition, corrupted-logging
+    and pulsed-load groups, whose capacity behaves differently)."""
     if train_cells is not None:
         return [c for c in train_cells if c != target]
     g = condition_groups(ct)
-    return [c for c in g.index if c != target and g.loc[c, "Group"] not in V2_EXCLUDED_GROUPS]
+    comparable = [c for c in g.index if c != target and g.loc[c, "Group"] not in V2_EXCLUDED_GROUPS]
+    if same_group and target in g.index:
+        same = [c for c in comparable if g.loc[c, "Group"] == g.loc[target, "Group"]]
+        if len(same) >= min_same:          # enough batteries under the same conditions: use only those
+            return same
+    return comparable
 
 
 @dataclass
@@ -6957,9 +7015,14 @@ def prepare_v2_ct(ct: pd.DataFrame, target: str, n0: int, train_cells: Optional[
         cl = clean_capacity(part, after)
         dropped = part.index[~part.index.isin(cl.index) & ~part["outlier"]]
         out.loc[dropped, "outlier"] = True
-        col = "SOH_causal" if cid == target else "SOH_clean"
-        out.loc[cl.index, "SOH"] = cl[col].to_numpy()
-        out.loc[cl.index, "Capacity_Ah"] = cl[col].to_numpy() * float(d["C_bol_Ah"].iloc[0])
+        if cid == target:
+            # the target's past: actual SOH on the transient-free cycles (3-cycle median, centred only within the past);
+            # the running minimum would hold the curve flat after a recovery jump and flatten every trend fitted to it
+            vals = cl["SOH"].rolling(3, min_periods=1).median().to_numpy()
+        else:
+            vals = cl["SOH_clean"].to_numpy()
+        out.loc[cl.index, "SOH"] = vals
+        out.loc[cl.index, "Capacity_Ah"] = vals * float(d["C_bol_Ah"].iloc[0])
     return out
 
 
@@ -7243,7 +7306,8 @@ def fleet_shape_forecast(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float 
         q = [float(np.quantile(E[(E[:, 0] > a) & (E[:, 0] <= b), 1], level)) if ((E[:, 0] > a) & (E[:, 0] <= b)).sum() >= 5
              else np.nan for a, b in zip(bins[:-1], bins[1:])]
         q = pd.Series(q).ffill().bfill().fillna(0.03).to_numpy()
-        half = q[np.clip(np.searchsorted(bins, h, side="left") - 1, 0, len(q) - 1)]
+        centres = np.array([10.0, 30.0, 60.0, 120.0])                 # smooth band: interpolate between bin centres
+        half = np.interp(h, centres, np.maximum.accumulate(q))
     else:
         half = 0.01 + 0.0005 * h
     past = np.interp(n_grid, good["n"], good["SOH"])
@@ -7378,11 +7442,17 @@ def protocol_scoreboard(res: pd.DataFrame, baseline_label: Optional[str] = None)
             verdict, p = ("reference" if m == best_base else "—"), np.nan
         else:
             p = float(wilcoxon(paired, b).pvalue) if len(diff) >= 5 and np.any(diff != 0) else np.nan
-            wins = int(np.sum(diff < 0))
-            if np.isfinite(p) and p < 0.05:
+            wins, n_b = int(np.sum(diff < 0)), len(diff)
+            min_p = 2.0 / 2 ** n_b                  # smallest two-sided exact p-value possible with n_b batteries
+            limit = "" if min_p < 0.05 else f"; the strongest evidence possible with {n_b} batteries"
+            if wins == n_b:
+                verdict = f"better on all {n_b} batteries" + (" (significant)" if np.isfinite(p) and p < 0.05 else limit)
+            elif wins == 0 and np.all(diff > 0):
+                verdict = f"worse on all {n_b} batteries" + (" (significant)" if np.isfinite(p) and p < 0.05 else limit)
+            elif np.isfinite(p) and p < 0.05:
                 verdict = "better than baseline" if np.median(diff) < 0 else "worse than baseline"
             else:
-                verdict = f"no clear difference ({wins}/{len(diff)} batteries better)"
+                verdict = f"no clear difference ({wins}/{n_b} batteries better)"
         fails = int(((res["model"] == m) & (res["status"] != "ok")).sum())
         rows.append({"Model": m, "Family": fam, "Batteries": n, "RMSE (SOH pts)": float(x.mean()), "95% CI ±": half,
                      "EOL |error| (cycles)": float(np.nanmean(d["eol"])) if d["eol"].notna().any() else np.nan,
@@ -7636,6 +7706,8 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         if rows.empty:
             raise ValueError("trajectory model: no test cycles after the origin")
         pred = model.predict(rows[feats].fillna(med).to_numpy(float))
+        # each cycle's measurements are noisy: a trailing 5-cycle median (current and past cycles only, causal)
+        pred = pd.Series(pred).rolling(5, min_periods=1).median().to_numpy()
         half = np.full(len(pred), float(np.quantile(np.abs(R), level)))
         n_pred = rows["n"].to_numpy()
         inputs0 = {TRAJ_MEASURED_FEATURES[f]: float(rows[f].iloc[0]) for f in feats if f != "n" and np.isfinite(rows[f].iloc[0])}
