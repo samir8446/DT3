@@ -1000,6 +1000,31 @@ def test_smooth_multi_horizon_forecast_fleet_shape_and_assessment():
     assert sb.loc["Persistence (SOH stays)", "RMSE (SOH pts)"] > sb.loc["Fleet shape", "RMSE (SOH pts)"]
 
 
+def test_trajectory_models_per_cycle_no_leakage_and_assessment():
+    m, imp, _ = te.make_synthetic_master(n_cells=6, n_cycles=90, ambients=(24, 34, 43, 24, 34, 24),
+                                         currents=(2, 2, 2, 4, 1, 2), seed=0, noise_v=0.01)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    n0 = 30
+    for mode in te.TRAJ_MODES:
+        f = te.train_trajectory_model(ct, imp, "S001", n0, "Bayesian Ridge", mode, eol_ah=1.6)
+        g = ct[(ct["Cell_ID"] == "S001") & ~ct["outlier"]]
+        assert f.n_grid.max() == g["n"].max()                          # stops at the last measured cycle
+        assert np.isfinite(f.soh[f.n_grid > n0]).all() and f.metrics.rmse < 0.05
+        assert len(f.importance) == len(f.features) and "S001" not in f.train_cells
+    # no leakage: changing the target's cycles after the origin cannot change a forecast-mode prediction
+    ct2 = ct.copy()
+    later = (ct2["Cell_ID"] == "S001") & (ct2["n"] > n0)
+    ct2.loc[later, ["SOH", "Capacity_Ah", "R_dc_ohm"]] *= 0.9
+    a = te.train_trajectory_model(ct, imp, "S001", n0, "Bayesian Ridge", "forecast", eol_ah=1.6)
+    b = te.train_trajectory_model(ct2, imp, "S001", n0, "Bayesian Ridge", "forecast", eol_ah=1.6)
+    fut = a.n_grid > n0
+    assert np.allclose(a.soh[fut], b.soh[fut])
+    res = te.run_protocol(store, ct, imp, ["S001", "S004", "S006"], ["trend", "traj:Bayesian Ridge"], (0.4,), 1.6)
+    assert (res["status"] == "ok").all()
+    assert "Trajectory · Bayesian Ridge" in te.protocol_scoreboard(res).index
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

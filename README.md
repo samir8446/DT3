@@ -1,9 +1,23 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.5.2)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.5.3)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Trajectory models (v5.5.3)
+
+`train_trajectory_model`: SOH of every cycle learned from every cycle of the training batteries, predicted cycle by
+cycle for the selected battery (Models › "Trajectory models"; also in the accuracy assessment as traj: / trajm:).
+Forecast mode (a real forecast): cycle number, cycles since the origin, estimated throughput, ambient temperature,
+discharge current, cut-off, and the battery's state at the origin (SOH, SOH trend per Ah, resistance and its trend,
+CV-charge time, dQ(V) variance); target = SOH change since the origin; training rows from origins at 10-60 % of
+each training battery's life. Measured mode (estimation): cycle number, conditions and each cycle's own
+measurements (load-step resistance, temperature rise, mean temperature, CC/CV charge times, mean voltage,
+efficiency, EIS Re/Rct). Bands from cross-validation by battery; permutation importance; stops at the last
+measured cycle. Synthetic (10 batteries, 4-43 °C, 1-4 A, forecast from 30 %): results vary by battery (GP 0.0059
+vs fleet shape 0.0147 on one, 0.0288 vs 0.0105 on another), so judge them with the accuracy assessment;
+measured mode 0.0045-0.0073 with SVM / Bayesian Ridge.
 
 ## Forecast shape and accuracy assessment (v5.5.2)
 

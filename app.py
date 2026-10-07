@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.5.2"
+REQUIRED_ENGINE = "5.5.3"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -59,7 +59,7 @@ st.set_page_config(
 )
 
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
-                   "train_ml_v2", "baseline_forecast_v2")
+                   "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -568,6 +568,8 @@ EXPLAIN: Dict[str, str] = {
     "uf_fig": "Tracking accuracy when the twin is updated every m cycles: it shows how rarely the twin can be updated without losing accuracy (Mission 2).",
     # models
     "acc_board": "Every model with the same held-out batteries and origins. Bars: mean error ± 95% CI; dashed line: the best baseline. A model is only worth using if it beats that line clearly.",
+    "tr_fig": "Cycle-by-cycle predictions of models trained on every cycle of the training batteries. In forecast mode they only know the battery's state at the training | test line plus the operating conditions; in measured mode they also see each test cycle's measurements.",
+    "tr_imp": "What the best trajectory model relies on: how much its error grows on held-out batteries when one input is shuffled.",
     "lad_base": "Level 1 references: 'nothing changes' (persistence) and 'the recent straight line continues' (linear trend). A model is only useful if it beats these.",
     "lad_deep": "Level 4 deep sequence models (GRU, Transformer) read a window of past SOH values and predict the next cycle, repeatedly, to build the forecast.",
     "lad_hybrid": "Level 5 hybrid models combine physics equations with learning: the mechanistic PINN obeys the degradation kinetics; hierarchical Bayes combines a physics law with fleet knowledge.",
@@ -4799,7 +4801,8 @@ def ladder_leaderboard() -> None:
 ACTIVE_LEVELS = (1, 2, 3)        # advanced levels (deep learning, hybrid, first principles) are added back step by step
 
 
-FAMILY_COLORS = {"Baselines": "#8C8C8C", "Machine learning": "#0072B2"}
+FAMILY_COLORS = {"Baselines": "#8C8C8C", "Machine learning": "#0072B2", "Trajectory (forecast)": "#AA4499",
+                 "Trajectory (measured)": "#56B4E9"}
 
 
 def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
@@ -4839,7 +4842,8 @@ def assessment_section() -> None:
     origins = c2.multiselect("Forecast origins (share of each battery's life)", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
                              default=[0.3, 0.5], key="acc_origins", format_func=lambda v: f"{100 * v:.0f}%")
     av = te.available_models()
-    options = ["persistence", "trend", "shape"] + [f"ml:{m}" for m in av]
+    options = (["persistence", "trend", "shape"] + [f"ml:{m}" for m in av] + [f"traj:{m}" for m in av]
+               + [f"trajm:{m}" for m in av])
     keys = st.multiselect("Models (levels 1–3)", options,
                           default=["persistence", "trend", "shape"] + [f"ml:{m}" for m in ("Bayesian Ridge", "Random Forest")
                                                                        if m in av],
@@ -4888,6 +4892,77 @@ def assessment_section() -> None:
              key="acc_csv")
 
 
+def trajectory_section() -> None:
+    section("Levels 2–3 · Trajectory models: SOH of every cycle, learned from all training batteries")
+    st.markdown("These models learn, from **every cycle of every training battery**, how SOH depends on the cycle number, "
+                "the operating conditions and the measured parameters, then predict the selected battery **cycle by "
+                "cycle**. Nothing is shrunk towards a baseline: you see what each model has really learned.")
+    sc = scheme()
+    c1, c2 = st.columns([2, 1])
+    av = list(te.available_models())
+    mdls = c1.multiselect("Models", av, default=[m for m in ("Bayesian Ridge", "Random Forest", "SVM", "Gaussian Process",
+                                                             "XGBoost", "LightGBM") if m in av], key="tr_models",
+                          format_func=lambda m: f"L{te.MODEL_SPECS[m].level} · {m}")
+    mode = c2.radio("Mode", list(te.TRAJ_MODES), key="tr_mode", format_func=te.TRAJ_MODES.get,
+                    help="Forecast: only what is known at the training | test line (a real forecast). Measured: each "
+                         "test cycle's own resistance, temperatures, charge times… (estimation; shows whether the model "
+                         "has learned how the measured parameters relate to health).")
+    feats = te.TRAJ_FORECAST_FEATURES if mode == "forecast" else te.TRAJ_MEASURED_FEATURES
+    with st.expander(f"Inputs used ({len(feats)})", icon=":material/list:"):
+        st.markdown(" · ".join(feats.values()))
+        st.caption("Training rows: every valid cycle of the training batteries (forecast mode: seen from several origins "
+                   "per battery, 10–60% of life) plus the selected battery's own cycles up to the origin. Target: SOH "
+                   "(forecast mode: the SOH change since the origin). EIS resistances are interpolated between tests.")
+    if sc["mode"] == "within":
+        train = None
+        st.caption("Within scheme: trained on all comparable batteries (conditions are inputs, so batteries from other "
+                   "groups teach the condition effects) plus this battery's cycles up to the origin.")
+    else:
+        train = list(sc["train"])
+    if st.button(f"Train trajectory models ({len(mdls) * len(sc['targets'])} runs)", key="tr_go", type="primary",
+                 icon=":material/timeline:", disabled=not mdls):
+        prog = st.progress(0.0)
+        out: Dict[str, List[Any]] = {}
+        k_ = 0
+        for t in sc["targets"]:
+            for m in mdls:
+                prog.progress(k_ / max(len(mdls) * len(sc["targets"]), 1), text=f"{m} on {t}")
+                k_ += 1
+                try:
+                    f = te.train_trajectory_model(ct, imp, t, sc["n0"][t], m, mode, train, float(eol_ah))
+                    out.setdefault(t, []).append(f)
+                    ladder_add(f.model, te.MODEL_SPECS[m].level, sc["n0"][t], f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+                except Exception as exc:
+                    st.warning(f"{m} on {t}: {exc}")
+        prog.empty()
+        st.session_state["traj"] = {"res": out, "mode": mode}
+    saved = st.session_state.get("traj")
+    show_t = sc.get("show", sc["targets"][0])
+    res = (saved or {}).get("res", {}).get(show_t, [])
+    if not res:
+        placeholder("Press 'Train trajectory models': each model's cycle-by-cycle prediction, its accuracy, the inputs it "
+                    "used and what it relied on appear here.")
+        return
+    entries = [{"name": f.model, "level": te.MODEL_SPECS[f.model.split(" · ")[1].replace(" (measured)", "")].level,
+                "n_grid": f.n_grid, "soh": f.soh, "lo": f.lo, "hi": f.hi, "m": f.metrics, "target": show_t} for f in res]
+    show(fig_ladder(entries, res[0].n0, P, "Trajectory models", show_t), key="tr_fig", export=False)
+    rows = [{"Model": f.model, "Accuracy (%)": f.metrics.accuracy, "RMSE": f.metrics.rmse, "Coverage": f.metrics.coverage,
+             "CV RMSE (held-out batteries)": f.cv_rmse, "Training batteries": len(f.train_cells), "Time (s)": f.fit_seconds}
+            for f in res]
+    show_table(pd.DataFrame(rows).set_index("Model").sort_values("RMSE").style.format(
+        {"Accuracy (%)": "{:.2f}", "RMSE": "{:.4f}", "Coverage": "{:.0%}", "CV RMSE (held-out batteries)": "{:.4f}",
+         "Time (s)": "{:.1f}"}),
+        note="RMSE on this battery's test cycles (SOH units). CV RMSE: error on batteries held out during training, "
+             "the better guide to how the model generalises. All models also appear in the leaderboard below.")
+    best = min(res, key=lambda f: f.metrics.rmse)
+    show(fig_importance(best.importance, P, best.model), key="tr_imp", export=False)
+    with st.expander(f"Exact inputs for {show_t} at the origin (cycle {res[0].n0})", icon=":material/fact_check:"):
+        show_table(pd.DataFrame({"Input": list(best.inputs_at_origin), "Value": list(best.inputs_at_origin.values())})
+                   .set_index("Input").style.format({"Value": "{:.4g}"}),
+                   note="Forecast mode: these values (plus cycle number, cycles since the origin and estimated "
+                        "throughput, which change along the forecast) are all the model receives about this battery.")
+
+
 def view_models() -> None:
     recommendations("models")
     section("Forecasting models: baselines and machine learning (levels 1–3)")
@@ -4898,6 +4973,7 @@ def view_models() -> None:
     ml_methods_panel()
     ladder_baselines()
     ml_section()
+    trajectory_section()
     ladder_leaderboard()
     assessment_section()
 

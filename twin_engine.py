@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.5.2"
+ENGINE_VERSION = "5.5.3"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -7413,3 +7413,230 @@ def estimation_protocol(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Se
             except Exception as exc:
                 rows.append({"Cell_ID": c, "model": m, "status": f"failed: {str(exc)[:80]}"})
     return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 34. TRAJECTORY MODELS: SOH of every cycle learned from all training batteries
+# =============================================================================
+# Two modes, both trained on every valid cycle of the training batteries (plus the target's own cycles up to the
+# origin):
+#   "forecast": for a future cycle m seen from an origin k, inputs = cycle number, cycles since the origin,
+#               estimated throughput, operating conditions (ambient, current, cut-off) and the battery's measured
+#               state at the origin (SOH, resistance, CV time, their trends, dQ(V) variance). Target = SOH(m) - SOH(k).
+#               Only information available at the origin is used (a true forecast).
+#   "measured": for a cycle m, inputs = cycle number, operating conditions and that cycle's own measurements
+#               (resistance, temperature rise, charge times, mean voltage, efficiency, EIS); target = SOH(m).
+#               Needs the measurements of each cycle (estimation), shows whether the model has learned how the
+#               measured parameters relate to health.
+TRAJ_MODES = {"forecast": "Forecast (only what is known at the origin)",
+              "measured": "Per cycle with that cycle's measured parameters"}
+TRAJ_FORECAST_FEATURES = {
+    "n": "Cycle number", "dn": "Cycles since the origin", "ah_est": "Estimated throughput (Ah)",
+    "T_amb": "Ambient temperature (°C)", "I_set": "Discharge current (A)", "V_cut": "Cut-off voltage (V)",
+    "soh0": "SOH at the origin", "slope0": "SOH trend per Ah at the origin", "r_rel0": "Resistance at the origin / new",
+    "r_slope0": "Resistance trend at the origin", "tcv_rel0": "CV-charge time at the origin / new",
+    "dq0": "ΔQ(V) variance at the origin"}
+TRAJ_MEASURED_FEATURES = {
+    "n": "Cycle number", "T_amb": "Ambient temperature (°C)", "I_set": "Discharge current (A)", "V_cut": "Cut-off voltage (V)",
+    "R_dc_ohm": "Load-step resistance", "dT_C": "Temperature rise", "T_mean_C": "Mean cell temperature",
+    "t_cv_s": "CV-charge time", "t_cc_s": "CC-charge time", "V_mean_V": "Mean discharge voltage",
+    "eff_energy": "Energy efficiency", "Re_ohm": "Electrolyte resistance (EIS)", "Rct_ohm": "Charge-transfer resistance (EIS)"}
+
+
+def _traj_conditions(ct: pd.DataFrame, cell: str) -> Dict[str, float]:
+    g = condition_groups(ct)
+    d = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]]
+    T_amb = float(g.loc[cell, "Ambient_C"]) if cell in g.index and np.isfinite(g.loc[cell, "Ambient_C"]) else float(d["T_mean_C"].median())
+    return {"T_amb": T_amb, "I_set": float(d["I_dis_A"].median()), "V_cut": float(d["V_min_V"].median())}
+
+
+def _traj_forecast_rows(ct: pd.DataFrame, cell: str, k: int, until: Optional[int] = None, step: int = 1
+                        ) -> Optional[pd.DataFrame]:
+    """Rows for the future cycles m > k of one battery, seen from origin k (inputs known at k only)."""
+    good = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]].sort_values("n")
+    dc = clean_capacity(ct[(ct["Cell_ID"] == cell) & (ct["n"] <= k)])
+    if len(dc) < 6:
+        return None
+    f = state_features(dc, k, float(good["C_bol_Ah"].iloc[0]))
+    cond = _traj_conditions(ct, cell)
+    last = int(until if until is not None else good["n"].max())
+    m = np.arange(k + 1, last + 1, step)
+    if not len(m):
+        return None
+    ah_cycle = f["ah_cycle"]
+    return pd.DataFrame({"Cell_ID": cell, "k": k, "n": m.astype(float), "dn": (m - k).astype(float),
+                         "ah_est": f["cum_ah"] + (m - k) * ah_cycle, **cond, "soh0": f["soh_now"],
+                         "slope0": f.get("soh_slope_ah", f["soh_slope"]), "r_rel0": f["r_rel"], "r_slope0": f["r_slope"],
+                         "tcv_rel0": f["tcv_rel"], "dq0": f["dq_logvar"]})
+
+
+def _traj_measured_rows(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n_min: int = 0,
+                        n_max: Optional[int] = None) -> pd.DataFrame:
+    cte = attach_eis(ct, imp) if imp is not None else ct
+    d = cte[(cte["Cell_ID"] == cell) & ~cte["outlier"]].sort_values("n")
+    d = d[(d["n"] > n_min) & ((d["n"] <= n_max) if n_max is not None else True)]
+    out = pd.DataFrame({"Cell_ID": cell, "n": d["n"].astype(float).to_numpy(), "SOH": d["SOH"].to_numpy()})
+    for k_, v in _traj_conditions(ct, cell).items():
+        out[k_] = v
+    for c in TRAJ_MEASURED_FEATURES:
+        if c not in out:
+            out[c] = d[c].to_numpy(float) if c in d else np.nan
+    return out
+
+
+@dataclass
+class TrajectoryForecast:
+    model: str
+    mode: str
+    cell_id: str
+    n0: int
+    n_grid: np.ndarray
+    soh: np.ndarray
+    lo: np.ndarray
+    hi: np.ndarray
+    metrics: ForecastMetrics
+    features: List[str]
+    inputs_at_origin: Dict[str, float]
+    importance: pd.DataFrame
+    train_cells: List[str]
+    cv_rmse: float
+    fit_seconds: float
+
+
+def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str, n0: int,
+                           model_name: str = "Random Forest", mode: str = "forecast",
+                           train_cells: Optional[Sequence[str]] = None, eol_ah: float = DEFAULT_EOL_AH,
+                           level: float = 0.9, origin_fracs: Sequence[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+                           step: int = 2, cv_folds: int = 3, seed: int = 0, horizon_factor: float = 1.0) -> TrajectoryForecast:
+    """Learn SOH of every cycle from all training batteries and predict the target battery cycle by cycle.
+    forecast mode: rows (origin k, future cycle m) from each training battery at several origins; the target is
+    predicted from its own state at n0. measured mode: rows = cycles with their own measurements. The band comes
+    from grouped (by battery) cross-validation residuals, binned by cycles ahead (forecast) or pooled (measured).
+    Permutation importance on the held-out batteries shows which inputs the model actually uses."""
+    t0 = time.time()
+    if mode not in TRAJ_MODES:
+        raise ValueError(f"mode must be one of {tuple(TRAJ_MODES)}")
+    prm = {"degree": 1} if MODEL_SPECS[model_name].poly else None
+    pool = [c for c in (train_cells if train_cells is not None else v2_training_pool(ct, cell_id)) if c != cell_id]
+    good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
+    n_last = int(good["n"].max())
+    feats = list(TRAJ_FORECAST_FEATURES if mode == "forecast" else TRAJ_MEASURED_FEATURES)
+    parts = []
+    if mode == "forecast":
+        for c in pool:
+            gc = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]]
+            if len(gc) < 20:
+                continue
+            nl = int(gc["n"].max())
+            dc_full = clean_capacity(ct[ct["Cell_ID"] == c])
+            for fr in origin_fracs:
+                k = int(max(10, round(fr * nl)))
+                r = _traj_forecast_rows(ct, c, k, step=step)
+                if r is None:
+                    continue
+                r["y"] = np.interp(r["n"], dc_full["n"], dc_full["SOH_clean"]) - r["soh0"]
+                parts.append(r)
+        for k in range(12, n0 - 5, 6):                         # the target's own past, seen from earlier origins
+            r = _traj_forecast_rows(ct, cell_id, k, until=n0, step=step)
+            if r is not None:
+                dcp = clean_capacity(ct[(ct["Cell_ID"] == cell_id) & (ct["n"] <= n0)])
+                r["y"] = np.interp(r["n"], dcp["n"], dcp["SOH_clean"]) - r["soh0"]
+                parts.append(r)
+    else:
+        for c in pool:
+            r = _traj_measured_rows(ct, imp, c)
+            r["y"] = r["SOH"]
+            parts.append(r)
+        r = _traj_measured_rows(ct, imp, cell_id, n_max=n0)
+        r["y"] = r["SOH"]
+        parts.append(r)
+    tab = pd.concat([p for p in parts if p is not None and len(p)], ignore_index=True) if parts else pd.DataFrame()
+    if len(tab) < 50 or tab["Cell_ID"].nunique() < 2:
+        raise ValueError("trajectory model: not enough training cycles (choose more training batteries)")
+    feats = [f for f in feats if tab[f].notna().mean() > 0.5]
+    med = tab[feats].median()
+    X = tab[feats].fillna(med).to_numpy(float)
+    y = tab["y"].to_numpy(float)
+    g = tab["Cell_ID"].to_numpy()
+
+    def fit(Xa, ya):
+        Xs, ys, _ = _gp_subsample(model_name, Xa, ya, np.ones(len(ya)), seed)
+        return _StandardisedTarget(make_model(model_name, seed, prm)).fit(Xs, ys)
+
+    rng = np.random.default_rng(seed)
+    cells_u = np.unique(g)
+    folds = np.array_split(rng.permutation(cells_u), min(cv_folds, len(cells_u))) if len(cells_u) >= 3 else []
+    res, ahead, imp_vals = [], [], np.zeros(len(feats))
+    n_imp = 0
+    for fold in folds:
+        te_m = np.isin(g, fold)
+        if te_m.all() or not te_m.any():
+            continue
+        mm = fit(X[~te_m], y[~te_m])
+        pr = mm.predict(X[te_m])
+        res.append(y[te_m] - pr)
+        ahead.append(tab.loc[te_m, "dn"].to_numpy() if "dn" in tab else np.zeros(te_m.sum()))
+        base = np.sqrt(np.mean((y[te_m] - pr) ** 2))
+        Xv = X[te_m]
+        sub = rng.choice(len(Xv), size=min(len(Xv), 1500), replace=False)
+        for j in range(len(feats)):
+            xp = Xv[sub].copy()
+            xp[:, j] = xp[rng.permutation(len(sub)), j]
+            imp_vals[j] += np.sqrt(np.mean((y[te_m][sub] - mm.predict(xp)) ** 2)) - np.sqrt(np.mean((y[te_m][sub] - mm.predict(Xv[sub])) ** 2))
+        n_imp += 1
+    model = fit(X, y)
+    R = np.concatenate(res) if res else np.array([0.02])
+    A = np.concatenate(ahead) if ahead else np.zeros(len(R))
+    cv_rmse = float(np.sqrt(np.mean(R ** 2)))
+    importance = pd.DataFrame({"key": feats, "Indicator": [({**TRAJ_FORECAST_FEATURES, **TRAJ_MEASURED_FEATURES})[f] for f in feats],
+                               "Importance (ΔRMSE)": imp_vals / max(n_imp, 1), "std": 0.0}).sort_values("Importance (ΔRMSE)", ascending=False)
+    # predict the target's later cycles
+    n_end = int(n_last * horizon_factor)
+    if mode == "forecast":
+        rows = _traj_forecast_rows(ct, cell_id, n0, until=n_end, step=1)
+        if rows is None:
+            raise ValueError("trajectory model: too few cycles before the origin")
+        Xt = rows[feats].fillna(med).to_numpy(float)
+        pred = rows["soh0"].to_numpy() + model.predict(Xt)
+        bins = np.array([0, 20, 40, 80, 1e9])
+        q = []
+        for a_, b_ in zip(bins[:-1], bins[1:]):
+            sel = (A > a_) & (A <= b_)
+            q.append(float(np.quantile(np.abs(R[sel]), level)) if sel.sum() >= 20 else np.nan)
+        q = pd.Series(q).ffill().bfill().fillna(float(np.quantile(np.abs(R), level))).to_numpy()
+        half = q[np.clip(np.searchsorted(bins, rows["dn"].to_numpy(), side="left") - 1, 0, len(q) - 1)]
+        n_pred = rows["n"].to_numpy()
+        inputs0 = {TRAJ_FORECAST_FEATURES[f]: float(rows[f].iloc[0]) for f in feats if f not in ("n", "dn", "ah_est")}
+    else:
+        rows = _traj_measured_rows(ct, imp, cell_id, n_min=n0)
+        if rows.empty:
+            raise ValueError("trajectory model: no test cycles after the origin")
+        pred = model.predict(rows[feats].fillna(med).to_numpy(float))
+        half = np.full(len(pred), float(np.quantile(np.abs(R), level)))
+        n_pred = rows["n"].to_numpy()
+        inputs0 = {TRAJ_MEASURED_FEATURES[f]: float(rows[f].iloc[0]) for f in feats if f != "n" and np.isfinite(rows[f].iloc[0])}
+    n_grid = np.arange(1, int(max(n_end, n_pred.max())) + 1)
+    past = np.interp(n_grid, good["n"], good["SOH"])
+    fut = n_grid > n0
+    soh = np.where(fut, np.interp(n_grid, n_pred, pred), past)
+    lo = np.where(fut, np.interp(n_grid, n_pred, pred - half), past)
+    hi = np.where(fut, np.interp(n_grid, n_pred, pred + half), past)
+    soh, lo, hi = np.clip(soh, 0, 1.05), np.clip(lo, 0, 1.05), np.clip(hi, 0, 1.05)
+    soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
+    metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), n_grid, soh, n0, soh_eol, lo, hi, 0.2)
+    return TrajectoryForecast(f"Trajectory · {model_name}" + (" (measured)" if mode == "measured" else ""), mode, cell_id,
+                              n0, n_grid, soh, lo, hi, metrics, feats, inputs0, importance, sorted(set(g) - {cell_id}),
+                              cv_rmse, time.time() - t0)
+
+
+for _m in ML_MODELS:                                   # trajectory models in the accuracy assessment
+    PROTOCOL_MODELS[f"traj:{_m}"] = ("Trajectory (forecast)", f"Trajectory · {_m}")
+    PROTOCOL_MODELS[f"trajm:{_m}"] = ("Trajectory (measured)", f"Trajectory · {_m} (measured)")
+_protocol_forecast_base = _protocol_forecast
+
+
+def _protocol_forecast(key, store, ct, imp, cell, n0, train, eol_ah):  # noqa: F811  (extends the registry)
+    if key.startswith("traj:") or key.startswith("trajm:"):
+        mode = "forecast" if key.startswith("traj:") else "measured"
+        return train_trajectory_model(ct, imp, cell, n0, key.split(":", 1)[1], mode, train, eol_ah)
+    return _protocol_forecast_base(key, store, ct, imp, cell, n0, train, eol_ah)
