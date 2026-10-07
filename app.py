@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.5"
+REQUIRED_ENGINE = "5.5.2"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -58,10 +58,19 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
-    st.error(f"**Version mismatch.** This app.py needs twin_engine.py version {REQUIRED_ENGINE}.x, but the file "
-             f"deployed next to it is version {getattr(te, 'ENGINE_VERSION', 'unknown')}. Upload **both** files from "
-             "the same release to the repository (same folder), then reboot the app (Manage app → ⋮ → Reboot).")
+_REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
+                   "train_ml_v2", "baseline_forecast_v2")
+_missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
+if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
+    _here = Path(__file__).resolve().parent
+    _copies = sorted(p.name for p in _here.glob("twin_engine*.py")) + sorted(p.name for p in _here.glob("app*.py"))
+    st.error(f"**Version mismatch.** This app.py needs twin_engine.py version **{REQUIRED_ENGINE}**, but the engine it "
+             f"loaded is version **{getattr(te, 'ENGINE_VERSION', 'unknown')}** "
+             f"(file: `{Path(getattr(te, '__file__', '?')).name}`)"
+             + (f", missing: {', '.join(_missing)}" if _missing else "") + ".\n\n"
+             f"Python files found next to the app: {', '.join(f'`{c}`' for c in _copies) or 'none'}. "
+             "If you see names like `twin_engine (1).py`, the browser renamed a second download: rename it to exactly "
+             "`twin_engine.py` (replacing the old one) and delete the copies. Then reboot the app (Manage app → ⋮ → Reboot).")
     st.stop()
 
 # =============================================================================
