@@ -1022,7 +1022,12 @@ def test_trajectory_models_per_cycle_no_leakage_and_assessment():
     assert np.allclose(a.soh[fut], b.soh[fut])
     res = te.run_protocol(store, ct, imp, ["S001", "S004", "S006"], ["trend", "traj:Bayesian Ridge"], (0.4,), 1.6)
     assert (res["status"] == "ok").all()
-    assert "Trajectory · Bayesian Ridge" in te.protocol_scoreboard(res).index
+    assert "ML · Bayesian Ridge" in te.protocol_scoreboard(res).index
+    # every model type starts its forecast at today's SOH (no jump at the origin)
+    for mdl in ("Bayesian Ridge", "Random Forest", "SVM"):
+        f = te.train_trajectory_model(ct, imp, "S001", n0, mdl, "forecast", eol_ah=1.6)
+        i = int(np.searchsorted(f.n_grid, n0 + 1))
+        assert abs(f.soh[i] - f.soh[i - 1]) < 0.01
 
 
 if __name__ == "__main__":                            # minimal runner when pytest is absent

@@ -1,9 +1,22 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.5.3)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.5.4)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Two independent levels (v5.5.4)
+
+Models view = Level 1 · Baselines (persistence, linear trend, fleet shape) and Level 2 · Machine learning, plus the
+leaderboard and the accuracy assessment, which compare the levels but do not connect them. No model uses another
+level's output (the ML v2 workbench, built as baseline + correction, and the v1/v2 switch are no longer in the view).
+Level 2 = the trajectory models, organised around Mission 2: SOH of every cycle learned from all training batteries.
+Forecast-mode fixes: tree models (Decision Tree, Random Forest, XGBoost, LightGBM) learn the average fade per Ah since
+the origin (rows >= 5 cycles ahead, clipped to [-2 %/Ah, 0]); linear and kernel models learn the SOH change and are
+anchored (their own prediction at zero cycles ahead is subtracted), so every forecast starts at today's SOH; training
+origins 5-60 % of life, with a warning when the chosen origin is outside. Synthetic (3 batteries, origins 8 / 30 %):
+jump at the origin 0.019 -> 0.003; Random Forest 0.0148 -> 0.0115 at 30 %; SVM unchanged; Bayesian Ridge 0.020 ->
+0.031 at 30 % (its earlier score partly came from an offset).
 
 ## Trajectory models (v5.5.3)
 

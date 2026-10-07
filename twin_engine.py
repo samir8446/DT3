@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.5.3"
+ENGINE_VERSION = "5.5.4"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -7428,6 +7428,7 @@ def estimation_protocol(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Se
 #               (resistance, temperature rise, charge times, mean voltage, efficiency, EIS); target = SOH(m).
 #               Needs the measurements of each cycle (estimation), shows whether the model has learned how the
 #               measured parameters relate to health.
+TRAJ_RATE_MODELS = ("Decision Tree", "Random Forest", "XGBoost", "LightGBM")
 TRAJ_MODES = {"forecast": "Forecast (only what is known at the origin)",
               "measured": "Per cycle with that cycle's measured parameters"}
 TRAJ_FORECAST_FEATURES = {
@@ -7465,9 +7466,14 @@ def _traj_forecast_rows(ct: pd.DataFrame, cell: str, k: int, until: Optional[int
         return None
     ah_cycle = f["ah_cycle"]
     return pd.DataFrame({"Cell_ID": cell, "k": k, "n": m.astype(float), "dn": (m - k).astype(float),
-                         "ah_est": f["cum_ah"] + (m - k) * ah_cycle, **cond, "soh0": f["soh_now"],
+                         "ah_est": f["cum_ah"] + (m - k) * ah_cycle, "ah_cyc": ah_cycle, **cond, "soh0": f["soh_now"],
                          "slope0": f.get("soh_slope_ah", f["soh_slope"]), "r_rel0": f["r_rel"], "r_slope0": f["r_slope"],
                          "tcv_rel0": f["tcv_rel"], "dq0": f["dq_logvar"]})
+
+
+def _traj_dah(rows: pd.DataFrame) -> np.ndarray:
+    """Throughput since the origin for each row (Ah) = cycles ahead x Ah per cycle, floored at 0.05 Ah."""
+    return np.maximum(rows["dn"].to_numpy(float) * rows["ah_cyc"].to_numpy(float), 0.05)
 
 
 def _traj_measured_rows(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n_min: int = 0,
@@ -7501,13 +7507,15 @@ class TrajectoryForecast:
     train_cells: List[str]
     cv_rmse: float
     fit_seconds: float
+    origin_note: str = ""
 
 
 def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str, n0: int,
                            model_name: str = "Random Forest", mode: str = "forecast",
                            train_cells: Optional[Sequence[str]] = None, eol_ah: float = DEFAULT_EOL_AH,
-                           level: float = 0.9, origin_fracs: Sequence[float] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
-                           step: int = 2, cv_folds: int = 3, seed: int = 0, horizon_factor: float = 1.0) -> TrajectoryForecast:
+                           level: float = 0.9, origin_fracs: Sequence[float] = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
+                           step: int = 2, cv_folds: int = 3, seed: int = 0, horizon_factor: float = 1.0,
+                           target: str = "auto") -> TrajectoryForecast:
     """Learn SOH of every cycle from all training batteries and predict the target battery cycle by cycle.
     forecast mode: rows (origin k, future cycle m) from each training battery at several origins; the target is
     predicted from its own state at n0. measured mode: rows = cycles with their own measurements. The band comes
@@ -7516,6 +7524,8 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
     t0 = time.time()
     if mode not in TRAJ_MODES:
         raise ValueError(f"mode must be one of {tuple(TRAJ_MODES)}")
+    if target == "auto":      # trees predict piecewise-constant values: a rate keeps them from flattening; smooth
+        target = "rate" if model_name in TRAJ_RATE_MODELS else "change"     # models extrapolate the change directly
     prm = {"degree": 1} if MODEL_SPECS[model_name].poly else None
     pool = [c for c in (train_cells if train_cells is not None else v2_training_pool(ct, cell_id)) if c != cell_id]
     good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
@@ -7534,13 +7544,15 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
                 r = _traj_forecast_rows(ct, c, k, step=step)
                 if r is None:
                     continue
-                r["y"] = np.interp(r["n"], dc_full["n"], dc_full["SOH_clean"]) - r["soh0"]
+                drop = np.interp(r["n"], dc_full["n"], dc_full["SOH_clean"]) - r["soh0"]
+                r["y"] = drop / _traj_dah(r) if target == "rate" else drop   # fade per Ah since the origin, or change
                 parts.append(r)
         for k in range(12, n0 - 5, 6):                         # the target's own past, seen from earlier origins
             r = _traj_forecast_rows(ct, cell_id, k, until=n0, step=step)
             if r is not None:
                 dcp = clean_capacity(ct[(ct["Cell_ID"] == cell_id) & (ct["n"] <= n0)])
-                r["y"] = np.interp(r["n"], dcp["n"], dcp["SOH_clean"]) - r["soh0"]
+                dr = np.interp(r["n"], dcp["n"], dcp["SOH_clean"]) - r["soh0"]
+                r["y"] = dr / _traj_dah(r) if target == "rate" else dr
                 parts.append(r)
     else:
         for c in pool:
@@ -7551,6 +7563,11 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         r["y"] = r["SOH"]
         parts.append(r)
     tab = pd.concat([p for p in parts if p is not None and len(p)], ignore_index=True) if parts else pd.DataFrame()
+    if mode == "forecast" and len(tab) and target == "rate":
+        # a rate measured over a few cycles is mostly noise: learn it from rows at least 5 cycles ahead, clipped to
+        # a physical range (no capacity gain, at most 2 % SOH per Ah)
+        tab = tab[tab["dn"] >= 5].copy()
+        tab["y"] = tab["y"].clip(-0.02, 0.0)
     if len(tab) < 50 or tab["Cell_ID"].nunique() < 2:
         raise ValueError("trajectory model: not enough training cycles (choose more training batteries)")
     feats = [f for f in feats if tab[f].notna().mean() > 0.5]
@@ -7574,7 +7591,8 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
             continue
         mm = fit(X[~te_m], y[~te_m])
         pr = mm.predict(X[te_m])
-        res.append(y[te_m] - pr)
+        scale = _traj_dah(tab.loc[te_m]) if (mode == "forecast" and target == "rate") else 1.0
+        res.append((y[te_m] - pr) * scale)                    # errors in SOH units for the band
         ahead.append(tab.loc[te_m, "dn"].to_numpy() if "dn" in tab else np.zeros(te_m.sum()))
         base = np.sqrt(np.mean((y[te_m] - pr) ** 2))
         Xv = X[te_m]
@@ -7597,7 +7615,13 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         if rows is None:
             raise ValueError("trajectory model: too few cycles before the origin")
         Xt = rows[feats].fillna(med).to_numpy(float)
-        pred = rows["soh0"].to_numpy() + model.predict(Xt)
+        if target == "rate":
+            pred = rows["soh0"].to_numpy() + np.minimum(model.predict(Xt), 0.0) * _traj_dah(rows)
+        else:
+            # anchoring: subtract the model's own prediction for zero cycles ahead, so the forecast starts at today's SOH
+            r0 = rows.iloc[[0]].copy()
+            r0["n"], r0["dn"], r0["ah_est"] = float(n0), 0.0, float(rows["ah_est"].iloc[0] - rows["ah_cyc"].iloc[0])
+            pred = rows["soh0"].to_numpy() + model.predict(Xt) - float(model.predict(r0[feats].fillna(med).to_numpy(float))[0])
         bins = np.array([0, 20, 40, 80, 1e9])
         q = []
         for a_, b_ in zip(bins[:-1], bins[1:]):
@@ -7624,14 +7648,20 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
     soh, lo, hi = np.clip(soh, 0, 1.05), np.clip(lo, 0, 1.05), np.clip(hi, 0, 1.05)
     soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
     metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), n_grid, soh, n0, soh_eol, lo, hi, 0.2)
-    return TrajectoryForecast(f"Trajectory · {model_name}" + (" (measured)" if mode == "measured" else ""), mode, cell_id,
+    note = ""
+    if mode == "forecast":
+        share = n0 / max(n_last, 1)
+        if share < min(origin_fracs) or share > max(origin_fracs):
+            note = (f"The origin is at {100 * share:.0f}% of this battery's recorded life, outside the training origins "
+                    f"({100 * min(origin_fracs):.0f}–{100 * max(origin_fracs):.0f}%): the models extrapolate.")
+    return TrajectoryForecast(f"ML · {model_name}" + (" (measured)" if mode == "measured" else ""), mode, cell_id,
                               n0, n_grid, soh, lo, hi, metrics, feats, inputs0, importance, sorted(set(g) - {cell_id}),
-                              cv_rmse, time.time() - t0)
+                              cv_rmse, time.time() - t0, note)
 
 
 for _m in ML_MODELS:                                   # trajectory models in the accuracy assessment
-    PROTOCOL_MODELS[f"traj:{_m}"] = ("Trajectory (forecast)", f"Trajectory · {_m}")
-    PROTOCOL_MODELS[f"trajm:{_m}"] = ("Trajectory (measured)", f"Trajectory · {_m} (measured)")
+    PROTOCOL_MODELS[f"traj:{_m}"] = ("Machine learning (forecast)", f"ML · {_m}")
+    PROTOCOL_MODELS[f"trajm:{_m}"] = ("Machine learning (measured)", f"ML · {_m} (measured)")
 _protocol_forecast_base = _protocol_forecast
 
 

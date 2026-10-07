@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.5.3"
+REQUIRED_ENGINE = "5.5.4"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -3464,10 +3464,8 @@ def _reco_items(view: str) -> List[Tuple[str, str]]:
         done = {e["level"] for e in ladder_entries()}
         if not done:
             items.append(("flag", "Start with **Level 1 · Baselines**: every other model must beat the linear trend."))
-        elif not (done & {2, 3}):
-            items.append(("trending_up", "Next: the **machine-learning workbench**, then compare in the leaderboard."))
-        if not ss.get("ml"):
-            items.append(("model_training", "In the ML workbench, press **Auto-tune** before judging the tree and boosting models."))
+        elif 2 not in done:
+            items.append(("trending_up", "Next: **Level 2 · Machine learning**, then compare in the leaderboard."))
         items.append(("fact_check", "One battery is an anecdote: confirm the ranking with the **Same operating conditions** "
                                     "or **Across batteries** scheme and several test batteries."))
     elif view == "ops":
@@ -4415,8 +4413,8 @@ def ml_methods_panel() -> None:
 
 
 LEVEL_INFO = {
-    1: ("Baselines", "Persistence, linear trend, a single decision tree, Bayesian ridge: the references to beat."),
-    2: ("Classical ML", "Random Forest, Extra Trees, Gaussian Process: robust learners for small data."),
+    1: ("Baselines", "Persistence, linear trend and fleet shape: references that need no learning."),
+    2: ("Machine learning", "SOH of every cycle learned from all training batteries: conditions and health parameters."),
     3: ("Boosting", "Histogram gradient boosting, XGBoost, LightGBM: strongest on tabular data."),
     4: ("Deep learning", "GRU recurrent network and Transformer: learn from sequences of past SOH."),
     5: ("Hybrid & physics-informed", "Mechanistic PINN and hierarchical Bayes: equations plus learning."),
@@ -4498,12 +4496,7 @@ def scheme_controls() -> Dict[str, Any]:
             st.caption(f"Learning from {len(train)} batteries, forecasting {len(test)}: each test battery is seen for its "
                        f"first {100 * frac:.0f}% of life. Baselines, the PINN and the first-principles model only need "
                        "the test battery itself; the other levels learn from the training batteries.")
-    gen = st.radio("Model generation (applies to both sections)", ["v2", "v1", "both"], horizontal=True, key="gen",
-                   format_func={"v2": "v2 · cleaned data, physical limits, state features (recommended)",
-                                "v1": "v1 · original models", "both": "both · compare on the leaderboard"}.get,
-                   help="v2 removes capacity-recovery jumps (causally for the test battery), trains on comparable "
-                        "batteries, keeps forecasts physical, gives the deep models four health channels and the "
-                        "first-principles model fleet priors.")
+    gen = "v2"
     sc["gen"] = gen
     st.session_state["_scheme"] = sc
     return sc
@@ -4618,9 +4611,9 @@ def ladder_intro() -> None:
         f'<div class="bt-step{" bt-step-done" if lv in done else ""}"><div class="bt-step-n">{lv}</div>'
         f'<div class="bt-step-t">{html.escape(LEVEL_INFO[lv][0])}</div></div>' for lv in ACTIVE_LEVELS)
     st.markdown(f'<div class="bt-ladder">{steps}</div>', unsafe_allow_html=True)
-    st.caption("Work top to bottom: first the baselines, then the machine-learning models. A level is ticked once one of "
-               "its models has run on the displayed battery; the leaderboard at the end compares them on the same test "
-               "cycles. Advanced models (deep learning, hybrid, first principles) are added once these are validated.")
+    st.caption("Two independent levels: no model uses another level's output. The leaderboard and the accuracy "
+               "assessment only compare them on the same test cycles. Advanced levels (deep learning, hybrid, first "
+               "principles) are added one at a time once these are validated.")
 
 
 def ladder_baselines() -> None:
@@ -4798,11 +4791,11 @@ def ladder_leaderboard() -> None:
         st.rerun()
 
 
-ACTIVE_LEVELS = (1, 2, 3)        # advanced levels (deep learning, hybrid, first principles) are added back step by step
+ACTIVE_LEVELS = (1, 2)           # independent levels; advanced ones (deep, hybrid, physics) are added back step by step
 
 
-FAMILY_COLORS = {"Baselines": "#8C8C8C", "Machine learning": "#0072B2", "Trajectory (forecast)": "#AA4499",
-                 "Trajectory (measured)": "#56B4E9"}
+FAMILY_COLORS = {"Baselines": "#8C8C8C", "Machine learning (forecast)": "#0072B2",
+                 "Machine learning (measured)": "#56B4E9"}
 
 
 def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
@@ -4842,11 +4835,11 @@ def assessment_section() -> None:
     origins = c2.multiselect("Forecast origins (share of each battery's life)", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
                              default=[0.3, 0.5], key="acc_origins", format_func=lambda v: f"{100 * v:.0f}%")
     av = te.available_models()
-    options = (["persistence", "trend", "shape"] + [f"ml:{m}" for m in av] + [f"traj:{m}" for m in av]
-               + [f"trajm:{m}" for m in av])
-    keys = st.multiselect("Models (levels 1–3)", options,
-                          default=["persistence", "trend", "shape"] + [f"ml:{m}" for m in ("Bayesian Ridge", "Random Forest")
-                                                                       if m in av],
+    options = ["persistence", "trend", "shape"] + [f"traj:{m}" for m in av] + [f"trajm:{m}" for m in av]
+    keys = st.multiselect("Models (level 1 baselines, level 2 machine learning)", options,
+                          default=["persistence", "trend", "shape"] + [f"traj:{m}" for m in ("Bayesian Ridge", "Random Forest",
+                                                                                                  "SVM", "Gaussian Process")
+                                                                         if m in av],
                           key="acc_models", format_func=lambda k: te.PROTOCOL_MODELS[k][1])
     cells_g = te.protocol_cells(ct, grp)
     n_fc = len(cells_g) * len(origins) * len(keys)
@@ -4893,16 +4886,18 @@ def assessment_section() -> None:
 
 
 def trajectory_section() -> None:
-    section("Levels 2–3 · Trajectory models: SOH of every cycle, learned from all training batteries")
-    st.markdown("These models learn, from **every cycle of every training battery**, how SOH depends on the cycle number, "
-                "the operating conditions and the measured parameters, then predict the selected battery **cycle by "
-                "cycle**. Nothing is shrunk towards a baseline: you see what each model has really learned.")
+    section("Level 2 · Machine learning: can a battery's SOH be predicted from the data of other batteries?")
+    st.markdown("Mission 2 asks whether future degradation can be predicted accurately and which variables are most "
+                "informative. The models learn, from **every cycle of every training battery**, how SOH depends on the "
+                "cycle number, the operating conditions and the measured health parameters, then predict the selected "
+                "battery **cycle by cycle**. This level is independent: it uses no baseline, so you see exactly what "
+                "each model has learned.")
     sc = scheme()
     c1, c2 = st.columns([2, 1])
     av = list(te.available_models())
     mdls = c1.multiselect("Models", av, default=[m for m in ("Bayesian Ridge", "Random Forest", "SVM", "Gaussian Process",
                                                              "XGBoost", "LightGBM") if m in av], key="tr_models",
-                          format_func=lambda m: f"L{te.MODEL_SPECS[m].level} · {m}")
+                          format_func=lambda m: m)
     mode = c2.radio("Mode", list(te.TRAJ_MODES), key="tr_mode", format_func=te.TRAJ_MODES.get,
                     help="Forecast: only what is known at the training | test line (a real forecast). Measured: each "
                          "test cycle's own resistance, temperatures, charge times… (estimation; shows whether the model "
@@ -4931,7 +4926,7 @@ def trajectory_section() -> None:
                 try:
                     f = te.train_trajectory_model(ct, imp, t, sc["n0"][t], m, mode, train, float(eol_ah))
                     out.setdefault(t, []).append(f)
-                    ladder_add(f.model, te.MODEL_SPECS[m].level, sc["n0"][t], f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+                    ladder_add(f.model, 2, sc["n0"][t], f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
                 except Exception as exc:
                     st.warning(f"{m} on {t}: {exc}")
         prog.empty()
@@ -4943,9 +4938,11 @@ def trajectory_section() -> None:
         placeholder("Press 'Train trajectory models': each model's cycle-by-cycle prediction, its accuracy, the inputs it "
                     "used and what it relied on appear here.")
         return
-    entries = [{"name": f.model, "level": te.MODEL_SPECS[f.model.split(" · ")[1].replace(" (measured)", "")].level,
+    entries = [{"name": f.model, "level": 2,
                 "n_grid": f.n_grid, "soh": f.soh, "lo": f.lo, "hi": f.hi, "m": f.metrics, "target": show_t} for f in res]
-    show(fig_ladder(entries, res[0].n0, P, "Trajectory models", show_t), key="tr_fig", export=False)
+    if res[0].origin_note:
+        st.warning(res[0].origin_note)
+    show(fig_ladder(entries, res[0].n0, P, "Level 2 · Machine learning", show_t), key="tr_fig", export=False)
     rows = [{"Model": f.model, "Accuracy (%)": f.metrics.accuracy, "RMSE": f.metrics.rmse, "Coverage": f.metrics.coverage,
              "CV RMSE (held-out batteries)": f.cv_rmse, "Training batteries": len(f.train_cells), "Time (s)": f.fit_seconds}
             for f in res]
@@ -4970,9 +4967,7 @@ def view_models() -> None:
     if not sc["targets"]:
         return
     ladder_intro()
-    ml_methods_panel()
     ladder_baselines()
-    ml_section()
     trajectory_section()
     ladder_leaderboard()
     assessment_section()
