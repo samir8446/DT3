@@ -975,6 +975,31 @@ def test_xgboost_lightgbm_svm_integration_and_ensemble():
             sys.modules.pop(n, None)
 
 
+def test_smooth_multi_horizon_forecast_fleet_shape_and_assessment():
+    m, imp, _ = te.make_synthetic_master(n_cells=5, n_cycles=110, ambients=(24,) * 5, seed=3, noise_v=0.01,
+                                         knee={i: (28 + 3 * i, 2.2) for i in range(5)})
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    assert len(te.V2_HORIZONS) >= 10
+    for bl in ("trend", "shape"):
+        f = te.train_ml_v2(ct, "S001", 30, "Bayesian Ridge", eol_ah=1.6, baseline=bl)
+        fut = f.n_grid > 30
+        assert f.baseline == bl and f.baseline_curve is not None
+        assert np.all(np.diff(f.soh_pred[fut]) <= 1e-12)                              # never rises
+        inside = f.n_grid[fut] - 30 <= max(te.V2_HORIZONS)
+        assert np.abs(np.diff(f.soh_pred[fut][inside], 2)).max() < 0.004            # smooth: no sharp kinks
+    shape = te.fleet_shape(ct, ["S002", "S003", "S004", "S005"])
+    assert np.all(np.diff(shape[1]) <= 1e-12)
+    fs = te.fleet_shape_forecast(ct, "S001", 30, 1.6, ["S002", "S003", "S004", "S005"])
+    assert "S001" not in fs.params["pool"] and np.isfinite(fs.metrics.rmse)
+    cells = te.protocol_cells(ct, "Reference")
+    res = te.run_protocol(store, ct, imp, cells, ["persistence", "trend", "shape", "ml:Bayesian Ridge", "bogus"], (0.3,), 1.6)
+    assert len(res) == len(cells) * 5 and (res[res["key"] == "bogus"]["status"].str.startswith("failed")).all()
+    sb = te.protocol_scoreboard(res)
+    assert (sb["Batteries"] == len(cells)).all() and sb.loc[sb.attrs["best_baseline"], "vs best baseline"] == "reference"
+    assert sb.loc["Persistence (SOH stays)", "RMSE (SOH pts)"] > sb.loc["Fleet shape", "RMSE (SOH pts)"]
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

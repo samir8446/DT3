@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.5.1"
+ENGINE_VERSION = "5.5.2"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -6595,7 +6595,7 @@ def spm_forecast(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float = DEFAUL
 # =============================================================================
 # 29. ML v2: state features at the origin, cleaned history, direct multi-horizon forecasting
 # =============================================================================
-V2_HORIZONS = (10, 20, 40, 60, 80, 100, 140)
+V2_HORIZONS = (5, 10, 15, 20, 30, 40, 50, 60, 80, 100, 120, 140)
 V2_EXCLUDED_GROUPS = ("Mixed conditions", "Corrupted logging", "Pulsed load")
 V2_FEATURES = {
     "soh_now": "SOH now (cleaned)", "soh_slope": "SOH trend, last 10 cycles",
@@ -6606,6 +6606,7 @@ V2_FEATURES = {
     "cum_ah": "Cumulative throughput (Ah)", "ah_cycle": "Ah per cycle",
     "arrhenius": "Arrhenius factor (cell temperature)", "c_rate": "C-rate", "v_cut": "Cut-off voltage",
     "dq_logvar": "ΔQ(V) variance (log10), cycle 2 → now",
+    "soh_slope_ah": "SOH trend per Ah, last 20 cycles",
 }
 
 
@@ -6633,6 +6634,74 @@ def clean_capacity(d: pd.DataFrame, after: int = 2) -> pd.DataFrame:
 def _slope(x: np.ndarray, y: np.ndarray) -> float:
     m = np.isfinite(x) & np.isfinite(y)
     return float(np.polyfit(x[m], y[m], 1)[0]) if m.sum() >= 3 and np.ptp(x[m]) > 0 else 0.0
+
+
+def _slope_ah(h: pd.DataFrame, window: int = 20) -> float:
+    """Robust (Theil-Sen) fade per Ah of throughput over the last `window` cleaned cycles, x100 (SOH % per Ah)."""
+    from scipy.stats import theilslopes
+
+    t = h.tail(window)
+    if len(t) < 5 or "cum_Ah" not in t or np.ptp(t["cum_Ah"]) <= 0:
+        return 0.0
+    col = "SOH_causal" if "SOH_causal" in t else "SOH"
+    return 100 * min(float(theilslopes(t[col], t["cum_Ah"])[0]), 0.0)
+
+
+def fleet_shape(ct: pd.DataFrame, cells: Sequence[str], n_grid: int = 300) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Typical fade shape of comparable batteries: median cleaned SOH against Ah throughput (where at least two
+    batteries have data), extended beyond the longest history with the final slope, non-increasing."""
+    curves = []
+    for c in cells:
+        d = ct[ct["Cell_ID"] == c]
+        if d[~d["outlier"]].shape[0] < 10:
+            continue
+        dc = clean_capacity(d)
+        A = dc["cum_Ah"].to_numpy(float) - float(dc["cum_Ah"].iloc[0])
+        curves.append((A, dc["SOH_clean"].to_numpy(float)))
+    if not curves:
+        return None
+    a_max = max(c[0].max() for c in curves)
+    grid = np.linspace(0, a_max, n_grid)
+    M = np.full((len(curves), n_grid), np.nan)
+    for i, (A, S) in enumerate(curves):
+        ok = grid <= A.max()
+        M[i, ok] = np.interp(grid[ok], A, S)
+    cnt = np.isfinite(M).sum(axis=0)
+    need = 2 if len(curves) >= 2 else 1
+    F = np.where(cnt >= need, np.nanmedian(np.where(np.isfinite(M), M, np.nan), axis=0), np.nan)
+    ok = np.isfinite(F)
+    if ok.sum() < 5:
+        return None
+    grid, F = grid[ok], np.minimum.accumulate(F[ok])
+    return grid, F
+
+
+def _shape_at(shape: Tuple[np.ndarray, np.ndarray], a: np.ndarray) -> np.ndarray:
+    A, F = shape
+    tail = max(5, len(A) // 7)
+    slope = min((F[-1] - F[-tail]) / max(A[-1] - A[-tail], 1e-9), 0.0)
+    a = np.asarray(a, float)
+    return np.where(a <= A[-1], np.interp(a, A, F), F[-1] + slope * (a - A[-1]))
+
+
+def shape_drop(shape: Tuple[np.ndarray, np.ndarray], s0: float, slope_ah: float, dah: float,
+               horizons: np.ndarray, shrink: float = 0.7) -> np.ndarray:
+    """SOH drop at each horizon (cycles) predicted by the fleet shape for a battery now at SOH s0 that fades at
+    `slope_ah` (SOH per Ah): place the battery at the fleet's equivalent age (same SOH), estimate its speed
+    relative to the fleet there (k, shrunk towards 1 and bounded), then follow the fleet curve at that speed.
+    Unlike a straight line this bends where batteries of this type bend (end of the early plateau, knee)."""
+    A, F = shape
+    a_star = 0.0 if s0 >= F[0] else float(np.interp(s0, F[::-1], A[::-1]))
+    w = max(15 * dah, A[1] - A[0])
+    lo_a = max(a_star - w, 0.0)
+    hi_a = lo_a + w if a_star - lo_a < 0.5 * w else a_star
+    fs = float((_shape_at(shape, [hi_a])[0] - _shape_at(shape, [lo_a])[0]) / max(hi_a - lo_a, 1e-9))
+    if fs < -1e-9 and slope_ah < 0:
+        k = float(np.exp(shrink * np.log(np.clip(slope_ah / fs, 0.4, 2.5))))
+    else:
+        k = 1.0
+    base = _shape_at(shape, [a_star])[0]
+    return _shape_at(shape, a_star + k * dah * np.asarray(horizons, float)) - base
 
 
 def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> Dict[str, float]:
@@ -6671,17 +6740,19 @@ def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> 
             "ah_cycle": float(np.median(da[da > 0])) if (da > 0).any() else 2.0,
             "arrhenius": math.exp(30e3 / R_GAS * (1 / 298.15 - 1 / T)), "c_rate": I / max(c_bol, 1e-6),
             "v_cut": float(h["V_min_V"].median()) if "V_min_V" in h else 2.7,
-            "dq_logvar": delta_q_stats(h, 2, k)["dq_logvar"] if k >= 6 else np.nan}
+            "dq_logvar": delta_q_stats(h, 2, k)["dq_logvar"] if k >= 6 else np.nan,
+            "soh_slope_ah": _slope_ah(h)}
 
 
-def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], step: int = 3, k_min: int = 8
-                ) -> pd.DataFrame:
+def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], step: int = 3, k_min: int = 8,
+                baseline: str = "trend", target: Optional[str] = None) -> pd.DataFrame:
     """Training table: for every cell and origin k, the state features at k and the SOH drop at each horizon."""
     rows = []
     for c in cells:
         d = ct[ct["Cell_ID"] == c]
         if d.empty:
             continue
+        shape_c = fleet_shape(ct, [x for x in cells if x not in (c, target)]) if baseline == "shape" else None
         dc = clean_capacity(d)
         lim = limits.get(c, int(dc["n"].max()))
         n_arr, s_arr = dc["n"].to_numpy(float), dc["SOH_clean"].to_numpy(float)
@@ -6692,11 +6763,13 @@ def _v2_samples(ct: pd.DataFrame, cells: Sequence[str], limits: Dict[str, int], 
             except ValueError:
                 continue
             s_k = float(f["soh_now"])
-            rate = f["soh_slope"] / 100.0
+            hz_arr = np.array(V2_HORIZONS, float)
+            base = (shape_drop(shape_c, s_k, f["soh_slope_ah"] / 100.0, f["ah_cycle"], hz_arr) if shape_c is not None
+                    else f["soh_slope"] / 100.0 * hz_arr)
             row = {"Cell_ID": c, "k": k, **f}
-            for hz in V2_HORIZONS:
-                # label = deviation of the true drop from "the recent trend continues"
-                row[f"y{hz}"] = (float(np.interp(k + hz, n_arr, s_arr)) - s_k - rate * hz) \
+            for hz, b in zip(V2_HORIZONS, base):
+                # label = deviation of the true drop from the baseline (fleet shape or "the recent trend continues")
+                row[f"y{hz}"] = (float(np.interp(k + hz, n_arr, s_arr)) - s_k - b) \
                     if k + hz <= min(lim, n_arr.max()) else np.nan
             rows.append(row)
     return pd.DataFrame(rows)
@@ -6727,12 +6800,14 @@ class V2Forecast:
     fit_seconds: float
     correction_weight: Dict[int, float] = field(default_factory=dict)   # per horizon: 0 = pure trend, 1 = full ML
     cv_rmse: float = float("nan")      # held-out-battery error of the final (shrunk) predictor, SOH units
+    baseline_curve: Optional[np.ndarray] = None    # the baseline alone (fleet shape or straight trend) on n_grid
+    baseline: str = "trend"
 
 
 def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Random Forest",
                 eol_ah: float = DEFAULT_EOL_AH, train_cells: Optional[Sequence[str]] = None,
                 model_params: Optional[Dict[str, Any]] = None, level: float = 0.9, cv_folds: int = 3,
-                seed: int = 0, horizon_factor: float = 1.5, alpha: float = 0.2) -> V2Forecast:
+                seed: int = 0, horizon_factor: float = 1.5, alpha: float = 0.2, baseline: str = "shape") -> V2Forecast:
     """ML v2 forecaster. Forecast = the battery's own robust recent trend + a learned deviation: one regressor
     per horizon h predicts how far the true drop SOH(n0 + h) - SOH(n0) departs from "the last-15-cycle trend
     continues", from the state features at n0. With few training batteries a regularised model falls back to
@@ -6747,7 +6822,7 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
     model_params = validate_params(model_name, model_params)
     good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
     pool = v2_training_pool(ct, cell_id, train_cells)
-    tab = _v2_samples(ct, pool + [cell_id], {cell_id: n0})
+    tab = _v2_samples(ct, pool + [cell_id], {cell_id: n0}, baseline=baseline, target=cell_id)
     feats = list(V2_FEATURES)
     if len(tab) < 20:
         raise ValueError("ML v2: not enough training origins (choose more training batteries).")
@@ -6815,10 +6890,15 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
             imp_rows = pd.DataFrame({"key": feats, "Indicator": [V2_FEATURES[f] for f in feats],
                                      "Importance (ΔRMSE)": vals, "std": 0.0}).sort_values("Importance (ΔRMSE)", ascending=False)
     hz = np.array(V2_HORIZONS, float)
-    rate0 = f0["soh_slope"] / 100.0
-    P_ = np.array(preds, float) + rate0 * hz            # recent trend + learned deviation (acceleration, knees)
-    los = list(np.array(los, float) + rate0 * hz)
-    his = list(np.array(his, float) + rate0 * hz)
+    shape_t = fleet_shape(ct, pool) if baseline == "shape" else None
+    if shape_t is not None:
+        base0 = shape_drop(shape_t, float(f0["soh_now"]), f0["soh_slope_ah"] / 100.0, f0["ah_cycle"], hz)
+    else:
+        base0 = f0["soh_slope"] / 100.0 * hz
+        baseline = "trend"
+    P_ = np.array(preds, float) + base0                 # baseline + learned deviation (acceleration, knees)
+    los = list(np.array(los, float) + base0)
+    his = list(np.array(his, float) + base0)
     ok = np.isfinite(P_)
     if ok.sum() < 2:
         raise ValueError("ML v2: too few horizons could be trained.")
@@ -6832,21 +6912,26 @@ def train_ml_v2(ct: pd.DataFrame, cell_id: str, n0: int, model_name: str = "Rand
     tail_rate = (P_[-1] - P_[-2]) / (hz[-1] - hz[-2]) if len(P_) >= 2 else 0.0
 
     def curve(vals):
-        xs, ys = np.concatenate([[0.0], hz]), np.concatenate([[0.0], vals])
-        out = np.interp(h_f, xs, ys)
+        # smooth, shape-preserving (monotone) curve through the horizons instead of straight segments
+        from scipy.interpolate import PchipInterpolator
+        xs, ys = np.concatenate([[0.0], hz]), np.minimum.accumulate(np.concatenate([[0.0], vals]))
+        out = PchipInterpolator(xs, ys, extrapolate=False)(np.minimum(h_f, xs[-1]))
         beyond = h_f > xs[-1]
         out[beyond] = ys[-1] + min(tail_rate, 0.0) * (h_f[beyond] - xs[-1])
         return out
 
     past = np.interp(n_grid, good["n"], good["SOH"])
     med_c = np.where(n_grid > n0, np.clip(s0 + curve(P_), 0.0, 1.05), past)
+    b_ok = np.minimum.accumulate(np.minimum(base0[ok], 0.0))
+    base_c = np.where(n_grid > n0, np.clip(s0 + curve(b_ok), 0.0, 1.05), past)
     lo_c = np.where(n_grid > n0, np.clip(s0 + curve(L_), 0.0, 1.05), past)
     hi_c = np.where(n_grid > n0, np.clip(s0 + curve(H_), 0.0, 1.05), past)
     soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
     metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), n_grid, med_c, n0, soh_eol, lo_c, hi_c, alpha)
     return V2Forecast(f"ML v2 · {model_name}", cell_id, n0, n_grid, med_c, lo_c, hi_c, metrics,
                       imp_rows if imp_rows is not None else pd.DataFrame(), f0, pool, time.time() - t0,
-                      dict(zip(V2_HORIZONS, shrink_w)), float(np.sqrt(np.mean(cv_sq))) if cv_sq else float("nan"))
+                      dict(zip(V2_HORIZONS, shrink_w)), float(np.sqrt(np.mean(cv_sq))) if cv_sq else float("nan"),
+                      base_c, baseline)
 
 
 # =============================================================================
@@ -7109,3 +7194,222 @@ def ml_v2_ensemble(members: Sequence["V2Forecast"], ct: pd.DataFrame, eol_ah: fl
     fc = ProgForecast("ML ensemble (v2)", grid, mean, mean - half, mean + half, None,
                       {"weights": {m.model: float(x) for m, x in zip(ms, w)}})
     return _v2_finish(fc, ct, ms[0].cell_id, ms[0].n0, eol_ah, "ML ensemble (v2)", alpha)
+
+
+# =============================================================================
+# 32. FORECASTING WORKFLOW: one protocol, one registry, one scoreboard
+# =============================================================================
+# Every model is evaluated the same way: within one condition group, each battery is held out in turn (trained on
+# the others plus its own cycles up to the origin), forecasts are made from fixed shares of its life and scored on
+# all its later measured cycles. Errors in SOH points (x100), end-of-life error in cycles, band coverage.
+PROTOCOL_ORIGINS = (0.3, 0.5, 0.7)
+
+
+def fleet_shape_forecast(ct: pd.DataFrame, cell_id: str, n0: int, eol_ah: float = DEFAULT_EOL_AH,
+                         train_cells: Optional[Sequence[str]] = None, level: float = 0.9,
+                         horizon_factor: float = 1.5) -> ProgForecast:
+    """Baseline 3: the typical fade curve of the training batteries placed at this battery's state and speed. The
+    band comes from how well the same construction forecast each training battery from the same share of life."""
+    pool = [c for c in (train_cells if train_cells is not None else v2_training_pool(ct, cell_id)) if c != cell_id]
+    shape = fleet_shape(ct, pool)
+    if shape is None:
+        raise ValueError("fleet shape: not enough training batteries")
+    good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
+    dc = clean_capacity(ct[(ct["Cell_ID"] == cell_id) & (ct["n"] <= n0)])
+    f0 = state_features(dc, n0, float(good["C_bol_Ah"].iloc[0]))
+    n_grid = np.arange(1, int(good["n"].max() * horizon_factor) + 1)
+    h = np.maximum(n_grid - n0, 0).astype(float)
+    med = f0["soh_now"] + shape_drop(shape, f0["soh_now"], f0["soh_slope_ah"] / 100, f0["ah_cycle"], h)
+    frac = n0 / max(float(good["n"].max()), 1.0)
+    errs = []                                            # leave-one-out error of the construction on the pool
+    for c in pool:
+        try:
+            gc = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
+            k = int(max(10, round(frac * gc["n"].max())))
+            sh_c = fleet_shape(ct, [x for x in pool if x != c])
+            if sh_c is None:
+                continue
+            dcc = clean_capacity(ct[(ct["Cell_ID"] == c) & (ct["n"] <= k)])
+            fc0 = state_features(dcc, k, float(gc["C_bol_Ah"].iloc[0]))
+            fut = gc[gc["n"] > k]
+            p = fc0["soh_now"] + shape_drop(sh_c, fc0["soh_now"], fc0["soh_slope_ah"] / 100, fc0["ah_cycle"],
+                                            (fut["n"] - k).to_numpy(float))
+            errs.append(np.column_stack([(fut["n"] - k).to_numpy(float), np.abs(p - fut["SOH"].to_numpy())]))
+        except Exception:
+            continue
+    if errs:
+        E = np.vstack(errs)
+        bins = np.array([0, 20, 40, 80, 1e9])
+        q = [float(np.quantile(E[(E[:, 0] > a) & (E[:, 0] <= b), 1], level)) if ((E[:, 0] > a) & (E[:, 0] <= b)).sum() >= 5
+             else np.nan for a, b in zip(bins[:-1], bins[1:])]
+        q = pd.Series(q).ffill().bfill().fillna(0.03).to_numpy()
+        half = q[np.clip(np.searchsorted(bins, h, side="left") - 1, 0, len(q) - 1)]
+    else:
+        half = 0.01 + 0.0005 * h
+    past = np.interp(n_grid, good["n"], good["SOH"])
+    fc = ProgForecast("Baseline · fleet shape", n_grid, np.where(n_grid > n0, med, past),
+                      np.where(n_grid > n0, med - half, past), np.where(n_grid > n0, med + half, past), None,
+                      {"pool": pool})
+    return _v2_finish(fc, ct, cell_id, n0, eol_ah, "Baseline · fleet shape")
+
+
+PROTOCOL_MODELS: Dict[str, Tuple[str, str]] = {
+    # key: (family, label)
+    "persistence": ("Baselines", "Persistence (SOH stays)"),
+    "trend": ("Baselines", "Linear trend"),
+    "shape": ("Baselines", "Fleet shape"),
+    "hb": ("Statistical / Bayesian", "Hierarchical Bayes"),
+    "ml:Bayesian Ridge": ("Machine learning", "ML v2 · Bayesian Ridge"),
+    "ml:Random Forest": ("Machine learning", "ML v2 · Random Forest"),
+    "ml:SVM": ("Machine learning", "ML v2 · SVM"),
+    "ml:Gaussian Process": ("Machine learning", "ML v2 · Gaussian Process"),
+    "ml:Decision Tree": ("Machine learning", "ML v2 · Decision Tree"),
+    "ml:XGBoost": ("Machine learning", "ML v2 · XGBoost"),
+    "ml:LightGBM": ("Machine learning", "ML v2 · LightGBM"),
+    "deep:GRU (recurrent network)": ("Deep learning", "GRU"),
+    "deep:Transformer (self-attention)": ("Deep learning", "Transformer"),
+    "spm": ("Physics", "Single-particle model + SEI"),
+    "pinn": ("Physics", "Mechanistic PINN"),
+}
+PROTOCOL_FAMILIES = ("Baselines", "Statistical / Bayesian", "Machine learning", "Deep learning", "Physics")
+
+
+def _protocol_forecast(key: str, store: Any, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n0: int,
+                       train: List[str], eol_ah: float) -> Any:
+    if key == "persistence":
+        return baseline_forecast_v2(ct, cell, n0, "persistence", eol_ah)
+    if key == "trend":
+        return baseline_forecast_v2(ct, cell, n0, "trend", eol_ah)
+    if key == "shape":
+        return fleet_shape_forecast(ct, cell, n0, eol_ah, train)
+    if key == "hb":
+        return hierarchical_bayes_forecast_v2(ct, cell, n0, eol_ah, train_cells=train)
+    if key.startswith("ml:"):
+        f = train_ml_v2(ct, cell, n0, key[3:], eol_ah, train)
+        return ProgForecast(f.model, f.n_grid, f.soh_pred, f.soh_lo, f.soh_hi, None, {}, f.metrics)
+    if key.startswith("deep:"):
+        return seq_forecast_v2(ct, cell, n0, key[5:], eol_ah, epochs=120, n_members=1, train_cells=train)
+    if key == "spm":
+        return spm_forecast_v2(ct, cell, n0, eol_ah, train_cells=train)
+    if key == "pinn":
+        return pinn_forecast_v2(ct, imp, cell, n0, PINNConfig(epochs=800, physics="mechanistic"), eol_ah, train)
+    raise ValueError(f"unknown model {key}")
+
+
+def protocol_cells(ct: pd.DataFrame, group: str, min_cycles: int = 25) -> List[str]:
+    g = condition_groups(ct)
+    return [c for c in g.index if g.loc[c, "Group"] == group and g.loc[c, "cycles"] >= min_cycles]
+
+
+def run_protocol(store: Any, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str],
+                 models: Sequence[str], origins: Sequence[float] = PROTOCOL_ORIGINS, eol_ah: float = DEFAULT_EOL_AH,
+                 eol_k: int = 3, progress: ProgressFn = None) -> pd.DataFrame:
+    """Evaluate models with the one protocol: leave-one-battery-out among `cells`, forecasts from each origin
+    (share of the battery's recorded life), scored on all later measured cycles. One row per
+    (battery, origin, model); failures are kept as rows with status (never silently dropped)."""
+    rows = []
+    cells = list(cells)
+    total = max(len(cells) * len(origins) * len(models), 1)
+    k_ = 0
+    for c in cells:
+        good = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
+        n_last = int(good["n"].max())
+        soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
+        eol_true, eol_status = eol_crossing(good["n"].to_numpy(), good["SOH"].to_numpy(), soh_eol, eol_k)
+        train = [x for x in cells if x != c]
+        for o in origins:
+            n0 = int(max(10, round(o * n_last)))
+            fut = good[good["n"] > n0]
+            for key in models:
+                k_ += 1
+                _report(progress, k_ / total, f"{c} · {int(100 * o)}% · {PROTOCOL_MODELS.get(key, (None, key))[1]}")
+                fam, label = PROTOCOL_MODELS.get(key, ("Other", key))
+                row = {"Cell_ID": c, "origin": o, "n0": n0, "model": label, "key": key, "family": fam,
+                       "test cycles": len(fut), "EOL true": eol_true}
+                if len(fut) < 5:
+                    rows.append({**row, "status": "too few test cycles"})
+                    continue
+                try:
+                    f = _protocol_forecast(key, store, ct, imp, c, n0, train, eol_ah)
+                    p = np.interp(fut["n"], f.n_grid, f.soh)
+                    e = (p - fut["SOH"].to_numpy()) * 100
+                    cov = np.nan
+                    if f.lo is not None and f.hi is not None:
+                        lo, hi = np.interp(fut["n"], f.n_grid, f.lo), np.interp(fut["n"], f.n_grid, f.hi)
+                        cov = float(np.mean((fut["SOH"] >= lo) & (fut["SOH"] <= hi)))
+                    fut_pred = f.n_grid > n0
+                    cross = np.nonzero(fut_pred & (f.soh < soh_eol))[0]
+                    eol_pred = int(f.n_grid[cross[0]]) if len(cross) else None
+                    eol_err = (eol_pred - eol_true) if (eol_pred is not None and eol_true is not None and eol_true > n0) else np.nan
+                    rows.append({**row, "status": "ok", "RMSE (SOH pts)": float(np.sqrt(np.mean(e ** 2))),
+                                 "MAE (SOH pts)": float(np.mean(np.abs(e))), "bias (SOH pts)": float(np.mean(e)),
+                                 "coverage": cov, "EOL pred": eol_pred, "EOL error (cycles)": eol_err,
+                                 "EOL status": eol_status if eol_true is None else ("before origin" if eol_true <= n0 else "scored")})
+                except Exception as exc:
+                    rows.append({**row, "status": f"failed: {type(exc).__name__}: {str(exc)[:80]}"})
+    _report(progress, 1.0, "protocol done")
+    return pd.DataFrame(rows)
+
+
+def protocol_scoreboard(res: pd.DataFrame, baseline_label: Optional[str] = None) -> pd.DataFrame:
+    """One row per model: error averaged per battery first (no pseudo-replication), mean with a 95 % t-interval
+    across batteries, end-of-life error, coverage, and whether it beats the best baseline on the same batteries
+    (paired per battery; Wilcoxon p-value when >= 5 batteries)."""
+    from scipy.stats import t as t_dist, wilcoxon
+
+    ok = res[res["status"] == "ok"]
+    if ok.empty:
+        return pd.DataFrame()
+    per = ok.groupby(["model", "family", "Cell_ID"]).agg(rmse=("RMSE (SOH pts)", "mean"),
+                                                         eol=("EOL error (cycles)", lambda x: float(np.nanmean(np.abs(x))) if x.notna().any() else np.nan),
+                                                         cov=("coverage", "mean")).reset_index()
+    base = per[per["family"] == "Baselines"].groupby("model")["rmse"].mean()
+    best_base = baseline_label or (base.idxmin() if len(base) else None)
+    bpc = per[per["model"] == best_base].set_index("Cell_ID")["rmse"] if best_base else pd.Series(dtype=float)
+    rows = []
+    for (m, fam), d in per.groupby(["model", "family"]):
+        x = d["rmse"].to_numpy()
+        n = len(x)
+        half = float(t_dist.ppf(0.975, n - 1) * x.std(ddof=1) / np.sqrt(n)) if n >= 2 else np.nan
+        paired = d.set_index("Cell_ID")["rmse"].reindex(bpc.index).dropna()
+        b = bpc.reindex(paired.index)
+        diff = (paired - b).to_numpy()
+        if m == best_base or not len(diff):
+            verdict, p = ("reference" if m == best_base else "—"), np.nan
+        else:
+            p = float(wilcoxon(paired, b).pvalue) if len(diff) >= 5 and np.any(diff != 0) else np.nan
+            wins = int(np.sum(diff < 0))
+            if np.isfinite(p) and p < 0.05:
+                verdict = "better than baseline" if np.median(diff) < 0 else "worse than baseline"
+            else:
+                verdict = f"no clear difference ({wins}/{len(diff)} batteries better)"
+        fails = int(((res["model"] == m) & (res["status"] != "ok")).sum())
+        rows.append({"Model": m, "Family": fam, "Batteries": n, "RMSE (SOH pts)": float(x.mean()), "95% CI ±": half,
+                     "EOL |error| (cycles)": float(np.nanmean(d["eol"])) if d["eol"].notna().any() else np.nan,
+                     "Coverage": float(np.nanmean(d["cov"])) if d["cov"].notna().any() else np.nan,
+                     "vs best baseline": verdict, "p (Wilcoxon)": p, "Failed runs": fails})
+    out = pd.DataFrame(rows).sort_values("RMSE (SOH pts)").set_index("Model")
+    out.attrs["best_baseline"] = best_base
+    return out
+
+
+def estimation_protocol(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], models: Sequence[str],
+                        features: Sequence[str], progress: ProgressFn = None) -> pd.DataFrame:
+    """SOH-now estimation with the same discipline: each battery of the group held out in turn (trained on the
+    others), features chosen from the Diagnostics health-indicator ranking (capacity-derived ones excluded)."""
+    feats = [f for f in features if f not in CAPACITY_LEAKS]
+    rows = []
+    cells = list(cells)
+    for i, c in enumerate(cells):
+        for m in models:
+            _report(progress, (i + models.index(m) / len(models)) / max(len(cells), 1), f"estimation · {c} · {m}")
+            try:
+                r = train_soh_estimator(ct, imp, m, features=tuple(feats), split="by_cell",
+                                        train_cells=[x for x in cells if x != c], test_cells=[c])
+                te_p = r.predictions[r.predictions["set"] == "test"]
+                e = (te_p["SOH_pred"] - te_p["SOH"]).to_numpy() * 100
+                rows.append({"Cell_ID": c, "model": m, "RMSE (SOH pts)": float(np.sqrt(np.mean(e ** 2))),
+                             "MAE (SOH pts)": float(np.mean(np.abs(e))), "cycles": len(te_p), "status": "ok"})
+            except Exception as exc:
+                rows.append({"Cell_ID": c, "model": m, "status": f"failed: {str(exc)[:80]}"})
+    return pd.DataFrame(rows)

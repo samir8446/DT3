@@ -1,9 +1,23 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.5.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.5.2)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Forecast shape and accuracy assessment (v5.5.2)
+
+- ML v2 predicts 12 horizons (+5 … +140 cycles) joined by a smooth, monotone (PCHIP) curve instead of 7 points
+  joined by straight segments.
+- Fleet-shape baseline (`fleet_shape`, `shape_drop`, `fleet_shape_forecast`): the typical fade curve of similar
+  batteries, placed at this battery's state and speed. Third Level 1 baseline, and ML v2's default starting
+  point (option: straight trend).
+- Accuracy assessment (`run_protocol`, `protocol_scoreboard`): each battery of a condition group held out in turn,
+  several origins, per-battery averaging, 95 % CI, paired verdict against the best baseline, CSV export.
+Synthetic check (6 early-knee batteries with recovery jumps, ML v2 with Bayesian Ridge and Random Forest, 3 test
+batteries, mean RMSE from 15 % / 40 % of life): v5.5.1 0.0619 / 0.0375; smooth horizons + straight trend
+0.0573 / 0.0359; smooth horizons + fleet shape (default) 0.0301 / 0.0346. The fleet shape gives the main gain,
+mostly at early origins; smoothing alone helps little.
 
 ## Models view in v5.5.1
 
@@ -25,7 +39,7 @@ are developed and validated.
 ```bash
 pip install -r requirements.txt
 streamlit run app.py                     # "Load synthetic demo cohort" works without data
-pytest                                   # 69 tests (pip install -r requirements-dev.txt)
+pytest                                   # 70 tests (pip install -r requirements-dev.txt)
 python study.py --master data/battery_master_data.parquet --imp data/impedance.parquet --out results/study
 python study.py --synthetic --out results/study_demo
 pip install -r requirements-service.txt && uvicorn service:app --port 8000   # streaming REST service
@@ -44,7 +58,7 @@ on the engine version, so engine updates always recompute.
 | `study.py` | Offline cohort study → CSVs, `summary.md`, manifest |
 | `service.py` | Streaming twin: framework-free `TwinRegistry` + optional FastAPI endpoints |
 | `benchmark.py` | Offline forecast-origin sweep (ML, Twin, PINN, HB) |
-| `tests/test_twin_engine.py` | 69 tests: gradient checks, synthetic-truth recovery, every model and study function |
+| `tests/test_twin_engine.py` | 70 tests: gradient checks, synthetic-truth recovery, every model and study function |
 
 ## Views
 

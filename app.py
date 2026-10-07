@@ -558,6 +558,7 @@ EXPLAIN: Dict[str, str] = {
     "abl_fig": "The twin re-run with different measurement sets: the gap between open loop and voltage-only is the information the sensors add (Mission 2).",
     "uf_fig": "Tracking accuracy when the twin is updated every m cycles: it shows how rarely the twin can be updated without losing accuracy (Mission 2).",
     # models
+    "acc_board": "Every model with the same held-out batteries and origins. Bars: mean error ± 95% CI; dashed line: the best baseline. A model is only worth using if it beats that line clearly.",
     "lad_base": "Level 1 references: 'nothing changes' (persistence) and 'the recent straight line continues' (linear trend). A model is only useful if it beats these.",
     "lad_deep": "Level 4 deep sequence models (GRU, Transformer) read a window of past SOH values and predict the next cycle, repeatedly, to build the forecast.",
     "lad_hybrid": "Level 5 hybrid models combine physics equations with learning: the mechanistic PINN obeys the degradation kinetics; hierarchical Bayes combines a physics law with fleet knowledge.",
@@ -2261,11 +2262,9 @@ def update_cohort_cached(_store: Any, _ct: pd.DataFrame, _imp: Optional[pd.DataF
 
 @st.cache_data(show_spinner=False, max_entries=64)
 def ml_v2_cached(_ct: pd.DataFrame, key: str, cell: str, n0: int, model: str, eol_ah: float, level: float,
-                 train_cells: Optional[Tuple[str, ...]], params_json: str) -> Any:
+                 train_cells: Optional[Tuple[str, ...]], params_json: str, baseline: str = "shape") -> Any:
     tc = None if train_cells is None else list(train_cells)
-    if tc == []:
-        tc = []                                          # 'this battery only': its own history
-    return te.train_ml_v2(_ct, cell, n0, model, eol_ah, tc, json.loads(params_json) or None, level)
+    return te.train_ml_v2(_ct, cell, n0, model, eol_ah, tc, json.loads(params_json) or None, level, baseline=baseline)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -3891,9 +3890,19 @@ def tuning_block(task: str, models: Sequence[str], params: Dict[str, Dict[str, A
 
 def ml_v2_panel(res: Sequence[Any], target: str) -> None:
     """ML v2 results: forecasts, how much each horizon trusted its correction, and which measurements matter."""
-    st.markdown(f"**ML v2 on {target}** · trend of the battery's own recent fade + a learned deviation")
+    bl = getattr(res[0], "baseline", "trend")
+    st.markdown(f"**ML v2 on {target}** · "
+                f"{'fleet-shape baseline' if bl == 'shape' else 'straight-trend baseline'} + a learned correction")
     entries = [{"name": r.model, "level": te.MODEL_SPECS[r.model.split(" · ")[1]].level, "n_grid": r.n_grid,
                 "soh": r.soh_pred, "lo": r.soh_lo, "hi": r.soh_hi, "m": r.metrics, "target": target} for r in res]
+    if getattr(res[0], "baseline_curve", None) is not None:
+        entries.append({"name": "Baseline alone (" + ("fleet shape" if bl == "shape" else "straight trend") + ")",
+                        "level": 1, "n_grid": res[0].n_grid, "soh": res[0].baseline_curve, "lo": None, "hi": None,
+                        "m": None, "target": target})
+    trust = [np.nanmean([v for v in r.correction_weight.values() if np.isfinite(v)] or [0.0]) for r in res]
+    if max(trust) < 0.1:
+        note("The learned corrections did not beat the baseline on held-out batteries, so the forecasts follow the "
+             "baseline. That is the honest outcome with few training batteries; the assessment below quantifies it.")
     show(fig_ladder(entries, res[0].n0, P, "ML v2 forecasts", target), key="ml_v2_fig", export=False)
     rows = []
     for r in res:
@@ -3955,6 +3964,12 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
                   train_cells=train_cells, eol_ah=float(eol_ah), strategy=strategy, conformal_cells=conf,
                   band_level=level, params={m: params.get(m) for m in models})
     version = scheme().get("gen", "v2")
+    if version in ("v2", "both"):
+        st.radio("ML v2 baseline", ["shape", "trend"], horizontal=True, key="ml_baseline",
+                 format_func={"shape": "Fleet shape (typical curve of similar batteries)",
+                              "trend": "Straight recent trend"}.get,
+                 help="ML v2 forecasts = baseline + a learned correction. The fleet shape bends where batteries of this "
+                      "type bend; the straight trend continues the last cycles' slope. Compare both in the assessment.")
     st.caption({"v2": "Generation v2: state features at the origin, the battery's own trend + a learned, "
                       "cross-validated deviation.", "v1": "Generation v1: fade-rate law of SOH and conditions.",
                 "both": "Both generations run; compare them on the leaderboard."}[version])
@@ -3984,7 +3999,8 @@ def ml_forecast_tab(models: Sequence[str], params: Dict[str, Dict[str, Any]]) ->
                     try:
                         v2 = ml_v2_cached(ct, DATA_KEY, t, sc["n0"][t], mname, float(eol_ah), level,
                                           train_cells if source == "cross" else (None if source == "cohort" else ()),
-                                          json.dumps(params.get(mname, {}) if version == "v2" else {}, sort_keys=True))
+                                          json.dumps(params.get(mname, {}) if version == "v2" else {}, sort_keys=True),
+                                          st.session_state.get("ml_baseline", "shape"))
                         v2_by_target.setdefault(t, []).append(v2)
                         ladder_add(v2.model, lvl, sc["n0"][t], v2.n_grid, v2.soh_pred, v2.soh_lo, v2.soh_hi,
                                    v2.metrics, t)
@@ -4533,6 +4549,7 @@ def fig_ladder(entries: Sequence[Dict[str, Any]], n0: int, P: Palette, title: st
 
 def _ladder_table(entries: Sequence[Dict[str, Any]]) -> pd.DataFrame:
     """Per model: metrics averaged over the test batteries (one row per model)."""
+    entries = [e for e in entries if e.get("m") is not None]
     rows = [{"Level": f"L{e['level']} · {LEVEL_INFO[e['level']][0]}", "Model": e["name"], "Battery": e["target"],
              "Accuracy (%)": e["m"].accuracy, "RMSE": e["m"].rmse, "Fade skill": e["m"].fade_skill,
              "Coverage": e["m"].coverage, "RUL error": e["m"].rul_error} for e in entries if e["m"] is not None]
@@ -4597,14 +4614,19 @@ def ladder_intro() -> None:
 
 def ladder_baselines() -> None:
     section("Level 1 · Baselines: the references every model must beat")
-    st.markdown("Two forecasts that need no learning at all. If an advanced model cannot beat the **linear trend**, "
-                "its complexity is not paying off.")
+    st.markdown("Three forecasts that need no learning at all: **persistence** (SOH stays), **linear trend** (the "
+                "recent slope continues) and **fleet shape** (the typical fade curve of similar batteries, placed at this "
+                "battery's state and speed). If a model cannot beat the best of them, its complexity is not paying off.")
     if st.button("Run baselines", key="lad_b_go", icon=":material/play_arrow:", type="primary"):
+        sc_b = scheme()
         def run(t, n0):
             for kind in ("persistence", "trend"):
                 for g in gens():
                     f = (te.baseline_forecast_v2 if g == "v2" else te.baseline_forecast)(ct, t, n0, kind, float(eol_ah))
                     ladder_add(f.name, 1, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
+            f = te.fleet_shape_forecast(ct, t, n0, float(eol_ah),
+                                        list(sc_b["train"]) if sc_b["mode"] == "across" and sc_b.get("train") else None)
+            ladder_add(f.name, 1, n0, f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
         _run_targets(run, "Baselines")
     ladder_level_block(1, "lad_base")
 
@@ -4768,6 +4790,95 @@ def ladder_leaderboard() -> None:
 ACTIVE_LEVELS = (1, 2, 3)        # advanced levels (deep learning, hybrid, first principles) are added back step by step
 
 
+FAMILY_COLORS = {"Baselines": "#8C8C8C", "Machine learning": "#0072B2"}
+
+
+def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
+    d = sb.iloc[::-1]
+    fig = go.Figure(go.Bar(y=d.index, x=d["RMSE (SOH pts)"], orientation="h",
+                           marker=dict(color=[FAMILY_COLORS.get(f, P.text) for f in d["Family"]]),
+                           error_x=dict(type="data", array=d["95% CI ±"].fillna(0), color=P.muted),
+                           customdata=np.column_stack([d["Family"], d["Batteries"], d["vs best baseline"]]),
+                           hovertemplate="%{y}<br>%{x:.2f} SOH points<br>%{customdata[0]} · %{customdata[1]} batteries"
+                                         "<br>%{customdata[2]}<extra></extra>"))
+    bb = sb.attrs.get("best_baseline")
+    if bb in sb.index:
+        fig.add_vline(x=float(sb.loc[bb, "RMSE (SOH pts)"]), line_dash="dash", line_color=P.muted,
+                      annotation_text=f"best baseline: {bb}", annotation_font=dict(color=P.muted))
+    fig.update_xaxes(title_text="Forecast error, RMSE (SOH points), mean over held-out batteries ± 95% CI", rangemode="tozero")
+    return style_fig(fig, P, 140 + 36 * len(sb), "Prediction-accuracy assessment: same batteries, same protocol",
+                     hovermode="closest")
+
+
+
+
+def assessment_section() -> None:
+    section("Accuracy assessment: every model, each battery held out in turn")
+    st.markdown("One forecast on one battery is an anecdote. Here each battery of a condition group is held out in turn: "
+                "the models learn from the other batteries of the group plus the held-out battery's own cycles up to the "
+                "forecast origin, and are scored on all its later measured cycles. Results are averaged per battery, "
+                "with a 95% confidence interval and a paired comparison against the best baseline.")
+    groups = te.condition_groups(ct)
+    usable = [g for g in te.GROUP_ORDER if g in set(groups["Group"]) and g not in te.V2_EXCLUDED_GROUPS]
+    if not usable:
+        st.info("No usable condition group (mixed, corrupted and pulsed cells are excluded).")
+        return
+    my = groups.loc[cell, "Group"] if cell in groups.index and groups.loc[cell, "Group"] in usable else usable[0]
+    c1, c2 = st.columns(2)
+    grp = c1.selectbox("Condition group", usable, index=usable.index(my), key="acc_group",
+                       format_func=lambda x: f"{x} · {len(te.protocol_cells(ct, x))} batteries")
+    origins = c2.multiselect("Forecast origins (share of each battery's life)", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
+                             default=[0.3, 0.5], key="acc_origins", format_func=lambda v: f"{100 * v:.0f}%")
+    av = te.available_models()
+    options = ["persistence", "trend", "shape"] + [f"ml:{m}" for m in av]
+    keys = st.multiselect("Models (levels 1–3)", options,
+                          default=["persistence", "trend", "shape"] + [f"ml:{m}" for m in ("Bayesian Ridge", "Random Forest")
+                                                                       if m in av],
+                          key="acc_models", format_func=lambda k: te.PROTOCOL_MODELS[k][1])
+    cells_g = te.protocol_cells(ct, grp)
+    n_fc = len(cells_g) * len(origins) * len(keys)
+    if len(cells_g) < 3:
+        st.warning(f"The {grp} group has fewer than three usable batteries: nothing to learn from when one is held out.")
+    if st.button(f"Run the assessment ({n_fc} forecasts)", key="acc_go", type="primary", icon=":material/fact_check:",
+                 disabled=len(cells_g) < 3 or not keys or not origins):
+        prog = st.progress(0.0)
+        st.session_state["acc_res"] = te.run_protocol(store, ct, imp, cells_g, keys, tuple(sorted(origins)), float(eol_ah),
+                                                      progress=lambda f_, m_: prog.progress(min(max(float(f_), 0.0), 1.0), text=m_))
+        st.session_state["acc_key"] = (DATA_KEY, grp, float(eol_ah))
+        prog.empty()
+    res = st.session_state.get("acc_res")
+    if res is None or not len(res) or st.session_state.get("acc_key") != (DATA_KEY, grp, float(eol_ah)):
+        placeholder("Press 'Run the assessment': the scoreboard, the verdict against the best baseline and the error by "
+                    "forecast origin appear here.")
+        return
+    sb = te.protocol_scoreboard(res)
+    if sb.empty:
+        st.warning("No forecast succeeded: " + "; ".join(sorted(set(res["status"].astype(str).str[:70]))[:3]))
+        return
+    show(fig_scoreboard(sb, P), key="acc_board", data=sb.reset_index())
+    show_table(sb.style.format({"RMSE (SOH pts)": "{:.2f}", "95% CI ±": "{:.2f}", "EOL |error| (cycles)": "{:.1f}",
+                                "Coverage": "{:.0%}", "p (Wilcoxon)": "{:.3f}"}, na_rep="—"),
+               note="RMSE in SOH points, averaged per battery first and then across batteries (95% CI). 'vs best "
+                    "baseline' is paired on the same batteries (Wilcoxon from 5 batteries). Coverage should be near 90%.")
+    best, bb = sb.index[0], sb.attrs.get("best_baseline")
+    better = sb[sb["vs best baseline"] == "better than baseline"]
+    txt = (f"In the **{grp}** group ({sb['Batteries'].max()} batteries), the lowest error is **{best}** "
+           f"({sb.loc[best, 'RMSE (SOH pts)']:.2f} ± {sb.loc[best, '95% CI ±']:.2f} SOH points). ")
+    txt += ("Significantly better than the best baseline (" + str(bb) + "): " + ", ".join(better.index) + "."
+            if len(better) else f"No model is significantly better than the best baseline ({bb}) with these batteries.")
+    card("Verdict", [txt])
+    by_o = res[res["status"] == "ok"].groupby(["model", "origin"])["RMSE (SOH pts)"].mean().unstack()
+    by_o.columns = [f"from {100 * o:.0f}%" for o in by_o.columns]
+    show_table(by_o.loc[[m for m in sb.index if m in by_o.index]].style.format("{:.2f}", na_rep="—"),
+               note="Error by forecast origin: later origins should give smaller errors.")
+    bad = res[res["status"] != "ok"]
+    if len(bad):
+        st.caption(f"{len(bad)} forecasts failed and are counted as failures: "
+                   + "; ".join(sorted(set(bad["status"].str[:60]))[:3]))
+    download("Download the assessment (CSV)", res.to_csv(index=False).encode(), f"assessment_{grp}.csv", "text/csv",
+             key="acc_csv")
+
+
 def view_models() -> None:
     recommendations("models")
     section("Forecasting models: baselines and machine learning (levels 1–3)")
@@ -4779,6 +4890,7 @@ def view_models() -> None:
     ladder_baselines()
     ml_section()
     ladder_leaderboard()
+    assessment_section()
 
 
 # =============================================================================
