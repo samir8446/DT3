@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.5.5"
+ENGINE_VERSION = "5.6.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -7541,6 +7541,16 @@ def _traj_forecast_rows(ct: pd.DataFrame, cell: str, k: int, until: Optional[int
                          "tcv_rel0": f["tcv_rel"], "dq0": f["dq_logvar"]})
 
 
+def _make_mlp(seed: int = 0) -> Any:
+    """Feed-forward neural network on the same inputs as the Level-2 models (scaled; early stopping)."""
+    from sklearn.neural_network import MLPRegressor
+    from sklearn.pipeline import make_pipeline
+    from sklearn.preprocessing import StandardScaler
+    return make_pipeline(StandardScaler(), MLPRegressor(hidden_layer_sizes=(64, 64), alpha=1e-3, learning_rate_init=3e-3,
+                                                        max_iter=600, early_stopping=True, n_iter_no_change=25,
+                                                        random_state=seed))
+
+
 def _traj_dah(rows: pd.DataFrame) -> np.ndarray:
     """Throughput since the origin for each row (Ah) = cycles ahead x Ah per cycle, floored at 0.05 Ah."""
     return np.maximum(rows["dn"].to_numpy(float) * rows["ah_cyc"].to_numpy(float), 0.05)
@@ -7585,7 +7595,7 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
                            train_cells: Optional[Sequence[str]] = None, eol_ah: float = DEFAULT_EOL_AH,
                            level: float = 0.9, origin_fracs: Sequence[float] = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
                            step: int = 2, cv_folds: int = 3, seed: int = 0, horizon_factor: float = 1.0,
-                           target: str = "auto") -> TrajectoryForecast:
+                           target: str = "auto", importance: bool = True) -> TrajectoryForecast:
     """Learn SOH of every cycle from all training batteries and predict the target battery cycle by cycle.
     forecast mode: rows (origin k, future cycle m) from each training battery at several origins; the target is
     predicted from its own state at n0. measured mode: rows = cycles with their own measurements. The band comes
@@ -7596,7 +7606,7 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         raise ValueError(f"mode must be one of {tuple(TRAJ_MODES)}")
     if target == "auto":      # trees predict piecewise-constant values: a rate keeps them from flattening; smooth
         target = "rate" if model_name in TRAJ_RATE_MODELS else "change"     # models extrapolate the change directly
-    prm = {"degree": 1} if MODEL_SPECS[model_name].poly else None
+    prm = {"degree": 1} if (model_name in MODEL_SPECS and MODEL_SPECS[model_name].poly) else None
     pool = [c for c in (train_cells if train_cells is not None else v2_training_pool(ct, cell_id)) if c != cell_id]
     good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
     n_last = int(good["n"].max())
@@ -7648,7 +7658,8 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
 
     def fit(Xa, ya):
         Xs, ys, _ = _gp_subsample(model_name, Xa, ya, np.ones(len(ya)), seed)
-        return _StandardisedTarget(make_model(model_name, seed, prm)).fit(Xs, ys)
+        est = _make_mlp(seed) if model_name == "MLP" else make_model(model_name, seed, prm)
+        return _StandardisedTarget(est).fit(Xs, ys)
 
     rng = np.random.default_rng(seed)
     cells_u = np.unique(g)
@@ -7664,6 +7675,8 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         scale = _traj_dah(tab.loc[te_m]) if (mode == "forecast" and target == "rate") else 1.0
         res.append((y[te_m] - pr) * scale)                    # errors in SOH units for the band
         ahead.append(tab.loc[te_m, "dn"].to_numpy() if "dn" in tab else np.zeros(te_m.sum()))
+        if not importance:
+            continue
         base = np.sqrt(np.mean((y[te_m] - pr) ** 2))
         Xv = X[te_m]
         sub = rng.choice(len(Xv), size=min(len(Xv), 1500), replace=False)
@@ -7726,7 +7739,8 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         if share < min(origin_fracs) or share > max(origin_fracs):
             note = (f"The origin is at {100 * share:.0f}% of this battery's recorded life, outside the training origins "
                     f"({100 * min(origin_fracs):.0f}–{100 * max(origin_fracs):.0f}%): the models extrapolate.")
-    return TrajectoryForecast(f"ML · {model_name}" + (" (measured)" if mode == "measured" else ""), mode, cell_id,
+    prefix = "DL" if model_name == "MLP" else "ML"
+    return TrajectoryForecast(f"{prefix} · {model_name}" + (" (measured)" if mode == "measured" else ""), mode, cell_id,
                               n0, n_grid, soh, lo, hi, metrics, feats, inputs0, importance, sorted(set(g) - {cell_id}),
                               cv_rmse, time.time() - t0, note)
 
@@ -7742,3 +7756,180 @@ def _protocol_forecast(key, store, ct, imp, cell, n0, train, eol_ah):  # noqa: F
         mode = "forecast" if key.startswith("traj:") else "measured"
         return train_trajectory_model(ct, imp, cell, n0, key.split(":", 1)[1], mode, train, eol_ah)
     return _protocol_forecast_base(key, store, ct, imp, cell, n0, train, eol_ah)
+
+
+
+# =============================================================================
+# 35. LEVEL 3 · DEEP LEARNING with the same approach as Level 2
+# =============================================================================
+# MLP: a neural network on exactly the Level-2 inputs (train_trajectory_model with model_name="MLP").
+# GRU / Transformer: sequence models reading the battery's last L cycles. Forecast mode: from the window ending at
+# the origin (SOH, resistance, temperature rise, CV time; causal) plus the conditions, the SOH change at 32 horizons
+# (5 ... 160 cycles) at once, anchored at today's SOH. Measured mode: from the window of measured parameters ending at
+# cycle m, the SOH of cycle m. Same training batteries, origins and cross-validated bands as Level 2.
+DL_MODELS = {"MLP": "MLP · feed-forward network on the Level-2 inputs",
+             "GRU": "GRU · recurrent network over the last cycles",
+             "Transformer": "Transformer · self-attention over the last cycles"}
+DL_HORIZONS = np.arange(5, 165, 5).astype(float)
+
+
+def _dl_channels(d: pd.DataFrame, mode: str) -> np.ndarray:
+    """Causal per-cycle channels (each value uses only the cycle itself and earlier ones)."""
+    def rel(col):
+        if col not in d or d[col].notna().sum() < 3:
+            return np.zeros(len(d))
+        v = d[col].astype(float).ffill().bfill().to_numpy()
+        base = float(np.nanmedian(v[:3])) or 1.0
+        return v / base - 1.0
+    dT = d["dT_C"].astype(float).ffill().bfill().fillna(0).to_numpy() if "dT_C" in d else np.zeros(len(d))
+    if mode == "forecast":
+        soh = d["SOH"].rolling(3, min_periods=1).median().to_numpy(float)
+        return np.column_stack([(soh - 0.85) * 10, rel("R_dc_ohm") * 10, dT / 5, rel("t_cv_s") * 5])
+    T = d["T_mean_C"].astype(float).ffill().bfill().fillna(24).to_numpy() if "T_mean_C" in d else np.full(len(d), 24.0)
+    eff = d["eff_energy"].astype(float).ffill().bfill().fillna(0.9).to_numpy() if "eff_energy" in d else np.full(len(d), 0.9)
+    return np.column_stack([rel("V_mean_V") * 20, rel("R_dc_ohm") * 10, rel("t_cv_s") * 5, rel("t_cc_s") * 5,
+                            (T - 24) / 20, dT / 5, (eff - 0.9) * 10])
+
+
+def train_deep_trajectory(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str, n0: int, kind: str = "GRU",
+                          mode: str = "forecast", train_cells: Optional[Sequence[str]] = None,
+                          eol_ah: float = DEFAULT_EOL_AH, L: int = 10, epochs: int = 300, hidden: int = 16,
+                          lr: float = 3e-3, level: float = 0.9, cv_folds: int = 2, seed: int = 0,
+                          importance: bool = True) -> "TrajectoryForecast":
+    """Level 3 (see the section header). kind = MLP | GRU | Transformer."""
+    if kind == "MLP":
+        return train_trajectory_model(ct, imp, cell_id, n0, "MLP", mode, train_cells, eol_ah, level=level,
+                                      cv_folds=max(cv_folds, 2), seed=seed, importance=importance)
+    t0 = time.time()
+    if mode not in TRAJ_MODES:
+        raise ValueError(f"mode must be one of {tuple(TRAJ_MODES)}")
+    net_kind = "GRU (recurrent network)" if kind == "GRU" else "Transformer (self-attention)"
+    pool = [c for c in (train_cells if train_cells is not None else v2_training_pool(ct, cell_id)) if c != cell_id]
+    cte = attach_eis(ct, imp) if imp is not None else ct
+    good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
+    n_last = int(good["n"].max())
+    Xs, Cs, Ys, G = [], [], [], []
+    target_rows = None
+    for c in pool + [cell_id]:
+        d = cte[(cte["Cell_ID"] == c) & ~cte["outlier"]].sort_values("n")
+        if c == cell_id and mode == "forecast":
+            d_in = d[d["n"] <= n0]
+        else:
+            d_in = d
+        if len(d_in) < L + 2:
+            continue
+        cond = _traj_conditions(ct, c)
+        Cvec = [(cond["T_amb"] - 24) / 20, (cond["I_set"] - 2) / 2, (cond["V_cut"] - 2.5) * 2]
+        ch = _dl_channels(d_in, mode)
+        n = d_in["n"].to_numpy(float)
+        if mode == "forecast":
+            lab = clean_capacity(d_in)
+            s_lab = np.interp(n, lab["n"], lab["SOH_clean"])
+            soh_now = d_in["SOH"].rolling(3, min_periods=1).median().to_numpy(float)
+            for i in range(L - 1, len(d_in), 2):
+                y = np.full(len(DL_HORIZONS), np.nan)
+                for j, h in enumerate(DL_HORIZONS):
+                    if n[i] + h <= n[-1]:
+                        y[j] = (np.interp(n[i] + h, n, s_lab) - soh_now[i]) * 20
+                if np.isfinite(y).any():
+                    Xs.append(ch[i - L + 1:i + 1]); Cs.append(Cvec); Ys.append(y); G.append(c)
+            if c == cell_id:
+                target_rows = (ch[-L:], Cvec, float(soh_now[-1]))
+        else:
+            soh = d_in["SOH"].to_numpy(float)
+            for i in range(L - 1, len(d_in)):
+                if c == cell_id and n[i] > n0:
+                    continue                                   # test cycles never enter training
+                Xs.append(ch[i - L + 1:i + 1]); Cs.append(Cvec); Ys.append(np.array([(soh[i] - 0.85) * 10])); G.append(c)
+            if c == cell_id:
+                test_idx = [i for i in range(L - 1, len(d_in)) if n[i] > n0]
+                target_rows = (np.array([ch[i - L + 1:i + 1] for i in test_idx]) if test_idx else None,
+                               Cvec, n[test_idx] if test_idx else None)
+    if target_rows is None or len(Xs) < 30 or len(set(G)) < 2:
+        raise ValueError("deep model: not enough training windows (choose more training batteries)")
+    X, C, Y, G = np.array(Xs, float), np.array(Cs, float), np.array(Ys, float), np.array(G)
+    M = np.isfinite(Y).astype(float)
+    Y0 = np.nan_to_num(Y)
+    rng = np.random.default_rng(seed)
+
+    def train(idx, sd):
+        net = _SeqNet(net_kind, L, hidden, sd, d_in=X.shape[2], d_out=Y.shape[1], d_cond=C.shape[1])
+        opt = Adam(net.params, lr=lr)
+        for _ in range(epochs):
+            b = rng.choice(idx, size=min(256, len(idx)), replace=False)
+            mt = Tensor(M[b])
+            loss = (((net.forward(X[b], C[b]) - Tensor(Y0[b])) * mt).square()).mean() * (M[b].size / max(M[b].sum(), 1))
+            for p_ in net.params:
+                p_.grad = np.zeros_like(p_.data)
+            loss.backward()
+            opt.step()
+        return net
+
+    cells_u = np.unique(G)
+    folds = np.array_split(rng.permutation(cells_u), min(cv_folds, len(cells_u))) if len(cells_u) >= 3 else []
+    res = []
+    for k, fold in enumerate(folds):
+        te_m = np.isin(G, fold)
+        if te_m.all() or not te_m.any():
+            continue
+        net = train(np.nonzero(~te_m)[0], seed + 100 + k)
+        res.append((Y[te_m] - net.forward(X[te_m], C[te_m]).data, M[te_m]))
+    net = train(np.arange(len(X)), seed)
+    n_grid = np.arange(1, n_last + 1)
+    past = np.interp(n_grid, good["n"], good["SOH"])
+    fut = n_grid > n0
+    if mode == "forecast":
+        win, Cvec, s0 = target_rows
+        drops = net.forward(win[None], np.array([Cvec])).data[0] / 20
+        if res:
+            R = np.vstack([r for r, _ in res])
+            Mm = np.vstack([mm for _, mm in res])
+            q = np.array([np.quantile(np.abs(R[Mm[:, j] > 0, j]), level) / 20 if (Mm[:, j] > 0).sum() >= 10 else np.nan
+                          for j in range(len(DL_HORIZONS))])
+            q = pd.Series(q).ffill().bfill().fillna(0.03).to_numpy()
+        else:
+            q = np.full(len(DL_HORIZONS), 0.03)
+        h = np.maximum(n_grid - n0, 0).astype(float)
+        xs = np.concatenate([[0.0], DL_HORIZONS])
+        med = s0 + np.interp(h, xs, np.concatenate([[0.0], drops]))
+        half = np.interp(h, xs, np.concatenate([[0.0], np.maximum.accumulate(q)]))
+        inputs0 = {"SOH at the origin": s0, "conditions (scaled)": float(np.mean(Cvec))}
+    else:
+        wins, Cvec, n_test = target_rows
+        if wins is None:
+            raise ValueError("deep model: no test cycles after the origin")
+        p_ = net.forward(wins, np.repeat(np.array([Cvec]), len(wins), axis=0)).data[:, 0] / 10 + 0.85
+        p_ = pd.Series(p_).rolling(5, min_periods=1).median().to_numpy()
+        med = np.interp(n_grid, n_test, p_)
+        qv = float(np.quantile(np.abs(np.vstack([r for r, _ in res])), level)) / 10 if res else 0.03
+        half = np.full(len(n_grid), qv)
+        inputs0 = {"measured channels per cycle": float(X.shape[2]), "window (cycles)": float(L)}
+    soh = np.clip(np.where(fut, med, past), 0, 1.05)
+    lo = np.clip(np.where(fut, med - half, past), 0, 1.05)
+    hi = np.clip(np.where(fut, med + half, past), 0, 1.05)
+    soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
+    metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), n_grid, soh, n0, soh_eol, lo, hi, 0.2)
+    cv = float(np.sqrt(np.mean(np.concatenate([r[m > 0] for r, m in res]) ** 2))) / (20 if mode == "forecast" else 10) if res else float("nan")
+    feats = (["SOH", "resistance growth", "temperature rise", "CV-time growth"] if mode == "forecast" else
+             ["mean voltage", "resistance", "CV time", "CC time", "mean temperature", "temperature rise", "efficiency"])
+    return TrajectoryForecast(f"DL · {kind}" + (" (measured)" if mode == "measured" else ""), mode, cell_id, n0, n_grid,
+                              soh, lo, hi, metrics, feats, inputs0, pd.DataFrame(), sorted(set(G) - {cell_id}), cv,
+                              time.time() - t0)
+
+
+for _k in DL_MODELS:                                   # Level 3 in the accuracy assessment
+    PROTOCOL_MODELS[f"dl:{_k}"] = ("Deep learning (forecast)", f"DL · {_k}")
+    PROTOCOL_MODELS[f"dlm:{_k}"] = ("Deep learning (measured)", f"DL · {_k} (measured)")
+_protocol_forecast_l2 = _protocol_forecast
+
+
+def _protocol_forecast(key, store, ct, imp, cell, n0, train, eol_ah):  # noqa: F811
+    """Assessment runs: no permutation importance and 2-fold bands (the scoreboard does not use importance)."""
+    if key.startswith("traj:") or key.startswith("trajm:"):
+        mode = "forecast" if key.startswith("traj:") else "measured"
+        return train_trajectory_model(ct, imp, cell, n0, key.split(":", 1)[1], mode, train, eol_ah, cv_folds=2,
+                                      importance=False)
+    if key.startswith("dl:") or key.startswith("dlm:"):
+        mode = "forecast" if key.startswith("dl:") else "measured"
+        return train_deep_trajectory(ct, imp, cell, n0, key.split(":", 1)[1], mode, train, eol_ah, importance=False)
+    return _protocol_forecast_l2(key, store, ct, imp, cell, n0, train, eol_ah)

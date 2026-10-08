@@ -1064,6 +1064,37 @@ def test_round_fixes_pool_shape_slope_gp_and_verdict():
     assert sb.loc["Bad", "vs best baseline"].startswith("worse on all 5 batteries")
 
 
+def test_deep_learning_level_same_approach_and_fast_assessment():
+    m, imp, _ = te.make_synthetic_master(n_cells=5, n_cycles=90, ambients=(24,) * 5, seed=3, noise_v=0.01)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    n0 = 30
+    g = ct[(ct["Cell_ID"] == "S001") & ~ct["outlier"]]
+    for kind in te.DL_MODELS:
+        for mode in te.TRAJ_MODES:
+            f = te.train_deep_trajectory(ct, imp, "S001", n0, kind, mode, eol_ah=1.6, epochs=40)
+            fut = f.n_grid > n0
+            assert f.model.startswith("DL · " + kind) and f.n_grid.max() == g["n"].max()
+            assert np.isfinite(f.soh[fut]).all() and "S001" not in f.train_cells
+            if mode == "forecast":
+                i = int(np.searchsorted(f.n_grid, n0 + 1))
+                assert abs(f.soh[i] - f.soh[i - 1]) < 0.02                      # anchored at today's SOH
+    # no leakage in sequence forecast mode: the target's later cycles cannot change the forecast
+    ct2 = ct.copy()
+    later = (ct2["Cell_ID"] == "S001") & (ct2["n"] > n0)
+    ct2.loc[later, ["SOH", "Capacity_Ah", "R_dc_ohm"]] *= 0.9
+    a = te.train_deep_trajectory(ct, imp, "S001", n0, "GRU", "forecast", eol_ah=1.6, epochs=40)
+    b = te.train_deep_trajectory(ct2, imp, "S001", n0, "GRU", "forecast", eol_ah=1.6, epochs=40)
+    fut = a.n_grid > n0
+    assert np.allclose(a.soh[fut], b.soh[fut])
+    fast = te.train_trajectory_model(ct, imp, "S001", n0, "Random Forest", "forecast", eol_ah=1.6, importance=False)
+    assert float(fast.importance["Importance (ΔRMSE)"].abs().sum()) == 0.0
+    res = te.run_protocol(store, ct, imp, ["S001", "S002", "S003"], ["trend", "dl:MLP", "dlm:GRU"], (0.4,), 1.6)
+    assert (res["status"] == "ok").all()
+    sb = te.protocol_scoreboard(res)
+    assert {"DL · MLP", "DL · GRU (measured)"} <= set(sb.index)
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

@@ -1,9 +1,25 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.5.5)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.6.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Level 3 · Deep learning and usability (v5.6.0)
+
+- Level 3 · Deep learning, same approach as Level 2 (same question, data, training batteries, origins, anchoring,
+  cross-validated bands), independent of Levels 1-2 (`train_deep_trajectory`, `DL_MODELS`): MLP on exactly the
+  Level-2 inputs; GRU and Transformer reading the last 10 cycles (forecast: SOH, resistance, temperature rise, CV time
+  up to the origin -> SOH change at 32 horizons; measured: mean voltage, resistance, charge times, temperatures,
+  efficiency -> SOH of the cycle). In the accuracy assessment as dl: / dlm:.
+- Each level keeps the results of both modes in separate tabs (training the other mode does not erase them).
+- Training and test battery pickers are mutually exclusive.
+- Baselines stop at the battery's last measured cycle.
+- Accuracy assessment ~36 % faster with identical results: no permutation importance and 2-fold bands in
+  assessment runs (synthetic, 20 forecasts: 120 s -> 77 s; the Gaussian Process is the slowest model, ~12 s per
+  forecast).
+Synthetic single-battery check (30 % origin, RMSE): forecast GP 0.042, MLP 0.068, GRU 0.036, Transformer 0.038;
+measured GP 0.076, MLP 0.011, GRU 0.036, Transformer 0.026 (one battery; judge with the assessment).
 
 ## Fixes after the first real assessment (v5.5.5)
 
