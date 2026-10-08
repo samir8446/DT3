@@ -485,7 +485,10 @@ div[data-testid="stPlotlyChart"], div[data-testid="stMetric"], .bt-card {{animat
 .bt-alert .bt-badge {{flex: none; padding: 3px 10px; border-radius: 8px; color: #fff; font-weight: 800; font-size: 0.8rem;}}
 .bt-alert .bt-msg {{font-size: 0.93rem; line-height: 1.5; color: inherit;}}
 </style>"""
-    st.markdown(css + DESIGN_CSS, unsafe_allow_html=True)
+    st.markdown(css, unsafe_allow_html=True)
+    # a separate call on one line: a <style> HTML block ends at the line containing </style>, so appending a second
+    # block after it would make Markdown print the rules as text
+    st.markdown(" ".join(line.strip() for line in DESIGN_CSS.splitlines()), unsafe_allow_html=True)
 
 
 # =============================================================================
