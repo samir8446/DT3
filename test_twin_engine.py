@@ -1095,6 +1095,40 @@ def test_deep_learning_level_same_approach_and_fast_assessment():
     assert {"DL · MLP", "DL · GRU (measured)"} <= set(sb.index)
 
 
+def test_parameters_automatic_selection_and_assessment_tasks():
+    m, imp, _ = te.make_synthetic_master(n_cells=5, n_cycles=90, ambients=(24,) * 5, seed=3, noise_v=0.01)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    for name in ("Random Forest", "MLP", "GRU"):
+        r = te.tune_level_model(ct, imp, "S001", 30, name, "forecast", n_iter=3, method="bayesian")
+        assert r.best_score <= r.default_score + 1e-12 and set(r.best_params) == set(te.default_params(name))
+    f_small = te.train_trajectory_model(ct, imp, "S001", 30, "Random Forest", "forecast", eol_ah=1.6,
+                                        model_params={"n_estimators": 50, "max_depth": 2, "min_samples_leaf": 10},
+                                        importance=False)
+    f_def = te.train_trajectory_model(ct, imp, "S001", 30, "Random Forest", "forecast", eol_ah=1.6, importance=False)
+    assert not np.allclose(f_small.soh, f_def.soh)                          # the parameters reach the model
+    g = te.train_deep_trajectory(ct, imp, "S001", 30, "GRU", "measured", eol_ah=1.6,
+                                 model_params={"hidden": 6, "window": 5, "epochs": 40, "learning_rate": 0.01})
+    assert np.isfinite(g.soh[g.n_grid > 30]).all()
+    task = te.run_protocol_task(store, ct, imp, ["S001", "S002", "S003", "S004"], "traj:Bayesian Ridge", 0.4, "S003", 1.6)
+    assert list(task["Cell_ID"].unique()) == ["S003"] and (task["status"] == "ok").all()
+
+
+def test_training_with_all_batteries_survives_unusable_ones():
+    m, imp, _ = te.make_synthetic_master(n_cells=5, n_cycles=90, ambients=(24,) * 5, seed=3)
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    ct.loc[(ct.Cell_ID == "S004") & (ct.n <= 40), "outlier"] = True     # invalid early cycles
+    ct.loc[ct.Cell_ID == "S005", "outlier"] = True                         # no valid cycle at all
+    assert te.clean_capacity(ct[ct.Cell_ID == "S005"]).empty
+    assert "S005" not in te.condition_groups(ct).index
+    allc = list(ct["Cell_ID"].unique())
+    for mode in te.TRAJ_MODES:
+        f = te.train_trajectory_model(ct, imp, "S001", 30, "Bayesian Ridge", mode, allc, 1.6, importance=False)
+        assert np.isfinite(f.metrics.rmse) and "S005" in f.origin_note and "S004" in f.train_cells
+        g = te.train_deep_trajectory(ct, imp, "S001", 30, "GRU", mode, allc, 1.6, epochs=30)
+        assert np.isfinite(g.metrics.rmse)
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
