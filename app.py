@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.7.0"
+REQUIRED_ENGINE = "5.6.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -59,8 +59,7 @@ st.set_page_config(
 )
 
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
-                   "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
-                   "tune_level_model", "run_protocol_task")
+                   "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -85,7 +84,7 @@ POLICIES = ["Twin-Aware", "Fixed 1 A", "Fixed 2 A", "Fixed 4 A"]
 VIEWS = [":material/home: Home", ":material/monitoring: Diagnostics", ":material/play_circle: Live twin",
          ":material/psychology: Models & forecasting", ":material/tune: Operations & control",
          ":material/fact_check: Study results"]
-SANS = "IBM Plex Sans, Segoe UI, Helvetica Neue, Arial, sans-serif"
+SANS = "Inter, 'Source Sans Pro', 'Helvetica Neue', Arial, sans-serif"
 SERIF = "'STIX Two Text', 'Times New Roman', Times, serif"
 
 
@@ -235,40 +234,6 @@ def resolve_palette(choice: str, publication: bool) -> Palette:
         return PUBLICATION
     mode = choice.lower() if choice in ("Light", "Dark") else detect_base_theme()
     return DARK if mode == "dark" else LIGHT
-
-
-# Design layer (instrument panel): one typeface with tabular figures, one interactive accent (electrolyte teal),
-# calm blue-graphite hero where the cell <-> twin illustration is the single memorable element; sentence case.
-DESIGN_CSS = """<style>
-@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
-:root { --dz-ink: #0F1E2A; --dz-line: #23394B; --dz-teal: #177E78; --dz-teal-hi: #2FA7A0; --dz-teal-dk: #126762;
-        --dz-mist: #9DB4C4; }
-html, body, .stApp, .stMarkdown, p, li, label, input, textarea, select, button, h1, h2, h3, h4, h5,
-div[data-testid="stMetricValue"], div[data-testid="stMetricLabel"] {
-  font-family: 'IBM Plex Sans', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; }
-div[data-testid="stMetricValue"], div[data-testid="stDataFrame"], div[data-testid="stTable"], .bt-statusbar {
-  font-variant-numeric: tabular-nums; }
-.bt-hero { background: var(--dz-ink) !important; animation: none !important; border: 1px solid var(--dz-line);
-  box-shadow: none !important; border-radius: 14px !important; }
-.bt-hero::before { opacity: 0.10 !important; background-size: 24px 24px !important; }
-.bt-hero::after { display: none !important; }
-.bt-hero .bt-kicker { text-transform: none !important; letter-spacing: 0 !important; font-weight: 500 !important;
-  font-size: 0.92rem !important; color: var(--dz-mist) !important; }
-.bt-hero .bt-title { font-weight: 600 !important; font-size: 2.15rem !important; letter-spacing: -0.02em !important; }
-.bt-hero .bt-sub { color: #C9D6E0 !important; max-width: 62ch !important; }
-.stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
-  background: var(--dz-teal) !important; box-shadow: none !important; border: 1px solid var(--dz-teal-dk) !important;
-  border-radius: 8px !important; font-weight: 600 !important; }
-.stButton > button[kind="primary"]:hover { background: var(--dz-teal-dk) !important; filter: none !important; }
-.stButton > button:focus-visible { outline: 2px solid var(--dz-teal-hi) !important; outline-offset: 2px; }
-div[data-baseweb="tab-highlight"] { background: var(--dz-teal-hi) !important; }
-.bt-section { font-weight: 600 !important; animation: none !important; }
-.bt-section .bt-num { background: transparent !important; box-shadow: none !important; color: var(--dz-teal-hi) !important;
-  border: 1px solid var(--dz-teal-hi); font-weight: 600 !important; border-radius: 6px !important; }
-.bt-statusbar { font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif !important; letter-spacing: 0 !important;
-  font-size: 0.86rem !important; background: var(--dz-ink) !important; border-color: var(--dz-line) !important; }
-@media (prefers-reduced-motion: reduce) { .bt-dot, .bt-pkt, .bt-scan { animation: none !important; } }
-</style>"""
 
 
 def inject_css(P: Palette) -> None:
@@ -485,7 +450,7 @@ div[data-testid="stPlotlyChart"], div[data-testid="stMetric"], .bt-card {{animat
 .bt-alert .bt-badge {{flex: none; padding: 3px 10px; border-radius: 8px; color: #fff; font-weight: 800; font-size: 0.8rem;}}
 .bt-alert .bt-msg {{font-size: 0.93rem; line-height: 1.5; color: inherit;}}
 </style>"""
-    st.markdown(css + DESIGN_CSS, unsafe_allow_html=True)
+    st.markdown(css, unsafe_allow_html=True)
 
 
 # =============================================================================
@@ -2520,8 +2485,8 @@ HERO_ART = """<div class="bt-art" aria-hidden="true">
  <!-- data links -->
  <path d="M 118 72 C 190 14, 270 14, 342 72" fill="none" stroke="rgba(127,227,255,0.55)" stroke-width="1.6" stroke-dasharray="4 5"/>
  <path d="M 342 150 C 270 208, 190 208, 118 150" fill="none" stroke="rgba(255,209,102,0.55)" stroke-width="1.6" stroke-dasharray="4 5"/>
- <text x="230" y="22" text-anchor="middle" font-size="10.5" letter-spacing="0.2" fill="rgba(255,255,255,0.92)" font-weight="700">Voltage, current, temperature</text>
- <text x="230" y="206" text-anchor="middle" font-size="10.5" letter-spacing="0.2" fill="rgba(255,255,255,0.92)" font-weight="700">Health, remaining life, control</text>
+ <text x="230" y="22" text-anchor="middle" font-size="10.5" letter-spacing="1.5" fill="rgba(255,255,255,0.92)" font-weight="700">V · I · T TELEMETRY</text>
+ <text x="230" y="206" text-anchor="middle" font-size="10.5" letter-spacing="1.5" fill="rgba(255,255,255,0.92)" font-weight="700">SOH · RUL · CONTROL</text>
  <!-- update engine -->
  <circle class="bt-ring" cx="230" cy="111" r="24" fill="none" stroke="#7FE3FF" stroke-width="2"/>
  <circle cx="230" cy="111" r="24" fill="rgba(14,23,38,0.55)" stroke="rgba(255,255,255,0.75)" stroke-width="1.4"/>
@@ -2536,7 +2501,7 @@ HERO_ART = """<div class="bt-art" aria-hidden="true">
  <rect x="42" y="56" width="56" height="113" rx="7" fill="rgba(11,61,145,0.45)"/>
  <rect class="bt-level" x="42" y="56" width="56" height="113" rx="7" fill="url(#btCharge)"/>
  <text x="70" y="118" text-anchor="middle" font-size="15" font-weight="900" fill="rgba(11,40,80,0.75)">+</text>
- <text x="70" y="200" text-anchor="middle" font-size="9.5" letter-spacing="0.2" font-weight="800" fill="#FFFFFF">Physical cell</text>
+ <text x="70" y="200" text-anchor="middle" font-size="9.5" letter-spacing="1.4" font-weight="800" fill="#FFFFFF">PHYSICAL CELL</text>
  <!-- digital twin -->
  <rect x="362" y="30" width="24" height="12" rx="3" fill="none" stroke="#7FE3FF" stroke-width="1.4" stroke-dasharray="3 3"/>
  <rect x="350" y="40" width="80" height="145" rx="14" fill="rgba(127,227,255,0.10)" stroke="#7FE3FF" stroke-width="1.6" stroke-dasharray="6 4"/>
@@ -2548,7 +2513,7 @@ HERO_ART = """<div class="bt-art" aria-hidden="true">
  <polyline class="bt-draw" points="360,64 372,67 384,72 396,80 405,90 412,104 417,122 421,146" fill="none" stroke="#FFFFFF" stroke-width="2.4" stroke-linecap="round"/>
  <line x1="360" y1="140" x2="422" y2="140" stroke="#FF8A4C" stroke-width="1.4" stroke-dasharray="3 3"/>
  <rect class="bt-scan" x="352" y="50" width="76" height="3" rx="1.5" fill="rgba(127,227,255,0.9)"/>
- <text x="390" y="200" text-anchor="middle" font-size="9.5" letter-spacing="0.2" font-weight="800" fill="#FFFFFF">Digital twin</text>
+ <text x="390" y="200" text-anchor="middle" font-size="9.5" letter-spacing="1.4" font-weight="800" fill="#FFFFFF">DIGITAL TWIN</text>
 </svg>
 <span class="bt-pkt bt-pkt-up" style="animation-delay:0s"></span>
 <span class="bt-pkt bt-pkt-up" style="animation-delay:0.7s"></span>
@@ -2558,18 +2523,19 @@ HERO_ART = """<div class="bt-art" aria-hidden="true">
 <span class="bt-pkt bt-pkt-down" style="animation-delay:1.75s"></span>
 </div>"""
 
-
+pills = "".join(f'<span class="bt-pill">{t}</span>' for t in
+                ("Self-updating EKF twin", "Mechanistic PINN", "Bayesian prognostics", "O&amp;M optimisation"))
 HERO_ART = re.sub(r"<!--.*?-->", "", HERO_ART)
 HERO_ART = " ".join(line.strip() for line in HERO_ART.splitlines())      # one line: no markdown code blocks
 HERO_CSS = " ".join(line.strip() for line in HERO_CSS.splitlines())
 st.markdown(
     HERO_CSS +
     '<div class="bt-hero"><div class="bt-hero-text">'
-    '<div class="bt-kicker">NASA Ames lithium-ion ageing data</div>'
-    '<div class="bt-title">Battery digital twin</div>'
+    '<div class="bt-kicker">Self-updating digital twin · NASA Ames Li-ion data</div>'
+    '<div class="bt-title">🔋 Battery Digital Twin</div>'
     '<div class="bt-sub">A physical cell and its virtual copy, synchronised cycle by cycle: diagnose ageing, '
     'forecast remaining life and decide when to act.</div>'
-    '</div>' + HERO_ART + '</div>',
+    f'<div>{pills}</div></div>' + HERO_ART + '</div>',
     unsafe_allow_html=True,
 )
 
@@ -2645,12 +2611,12 @@ _n_crit = int((_fs_bar["Risk"] == "Critical").sum()) if len(_fs_bar) else 0
 _n_warn = int((_fs_bar["Risk"] == "Warning").sum()) if len(_fs_bar) else 0
 st.markdown(
     '<div class="bt-statusbar">'
-    '<span class="bt-live"><span class="bt-dot"></span>Replaying recorded data</span>'
-    f'<span>Engine <b>v{te.ENGINE_VERSION}</b></span>'
-    f'<span>Source <b>{"synthetic demo" if st.session_state.get("demo") else "telemetry"}</b></span>'
-    f'<span><b>{len(meta)}</b> cells, <b>{int(ct["n"].count()):,}</b> cycles</span>'
-    f'<span class="bt-sev bt-sev-crit">{_n_crit} critical</span>'
-    f'<span class="bt-sev bt-sev-warn">{_n_warn} warning</span>'
+    '<span class="bt-live"><span class="bt-dot"></span>REPLAY MODE · RECORDED DATA</span>'
+    f'<span>ENGINE <b>v{te.ENGINE_VERSION}</b></span>'
+    f'<span>SOURCE <b>{"SYNTHETIC DEMO" if st.session_state.get("demo") else "TELEMETRY"}</b></span>'
+    f'<span>FLEET <b>{len(meta)}</b> CELLS · <b>{int(ct["n"].count())}</b> CYCLES</span>'
+    f'<span class="bt-sev bt-sev-crit">{_n_crit} CRITICAL</span>'
+    f'<span class="bt-sev bt-sev-warn">{_n_warn} WARNING</span>'
     f'<span class="bt-clock">{time.strftime("%Y-%m-%d %H:%M")} UTC</span>'
     '</div>', unsafe_allow_html=True)
 view = nav(VIEWS, key="view")
@@ -3844,29 +3810,19 @@ def hyperparam_editor(models: Sequence[str], prefix: str) -> Dict[str, Dict[str,
             for i, h in enumerate(spec.params):
                 k = f"{prefix}_{name}_{h.key}"
                 c = cols[i % len(cols)]
-                has = k in st.session_state                   # tuned or edited value already stored: no default
                 if h.kind == "int":
-                    if has:
-                        st.session_state[k] = int(np.clip(int(st.session_state[k]), int(h.low), int(h.high)))
-                    vals[h.key] = int(c.number_input(h.label, int(h.low), int(h.high), key=k, help=h.help or None,
-                                                     **({} if has else {"value": int(h.default)})))
+                    vals[h.key] = int(c.number_input(h.label, int(h.low), int(h.high), int(h.default), key=k, help=h.help or None))
                 elif h.kind == "float":
-                    vals[h.key] = float(c.slider(h.label, float(h.low), float(h.high), key=k,
-                                                 **({} if has else {"value": float(h.default)})))
+                    vals[h.key] = float(c.slider(h.label, float(h.low), float(h.high), float(h.default), key=k))
                 elif h.kind == "log":
-                    extra = [float(f"{float(st.session_state[k]):.3g}")] if has else []
-                    if has:
-                        st.session_state[k] = extra[0]
-                    grid = sorted(set([float(f"{v:.3g}") for v in np.geomspace(h.low, h.high, 25)] + [float(h.default)]
-                                      + extra))
-                    vals[h.key] = float(c.select_slider(h.label, grid, key=k, format_func=lambda v: f"{v:.3g}",
-                                                        **({} if has else {"value": float(h.default)})))
+                    grid = sorted(set([float(f"{v:.3g}") for v in np.geomspace(h.low, h.high, 25)] + [float(h.default)]))
+                    vals[h.key] = float(c.select_slider(h.label, grid, value=float(h.default), key=k,
+                                                        format_func=lambda v: f"{v:.3g}"))
                 elif h.kind == "choice":
                     opts = list(h.options)
-                    vals[h.key] = c.selectbox(h.label, opts, key=k, **({} if has else {"index": opts.index(h.default)}))
+                    vals[h.key] = c.selectbox(h.label, opts, index=opts.index(h.default), key=k)
                 else:
-                    vals[h.key] = c.text_input(h.label, key=k, help=h.help or None,
-                                               **({} if has else {"value": str(h.default)}))
+                    vals[h.key] = c.text_input(h.label, str(h.default), key=k, help=h.help or None)
             try:
                 out[name] = te.validate_params(name, vals)
             except ValueError as exc:
@@ -4887,30 +4843,12 @@ def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
 
 
 
-ASSESS_SECONDS = {"persistence": 0.3, "trend": 0.3, "shape": 1.0, "Bayesian Ridge": 1.5, "Decision Tree": 1.5,
-                  "Random Forest": 3.0, "SVM": 2.0, "Gaussian Process": 12.0, "XGBoost": 3.0, "LightGBM": 2.0,
-                  "MLP": 2.0, "GRU": 6.0, "Transformer": 4.0}
-
-
-@st.cache_data(show_spinner=False, max_entries=20000)
-def assess_task_cached(_store: Any, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...],
-                       mkey: str, origin: float, held: str, eol: float) -> pd.DataFrame:
-    """One forecast of the assessment, cached as soon as it finishes: an interrupted run resumes where it stopped."""
-    return te.run_protocol_task(_store, _ct, _imp, cells, mkey, origin, held, eol)
-
-
-def _per_battery_table(res: pd.DataFrame) -> pd.DataFrame:
-    ok = res[res["status"] == "ok"]
-    piv = ok.groupby(["model", "Cell_ID"])["RMSE (SOH pts)"].mean().unstack()
-    return piv
-
-
 def assessment_section() -> None:
     section("Accuracy assessment: every model, each battery held out in turn")
     st.markdown("One forecast on one battery is an anecdote. Here each battery of a condition group is held out in turn: "
                 "the models learn from the other batteries of the group plus the held-out battery's own cycles up to the "
-                "forecast origin, and are scored on all its later measured cycles. Each forecast is saved as soon as it "
-                "finishes, so the scoreboard fills in live and an interrupted run continues where it stopped.")
+                "forecast origin, and are scored on all its later measured cycles. Results are averaged per battery, "
+                "with a 95% confidence interval and a paired comparison against the best baseline.")
     groups = te.condition_groups(ct)
     usable = [g for g in te.GROUP_ORDER if g in set(groups["Group"]) and g not in te.V2_EXCLUDED_GROUPS]
     if not usable:
@@ -4919,96 +4857,53 @@ def assessment_section() -> None:
     my = groups.loc[cell, "Group"] if cell in groups.index and groups.loc[cell, "Group"] in usable else usable[0]
     c1, c2 = st.columns(2)
     grp = c1.selectbox("Condition group", usable, index=usable.index(my), key="acc_group",
-                       format_func=lambda x: f"{x}, {len(te.protocol_cells(ct, x))} batteries")
+                       format_func=lambda x: f"{x} · {len(te.protocol_cells(ct, x))} batteries")
     origins = c2.multiselect("Forecast origins (share of each battery's life)", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
-                             default=[0.3], key="acc_origins", format_func=lambda v: f"{100 * v:.0f}%")
+                             default=[0.3, 0.5], key="acc_origins", format_func=lambda v: f"{100 * v:.0f}%")
     av = te.available_models()
     options = (["persistence", "trend", "shape"] + [f"traj:{m}" for m in av] + [f"trajm:{m}" for m in av]
                + [f"dl:{k}" for k in te.DL_MODELS] + [f"dlm:{k}" for k in te.DL_MODELS])
     keys = st.multiselect("Models (level 1 baselines, level 2 machine learning, level 3 deep learning)", options,
-                          default=["trend", "shape"] + [f"traj:{m}" for m in ("Bayesian Ridge", "Random Forest", "SVM")
-                                                        if m in av] + ["dl:GRU"],
+                          default=["persistence", "trend", "shape"] + [f"traj:{m}" for m in ("Bayesian Ridge", "Random Forest",
+                                                                                                  "SVM", "Gaussian Process")
+                                                                         if m in av],
                           key="acc_models", format_func=lambda k: te.PROTOCOL_MODELS[k][1])
-    cells_g = tuple(te.protocol_cells(ct, grp))
-    tasks = [(c, o, k) for c in cells_g for o in sorted(origins) for k in keys]
-    secs = sum(ASSESS_SECONDS.get(k.split(":", 1)[-1], 3.0) for _, _, k in tasks)
+    cells_g = te.protocol_cells(ct, grp)
+    n_fc = len(cells_g) * len(origins) * len(keys)
     if len(cells_g) < 3:
         st.warning(f"The {grp} group has fewer than three usable batteries: nothing to learn from when one is held out.")
-    st.caption(f"{len(tasks)} forecasts, about {max(1, round(secs / 60))} min on a fresh run (the Gaussian Process is the "
-               "slowest model). Forecasts already computed with the same settings are reused instantly.")
-    run_key = (DATA_KEY, grp, float(eol_ah), tuple(sorted(origins)), tuple(keys))
-    if st.button(f"Run the assessment ({len(tasks)} forecasts)", key="acc_go", type="primary", icon=":material/fact_check:",
+    if st.button(f"Run the assessment ({n_fc} forecasts)", key="acc_go", type="primary", icon=":material/fact_check:",
                  disabled=len(cells_g) < 3 or not keys or not origins):
         prog = st.progress(0.0)
-        live = st.empty()
-        parts: List[pd.DataFrame] = []
-        t_start = time.time()
-        for i, (c, o, k) in enumerate(tasks):
-            prog.progress(i / max(len(tasks), 1),
-                          text=f"{i}/{len(tasks)} · {te.PROTOCOL_MODELS[k][1]} on {c} from {100 * o:.0f}% · "
-                               f"{time.time() - t_start:.0f}s")
-            parts.append(assess_task_cached(store, ct, imp, DATA_KEY, cells_g, k, float(o), c, float(eol_ah)))
-            if i % 3 == 2 or i == len(tasks) - 1:
-                part = pd.concat(parts, ignore_index=True)
-                sbp = te.protocol_scoreboard(part)
-                if len(sbp):
-                    live.dataframe(sbp[["Batteries", "RMSE (SOH pts)", "95% CI ±", "EOL |error| (cycles)"]].round(2),
-                                   use_container_width=True)
-                st.session_state["acc_res"] = part              # partial results survive an interruption
-                st.session_state["acc_key"] = run_key
+        st.session_state["acc_res"] = te.run_protocol(store, ct, imp, cells_g, keys, tuple(sorted(origins)), float(eol_ah),
+                                                      progress=lambda f_, m_: prog.progress(min(max(float(f_), 0.0), 1.0), text=m_))
+        st.session_state["acc_key"] = (DATA_KEY, grp, float(eol_ah))
         prog.empty()
-        live.empty()
     res = st.session_state.get("acc_res")
-    if res is None or not len(res) or st.session_state.get("acc_key", (None,))[:3] != run_key[:3]:
-        placeholder("Press 'Run the assessment': the scoreboard, the verdict, the winner on each battery and the error by "
+    if res is None or not len(res) or st.session_state.get("acc_key") != (DATA_KEY, grp, float(eol_ah)):
+        placeholder("Press 'Run the assessment': the scoreboard, the verdict against the best baseline and the error by "
                     "forecast origin appear here.")
         return
-    if st.session_state.get("acc_key") != run_key:
-        st.info("The results below were computed with different models or origins than currently selected; press Run to "
-                "update them (forecasts already computed are reused).")
     sb = te.protocol_scoreboard(res)
     if sb.empty:
         st.warning("No forecast succeeded: " + "; ".join(sorted(set(res["status"].astype(str).str[:70]))[:3]))
         return
-    best, bb = sb.index[0], sb.attrs.get("best_baseline")
-    better = sb[sb["vs best baseline"].astype(str).str.startswith("better")]
-    k = st.columns(4)
-    k[0].metric("Lowest error", best, help="Mean RMSE over the held-out batteries.")
-    k[1].metric("Its error", f"{sb.loc[best, 'RMSE (SOH pts)']:.2f} SOH pts", delta=f"± {sb.loc[best, '95% CI ±']:.2f} (95% CI)",
-                delta_color="off")
-    eol_col = sb["EOL |error| (cycles)"].dropna()
-    if len(eol_col):
-        k[2].metric("Best end-of-life timing", eol_col.idxmin(), delta=f"{eol_col.min():.0f} cycles off", delta_color="off")
-    k[3].metric("Beat the best baseline", f"{len(better)} model(s)", delta=f"baseline: {bb}", delta_color="off")
     show(fig_scoreboard(sb, P), key="acc_board", data=sb.reset_index())
     show_table(sb.style.format({"RMSE (SOH pts)": "{:.2f}", "95% CI ±": "{:.2f}", "EOL |error| (cycles)": "{:.1f}",
                                 "Coverage": "{:.0%}", "p (Wilcoxon)": "{:.3f}"}, na_rep="—"),
                note="RMSE in SOH points, averaged per battery first and then across batteries (95% CI). 'vs best "
-                    "baseline' is paired on the same batteries. Coverage should be near 90%.")
-    n_b = int(sb["Batteries"].max())
-    txt = (f"In the **{grp}** group ({n_b} batteries), the lowest error is **{best}** "
+                    "baseline' is paired on the same batteries (Wilcoxon from 5 batteries). Coverage should be near 90%.")
+    best, bb = sb.index[0], sb.attrs.get("best_baseline")
+    better = sb[sb["vs best baseline"] == "better than baseline"]
+    txt = (f"In the **{grp}** group ({sb['Batteries'].max()} batteries), the lowest error is **{best}** "
            f"({sb.loc[best, 'RMSE (SOH pts)']:.2f} ± {sb.loc[best, '95% CI ±']:.2f} SOH points). ")
-    txt += ("Better than the best baseline (" + str(bb) + "): " + ", ".join(better.index) + "."
-            if len(better) else f"No model is better than the best baseline ({bb}) on all batteries.")
-    if n_b < 6:
-        txt += f" With {n_b} batteries no test can reach 5% significance: read the per-battery table below."
+    txt += ("Significantly better than the best baseline (" + str(bb) + "): " + ", ".join(better.index) + "."
+            if len(better) else f"No model is significantly better than the best baseline ({bb}) with these batteries.")
     card("Verdict", [txt])
-    piv = _per_battery_table(res)
-    if len(piv):
-        order = [m for m in sb.index if m in piv.index]
-        piv = piv.loc[order]
-        wins = piv.idxmin().value_counts()
-        piv["Battery wins"] = [int(wins.get(m, 0)) for m in piv.index]
-        show_table(piv.style.format("{:.2f}", na_rep="—", subset=[c for c in piv.columns if c != "Battery wins"])
-                   .highlight_min(axis=0, subset=[c for c in piv.columns if c != "Battery wins"],
-                                  props="background-color: rgba(23,126,120,0.35); font-weight: 600;"),
-                   note="Error of every model on every held-out battery (mean over origins); the best model on each "
-                        "battery is highlighted. 'Battery wins' counts on how many batteries a model was the best.")
     by_o = res[res["status"] == "ok"].groupby(["model", "origin"])["RMSE (SOH pts)"].mean().unstack()
     by_o.columns = [f"from {100 * o:.0f}%" for o in by_o.columns]
-    if by_o.shape[1] > 1:
-        show_table(by_o.loc[[m for m in sb.index if m in by_o.index]].style.format("{:.2f}", na_rep="—"),
-                   note="Error by forecast origin: later origins should give smaller errors.")
+    show_table(by_o.loc[[m for m in sb.index if m in by_o.index]].style.format("{:.2f}", na_rep="—"),
+               note="Error by forecast origin: later origins should give smaller errors.")
     bad = res[res["status"] != "ok"]
     if len(bad):
         st.caption(f"{len(bad)} forecasts failed and are counted as failures: "
@@ -5061,53 +4956,6 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
                          "test cycle's own measured parameters (estimation). Results of both modes are kept below.")
     kw = extra() if extra else {}
     train = None if sc["mode"] == "within" else list(sc["train"])
-    hp_prefix = f"{key}_hp"
-    pending = st.session_state.pop(f"{key}_pending", None)      # tuned values from the last automatic selection
-    if pending:
-        for m_, prm in pending.items():
-            for k_, v in prm.items():
-                st.session_state[f"{hp_prefix}_{m_}_{k_}"] = v
-    with st.expander("Model parameters (optimise each model by hand)", icon=":material/tune:"):
-        st.caption("Each model's own settings. The values from an automatic selection appear here, and you can still "
-                   "adjust them. 'Reset' restores the defaults.")
-        params = hyperparam_editor(mdls, hp_prefix) if mdls else {}
-        if st.button("Reset to defaults", key=f"{key}_hp_reset", icon=":material/restart_alt:"):
-            for k_ in [k_ for k_ in st.session_state if str(k_).startswith(hp_prefix + "_")]:
-                del st.session_state[k_]
-            st.rerun()
-    with st.expander("Automatic parameter selection", icon=":material/auto_fix_high:"):
-        st.caption("Searches each selected model's parameters and keeps the settings with the lowest error on training "
-                   "batteries held out during cross-validation. The test battery's cycles after the training | test "
-                   "line are never used, so tuning cannot see the answer. The defaults are always tried first.")
-        t1, t2 = st.columns([2, 1])
-        n_iter = t1.select_slider("Candidates per model", [6, 10, 16, 24], value=10, key=f"{key}_tn_iter",
-                                  help="More candidates search better but take longer; deep models take about 10–30 s each.")
-        method = t2.radio("Search", list(te.TUNING_METHODS), index=1, horizontal=True, key=f"{key}_tn_method",
-                          format_func={"random": "Random", "bayesian": "Bayesian optimisation"}.get)
-        show_t0 = sc.get("show", sc["targets"][0])
-        if st.button(f"Tune Level {level}: {len(mdls)} model(s) on {show_t0}, {mode} mode", key=f"{key}_tn_go",
-                     icon=":material/auto_fix_high:", disabled=not mdls):
-            prog = st.progress(0.0)
-            best, rows = {}, []
-            for i, m in enumerate(mdls):
-                r = te.tune_level_model(ct, imp, show_t0, sc["n0"][show_t0], m, mode, train, float(eol_ah), n_iter=int(n_iter),
-                                        method=method, progress=lambda f_, msg: prog.progress(
-                                            min((i + max(min(float(f_), 1.0), 0.0)) / len(mdls), 1.0), text=f"{m}: {msg}"))
-                best[m] = r.best_params
-                rows.append({"Model": m, "Default CV RMSE": r.default_score, "Tuned CV RMSE": r.best_score,
-                             "Improvement (%)": r.improvement_pct, "Time (s)": r.seconds,
-                             "Best parameters": ", ".join(f"{k_}={v:.3g}" if isinstance(v, float) else f"{k_}={v}"
-                                                          for k_, v in r.best_params.items())})
-            prog.empty()
-            st.session_state[f"{key}_pending"] = best
-            st.session_state[f"{key}_tuning"] = pd.DataFrame(rows).set_index("Model")
-            st.rerun()
-        tun = st.session_state.get(f"{key}_tuning")
-        if tun is not None and len(tun):
-            show_table(tun.style.format({"Default CV RMSE": "{:.4f}", "Tuned CV RMSE": "{:.4f}", "Improvement (%)": "{:+.0f}",
-                                         "Time (s)": "{:.0f}"}),
-                       note="Errors on held-out training batteries (SOH units). The best parameters are now set in "
-                            "'Model parameters' and used by the next Train.")
     if sc["mode"] == "within":
         pool = te.v2_training_pool(ct, cell)
         st.caption(f"Within scheme: trained on {len(pool)} batteries ({', '.join(pool[:6])}{'…' if len(pool) > 6 else ''}): "
@@ -5123,7 +4971,7 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
                 prog.progress(k_ / max(len(mdls) * len(sc["targets"]), 1), text=f"{m} on {t}")
                 k_ += 1
                 try:
-                    f = trainer(t, sc["n0"][t], m, mode, train, model_params=params.get(m), **kw)
+                    f = trainer(t, sc["n0"][t], m, mode, train, **kw)
                     out.setdefault(t, []).append(f)
                     ladder_add(f.model, level, sc["n0"][t], f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
                 except Exception as exc:
@@ -5152,12 +5000,14 @@ def trajectory_section() -> None:
         "number, the operating conditions and the measured health parameters, then predict the selected battery **cycle "
         "by cycle**. This level is independent: it uses no baseline.",
         {m: m for m in te.available_models()}, ("Bayesian Ridge", "Random Forest", "SVM", "Gaussian Process", "XGBoost", "LightGBM"),
-        lambda t, n0, m, mode, train, model_params=None: te.train_trajectory_model(ct, imp, t, n0, m, mode, train,
-                                                                                  float(eol_ah), model_params=model_params),
-        "tr")
+        lambda t, n0, m, mode, train: te.train_trajectory_model(ct, imp, t, n0, m, mode, train, float(eol_ah)), "tr")
 
 
 def deep_section() -> None:
+    def extra() -> Dict[str, Any]:
+        ep = st.select_slider("Training iterations (GRU, Transformer)", [150, 300, 500, 800], value=300, key="dl_epochs",
+                              help="More iterations fit better but take longer; the MLP stops early on its own.")
+        return {"epochs": int(ep)}
     model_level_section(
         3, "Level 3 · Deep learning: do neural networks predict better than Level 2?",
         "The **same question, data, training batteries and test** as Level 2, answered with neural networks. The "
@@ -5166,9 +5016,8 @@ def deep_section() -> None:
         "temperature-rise and CV-time history up to the origin; in measured mode its mean voltage, resistance, charge "
         "times, temperatures and efficiency. This level is independent of Levels 1 and 2.",
         te.DL_MODELS, ("MLP", "GRU", "Transformer"),
-        lambda t, n0, m, mode, train, model_params=None, **_: te.train_deep_trajectory(ct, imp, t, n0, m, mode, train,
-                                                                                       float(eol_ah), model_params=model_params),
-        "dl")
+        lambda t, n0, m, mode, train, epochs=300: te.train_deep_trajectory(ct, imp, t, n0, m, mode, train, float(eol_ah),
+                                                                            epochs=epochs), "dl", extra)
 
 
 def view_models() -> None:

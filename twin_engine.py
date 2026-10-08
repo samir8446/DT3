@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.7.0"
+ENGINE_VERSION = "5.6.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -7367,7 +7367,7 @@ def protocol_cells(ct: pd.DataFrame, group: str, min_cycles: int = 25) -> List[s
 
 def run_protocol(store: Any, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str],
                  models: Sequence[str], origins: Sequence[float] = PROTOCOL_ORIGINS, eol_ah: float = DEFAULT_EOL_AH,
-                 eol_k: int = 3, progress: ProgressFn = None, only_cells: Optional[Sequence[str]] = None) -> pd.DataFrame:
+                 eol_k: int = 3, progress: ProgressFn = None) -> pd.DataFrame:
     """Evaluate models with the one protocol: leave-one-battery-out among `cells`, forecasts from each origin
     (share of the battery's recorded life), scored on all later measured cycles. One row per
     (battery, origin, model); failures are kept as rows with status (never silently dropped)."""
@@ -7375,7 +7375,7 @@ def run_protocol(store: Any, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell
     cells = list(cells)
     total = max(len(cells) * len(origins) * len(models), 1)
     k_ = 0
-    for c in (list(only_cells) if only_cells is not None else cells):
+    for c in cells:
         good = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
         n_last = int(good["n"].max())
         soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
@@ -7541,14 +7541,12 @@ def _traj_forecast_rows(ct: pd.DataFrame, cell: str, k: int, until: Optional[int
                          "tcv_rel0": f["tcv_rel"], "dq0": f["dq_logvar"]})
 
 
-def _make_mlp(seed: int = 0, params: Optional[Dict[str, Any]] = None) -> Any:
+def _make_mlp(seed: int = 0) -> Any:
     """Feed-forward neural network on the same inputs as the Level-2 models (scaled; early stopping)."""
     from sklearn.neural_network import MLPRegressor
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import StandardScaler
-    p = {"width": 64, "layers": 2, "alpha": 1e-3, "learning_rate": 3e-3, **(params or {})}
-    return make_pipeline(StandardScaler(), MLPRegressor(hidden_layer_sizes=(int(p["width"]),) * int(p["layers"]),
-                                                        alpha=float(p["alpha"]), learning_rate_init=float(p["learning_rate"]),
+    return make_pipeline(StandardScaler(), MLPRegressor(hidden_layer_sizes=(64, 64), alpha=1e-3, learning_rate_init=3e-3,
                                                         max_iter=600, early_stopping=True, n_iter_no_change=25,
                                                         random_state=seed))
 
@@ -7597,8 +7595,7 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
                            train_cells: Optional[Sequence[str]] = None, eol_ah: float = DEFAULT_EOL_AH,
                            level: float = 0.9, origin_fracs: Sequence[float] = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
                            step: int = 2, cv_folds: int = 3, seed: int = 0, horizon_factor: float = 1.0,
-                           target: str = "auto", importance: bool = True,
-                           model_params: Optional[Dict[str, Any]] = None) -> TrajectoryForecast:
+                           target: str = "auto", importance: bool = True) -> TrajectoryForecast:
     """Learn SOH of every cycle from all training batteries and predict the target battery cycle by cycle.
     forecast mode: rows (origin k, future cycle m) from each training battery at several origins; the target is
     predicted from its own state at n0. measured mode: rows = cycles with their own measurements. The band comes
@@ -7610,8 +7607,6 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
     if target == "auto":      # trees predict piecewise-constant values: a rate keeps them from flattening; smooth
         target = "rate" if model_name in TRAJ_RATE_MODELS else "change"     # models extrapolate the change directly
     prm = {"degree": 1} if (model_name in MODEL_SPECS and MODEL_SPECS[model_name].poly) else None
-    if model_params and model_name != "MLP":
-        prm = validate_params(model_name, {**(prm or {}), **model_params})
     pool = [c for c in (train_cells if train_cells is not None else v2_training_pool(ct, cell_id)) if c != cell_id]
     good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
     n_last = int(good["n"].max())
@@ -7663,7 +7658,7 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
 
     def fit(Xa, ya):
         Xs, ys, _ = _gp_subsample(model_name, Xa, ya, np.ones(len(ya)), seed)
-        est = _make_mlp(seed, model_params) if model_name == "MLP" else make_model(model_name, seed, prm)
+        est = _make_mlp(seed) if model_name == "MLP" else make_model(model_name, seed, prm)
         return _StandardisedTarget(est).fit(Xs, ys)
 
     rng = np.random.default_rng(seed)
@@ -7800,17 +7795,11 @@ def train_deep_trajectory(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id
                           mode: str = "forecast", train_cells: Optional[Sequence[str]] = None,
                           eol_ah: float = DEFAULT_EOL_AH, L: int = 10, epochs: int = 300, hidden: int = 16,
                           lr: float = 3e-3, level: float = 0.9, cv_folds: int = 2, seed: int = 0,
-                          importance: bool = True, model_params: Optional[Dict[str, Any]] = None) -> "TrajectoryForecast":
-    """Level 3 (see the section header). kind = MLP | GRU | Transformer. model_params override the network settings
-    (MLP: width, layers, alpha, learning_rate; GRU / Transformer: hidden, window, epochs, learning_rate)."""
+                          importance: bool = True) -> "TrajectoryForecast":
+    """Level 3 (see the section header). kind = MLP | GRU | Transformer."""
     if kind == "MLP":
         return train_trajectory_model(ct, imp, cell_id, n0, "MLP", mode, train_cells, eol_ah, level=level,
-                                      cv_folds=max(cv_folds, 2), seed=seed, importance=importance, model_params=model_params)
-    if model_params:
-        hidden = int(model_params.get("hidden", hidden))
-        L = int(model_params.get("window", L))
-        epochs = int(model_params.get("epochs", epochs))
-        lr = float(model_params.get("learning_rate", lr))
+                                      cv_folds=max(cv_folds, 2), seed=seed, importance=importance)
     t0 = time.time()
     if mode not in TRAJ_MODES:
         raise ValueError(f"mode must be one of {tuple(TRAJ_MODES)}")
@@ -7944,121 +7933,3 @@ def _protocol_forecast(key, store, ct, imp, cell, n0, train, eol_ah):  # noqa: F
         mode = "forecast" if key.startswith("dl:") else "measured"
         return train_deep_trajectory(ct, imp, cell, n0, key.split(":", 1)[1], mode, train, eol_ah, importance=False)
     return _protocol_forecast_l2(key, store, ct, imp, cell, n0, train, eol_ah)
-
-
-
-# =============================================================================
-# 36. HYPERPARAMETERS FOR EVERY LEVEL-2 / LEVEL-3 MODEL: specifications and automatic selection
-# =============================================================================
-MODEL_SPECS.update({
-    "MLP": ModelSpec("MLP", "Neural network", "Feed-forward network on the Level-2 inputs (early stopping).",
-                     (_P("width", "Neurons per layer", "int", 64, 8, 256), _P("layers", "Hidden layers", "int", 2, 1, 4),
-                      _P("alpha", "L2 regularisation", "log", 1e-3, 1e-6, 1e-1),
-                      _P("learning_rate", "Learning rate", "log", 3e-3, 1e-4, 3e-2)), level=3),
-    "GRU": ModelSpec("GRU", "Recurrent network", "Gated recurrent network over the last cycles.",
-                     (_P("hidden", "Hidden units", "int", 16, 4, 64), _P("window", "Window (cycles)", "int", 10, 4, 25),
-                      _P("epochs", "Training iterations", "int", 300, 80, 1200),
-                      _P("learning_rate", "Learning rate", "log", 3e-3, 3e-4, 3e-2)), level=3),
-    "Transformer": ModelSpec("Transformer", "Attention network", "Self-attention over the last cycles.",
-                             (_P("hidden", "Hidden units", "int", 16, 4, 64), _P("window", "Window (cycles)", "int", 10, 4, 25),
-                              _P("epochs", "Training iterations", "int", 300, 80, 1200),
-                              _P("learning_rate", "Learning rate", "log", 3e-3, 3e-4, 3e-2)), level=3),
-})
-
-
-TUNING_METHODS = ("random", "bayesian")
-
-
-def _encode(name: str, prm: Dict[str, Any]) -> np.ndarray:
-    """Hyperparameters -> point in [0, 1]^d (log scale for 'log', index for choices)."""
-    out = []
-    for h in MODEL_SPECS[name].params:
-        v = prm[h.key]
-        if h.kind == "choice":
-            out.append(h.options.index(v) / max(len(h.options) - 1, 1) if v in h.options else 0.0)
-        elif h.kind == "log":
-            out.append((math.log(v) - math.log(h.low)) / (math.log(h.high) - math.log(h.low)))
-        elif h.kind in ("int", "float"):
-            out.append((float(v) - h.low) / max(h.high - h.low, 1e-12))
-        else:
-            out.append(0.0)
-    return np.clip(np.array(out, float), 0, 1)
-
-
-def _search(name: str, n_iter: int, evaluate: Callable[[Dict[str, Any]], Tuple[float, float, float]],
-            rng: np.random.Generator, method: str = "random", progress: ProgressFn = None) -> List[Dict[str, Any]]:
-    """Hyperparameter search. The defaults are always candidate 0 (tuning can never be worse than the defaults on
-    validation). 'random': the remaining candidates are drawn from the search space. 'bayesian': after a few
-    random starts, a Gaussian-process surrogate of the validation score proposes each next candidate by expected
-    improvement among 400 random proposals (sequential model-based optimisation)."""
-    from scipy.stats import norm
-    from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
-
-    rows: List[Dict[str, Any]] = []
-    n_init = 4 if method == "bayesian" else n_iter
-    for j in range(max(n_iter, 1)):
-        _report(progress, j / max(n_iter, 1), f"{name}: candidate {j + 1}/{n_iter} ({method})")
-        if j == 0:
-            prm = default_params(name)
-        elif j < n_init or not MODEL_SPECS[name].params:
-            prm = sample_params(name, rng)
-        else:
-            done = [r for r in rows if np.isfinite(r["score"])]
-            Xo = np.array([_encode(name, r["params"]) for r in done])
-            yo = np.array([r["score"] for r in done])
-            try:
-                gp = GaussianProcessRegressor(ConstantKernel(1.0) * Matern(length_scale=0.3, nu=2.5) + WhiteKernel(1e-4),
-                                              normalize_y=True, random_state=0).fit(Xo, yo)
-                props = [sample_params(name, rng) for _ in range(400)]
-                Xp = np.array([_encode(name, q) for q in props])
-                mu, sd = gp.predict(Xp, return_std=True)
-                best = yo.min()
-                z = (best - mu) / np.maximum(sd, 1e-12)
-                ei = (best - mu) * norm.cdf(z) + sd * norm.pdf(z)
-                prm = props[int(np.argmax(ei))]
-            except Exception:
-                prm = sample_params(name, rng)
-        sc, mu_, sd_ = evaluate(prm)
-        rows.append({"candidate": j, "score": sc, "mean RMSE": mu_, "sd RMSE": sd_, "params": prm,
-                     "is_default": j == 0, "method": method})
-    return rows
-
-
-
-def tune_level_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str, n0: int, model_name: str,
-                     mode: str = "forecast", train_cells: Optional[Sequence[str]] = None, eol_ah: float = DEFAULT_EOL_AH,
-                     n_iter: int = 10, method: str = "bayesian", seed: int = 0, progress: ProgressFn = None) -> "TuningResult":
-    """Automatic parameter selection for a Level-2 or Level-3 model. Each candidate is scored by its error on
-    training batteries held out during cross-validation (the same score as 'CV RMSE'): the test battery's cycles
-    after the origin are never used, so tuning cannot leak the answer. The defaults are always candidate 0."""
-    t0 = time.time()
-    deep = model_name in DL_MODELS
-
-    def evaluate(prm):
-        try:
-            if deep:
-                f = train_deep_trajectory(ct, imp, cell_id, n0, model_name, mode, train_cells, eol_ah, seed=seed,
-                                          importance=False, model_params=prm)
-            else:
-                f = train_trajectory_model(ct, imp, cell_id, n0, model_name, mode, train_cells, eol_ah, cv_folds=3,
-                                           seed=seed, importance=False, model_params=prm)
-            sc = float(f.cv_rmse) if np.isfinite(f.cv_rmse) else float("inf")
-        except Exception:
-            sc = float("inf")
-        return sc, sc, 0.0
-
-    rows = _search(model_name, n_iter, evaluate, np.random.default_rng(seed), method, progress)
-    tab = pd.DataFrame(rows).sort_values("score").reset_index(drop=True)
-    best = tab.iloc[0]
-    return TuningResult(model_name, dict(best["params"]), default_params(model_name), float(best["score"]),
-                        float(tab.loc[tab["is_default"], "score"].iloc[0]), tab,
-                        f"{method} search · CV error on held-out training batteries ({mode} mode)", time.time() - t0)
-
-
-def run_protocol_task(store: Any, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], key: str,
-                      origin: float, held_out: str, eol_ah: float = DEFAULT_EOL_AH) -> pd.DataFrame:
-    """One assessment forecast (one held-out battery, one origin, one model): the unit that the app caches, so an
-    interrupted assessment resumes where it stopped and completed forecasts are never recomputed."""
-    res = run_protocol(store, ct, imp, list(cells), [key], (origin,), eol_ah, only_cells=[held_out])
-    return res

@@ -1,24 +1,9 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.7.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.6.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
-
-## Parameters, automatic selection, reliable assessment, new design (v5.7.0)
-
-- Every Level-2 and Level-3 model has a 'Model parameters' panel (its own settings, from te.MODEL_SPECS; specs added
-  for MLP, GRU, Transformer) and an 'Automatic parameter selection' (`tune_level_model`: Bayesian optimisation or
-  random search, defaults always tried first, scored by the CV error on training batteries held out during
-  cross-validation, never on the test battery's future). Tuned values are written into the panel and used by the next
-  Train. Synthetic check: MLP measured CV 0.056 -> 0.021; GRU forecast CV 0.028 -> 0.024 and test RMSE 0.033 -> 0.015;
-  Random Forest -3 %.
-- Accuracy assessment: each forecast is a cached task (`run_protocol_task`); the scoreboard fills in live, partial
-  results survive an interruption and repeated runs reuse finished forecasts (synthetic: 31 s -> 1.4 s). New headline
-  metrics and a per-battery table (best model per battery, battery wins). Verdict bug fixed (it ignored the
-  'better on all N batteries' wording). Defaults: origin 30 %, fewer models; time estimate before running.
-- Design: instrument-panel look (IBM Plex Sans with tabular figures, one teal accent, calm hero without the feature
-  chips, sentence-case labels, status bar without monospace capitals, reduced-motion respected).
 
 ## Level 3 · Deep learning and usability (v5.6.0)
 
