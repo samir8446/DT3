@@ -237,37 +237,22 @@ def resolve_palette(choice: str, publication: bool) -> Palette:
     return DARK if mode == "dark" else LIGHT
 
 
-# Design layer (instrument panel): one typeface with tabular figures, one interactive accent (electrolyte teal),
-# calm blue-graphite hero where the cell <-> twin illustration is the single memorable element; sentence case.
+# Design layer on top of the original colours: one typeface with tabular figures, sentence-case labels, visible
+# keyboard focus and reduced motion when requested (the original gradients and palette are kept).
 DESIGN_CSS = """<style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
-:root { --dz-ink: #0F1E2A; --dz-line: #23394B; --dz-teal: #177E78; --dz-teal-hi: #2FA7A0; --dz-teal-dk: #126762;
-        --dz-mist: #9DB4C4; }
 html, body, .stApp, .stMarkdown, p, li, label, input, textarea, select, button, h1, h2, h3, h4, h5,
 div[data-testid="stMetricValue"], div[data-testid="stMetricLabel"] {
   font-family: 'IBM Plex Sans', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; }
 div[data-testid="stMetricValue"], div[data-testid="stDataFrame"], div[data-testid="stTable"], .bt-statusbar {
   font-variant-numeric: tabular-nums; }
-.bt-hero { background: var(--dz-ink) !important; animation: none !important; border: 1px solid var(--dz-line);
-  box-shadow: none !important; border-radius: 14px !important; }
-.bt-hero::before { opacity: 0.10 !important; background-size: 24px 24px !important; }
-.bt-hero::after { display: none !important; }
 .bt-hero .bt-kicker { text-transform: none !important; letter-spacing: 0 !important; font-weight: 500 !important;
-  font-size: 0.92rem !important; color: var(--dz-mist) !important; }
-.bt-hero .bt-title { font-weight: 600 !important; font-size: 2.15rem !important; letter-spacing: -0.02em !important; }
-.bt-hero .bt-sub { color: #C9D6E0 !important; max-width: 62ch !important; }
-.stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
-  background: var(--dz-teal) !important; box-shadow: none !important; border: 1px solid var(--dz-teal-dk) !important;
-  border-radius: 8px !important; font-weight: 600 !important; }
-.stButton > button[kind="primary"]:hover { background: var(--dz-teal-dk) !important; filter: none !important; }
-.stButton > button:focus-visible { outline: 2px solid var(--dz-teal-hi) !important; outline-offset: 2px; }
-div[data-baseweb="tab-highlight"] { background: var(--dz-teal-hi) !important; }
-.bt-section { font-weight: 600 !important; animation: none !important; }
-.bt-section .bt-num { background: transparent !important; box-shadow: none !important; color: var(--dz-teal-hi) !important;
-  border: 1px solid var(--dz-teal-hi); font-weight: 600 !important; border-radius: 6px !important; }
+  font-size: 0.92rem !important; }
+.bt-hero .bt-title { font-weight: 650 !important; letter-spacing: -0.02em !important; }
+.stButton > button:focus-visible { outline: 2px solid var(--bt-accent) !important; outline-offset: 2px; }
 .bt-statusbar { font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif !important; letter-spacing: 0 !important;
-  font-size: 0.86rem !important; background: var(--dz-ink) !important; border-color: var(--dz-line) !important; }
-@media (prefers-reduced-motion: reduce) { .bt-dot, .bt-pkt, .bt-scan { animation: none !important; } }
+  font-size: 0.86rem !important; }
+@media (prefers-reduced-motion: reduce) { .bt-hero, .bt-dot, .bt-pkt, .bt-scan { animation: none !important; } }
 </style>"""
 
 
