@@ -1,24 +1,9 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.8.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.7.1)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
-
-## Level 4 · Physics-informed neural network (v5.8.0)
-
-`train_pinn_model` / `train_pinn_level`: three latent mechanism states (LLI by SEI growth, LLI by lithium plating, LAM)
-learned from all training batteries and the predicted battery's cycles up to the origin. Electrochemistry links them to
-the measurements (SOH = (1 - LLI_sei - LLI_pl)(1 - LAM); R/R0 grows with the SEI film). Degradation equations enforced as
-residuals at collocation points, including the predicted battery's future: diffusion-limited SEI growth with Arrhenius
-temperature dependence; plating promoted by cold, high current and LAM (knees); LAM with cycling. Per-battery
-multipliers through a learned battery code. Band and CV error from held-out forecasts (training batteries cut at the
-same share of life). "Same network without physics" included as an ablation; the physics weight is a tunable parameter.
-Mechanism decomposition chart and learned-physics table. Forecast mode only.
-Synthetic check (3 batteries, origin 30 %): CV error of held-out forecasts 0.033 with physics vs 0.062 without; on the
-test batteries themselves mixed (physics better on 1 of 3: 0.035 vs 0.069; worse on 2: 0.048 vs 0.011, 0.048 vs 0.019).
-The synthetic generator creates knees by a rate change at a fixed cycle, not by LAM-driven plating, so its physics is
-partly mis-specified for the PINN: judge on real data with the ablation and the assessment.
 
 ## Fix: training with all batteries (v5.7.1)
 

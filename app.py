@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.8.0"
+REQUIRED_ENGINE = "5.7.1"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -60,7 +60,7 @@ st.set_page_config(
 
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
-                   "tune_level_model", "run_protocol_task", "train_pinn_model")
+                   "tune_level_model", "run_protocol_task")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -237,54 +237,37 @@ def resolve_palette(choice: str, publication: bool) -> Palette:
     return DARK if mode == "dark" else LIGHT
 
 
-# Design layer on top of the original colours: one typeface with tabular figures, sentence-case labels, visible
-# keyboard focus and reduced motion when requested (the original gradients and palette are kept).
+# Design layer (instrument panel): one typeface with tabular figures, one interactive accent (electrolyte teal),
+# calm blue-graphite hero where the cell <-> twin illustration is the single memorable element; sentence case.
 DESIGN_CSS = """<style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+:root { --dz-ink: #0F1E2A; --dz-line: #23394B; --dz-teal: #177E78; --dz-teal-hi: #2FA7A0; --dz-teal-dk: #126762;
+        --dz-mist: #9DB4C4; }
 html, body, .stApp, .stMarkdown, p, li, label, input, textarea, select, button, h1, h2, h3, h4, h5,
 div[data-testid="stMetricValue"], div[data-testid="stMetricLabel"] {
   font-family: 'IBM Plex Sans', 'Segoe UI', 'Helvetica Neue', Arial, sans-serif; }
 div[data-testid="stMetricValue"], div[data-testid="stDataFrame"], div[data-testid="stTable"], .bt-statusbar {
   font-variant-numeric: tabular-nums; }
+.bt-hero { background: var(--dz-ink) !important; animation: none !important; border: 1px solid var(--dz-line);
+  box-shadow: none !important; border-radius: 14px !important; }
+.bt-hero::before { opacity: 0.10 !important; background-size: 24px 24px !important; }
+.bt-hero::after { display: none !important; }
 .bt-hero .bt-kicker { text-transform: none !important; letter-spacing: 0 !important; font-weight: 500 !important;
-  font-size: 0.92rem !important; }
-.bt-hero .bt-title { font-weight: 650 !important; letter-spacing: -0.02em !important; }
-.stButton > button:focus-visible { outline: 2px solid var(--bt-accent) !important; outline-offset: 2px; }
+  font-size: 0.92rem !important; color: var(--dz-mist) !important; }
+.bt-hero .bt-title { font-weight: 600 !important; font-size: 2.15rem !important; letter-spacing: -0.02em !important; }
+.bt-hero .bt-sub { color: #C9D6E0 !important; max-width: 62ch !important; }
+.stButton > button[kind="primary"], .stDownloadButton > button[kind="primary"] {
+  background: var(--dz-teal) !important; box-shadow: none !important; border: 1px solid var(--dz-teal-dk) !important;
+  border-radius: 8px !important; font-weight: 600 !important; }
+.stButton > button[kind="primary"]:hover { background: var(--dz-teal-dk) !important; filter: none !important; }
+.stButton > button:focus-visible { outline: 2px solid var(--dz-teal-hi) !important; outline-offset: 2px; }
+div[data-baseweb="tab-highlight"] { background: var(--dz-teal-hi) !important; }
+.bt-section { font-weight: 600 !important; animation: none !important; }
+.bt-section .bt-num { background: transparent !important; box-shadow: none !important; color: var(--dz-teal-hi) !important;
+  border: 1px solid var(--dz-teal-hi); font-weight: 600 !important; border-radius: 6px !important; }
 .bt-statusbar { font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif !important; letter-spacing: 0 !important;
-  font-size: 0.86rem !important; }
-@media (prefers-reduced-motion: reduce) { .bt-hero, .bt-dot, .bt-pkt, .bt-scan { animation: none !important; } }
-/* ---------- application look: full-width workspace, title bar, tab strip, panels, denser controls ---------- */
-html { font-size: 15px; }
-.block-container { max-width: 100% !important; padding: 0.4rem 1.4rem 2rem 1.4rem !important; }
-div[data-testid="stToolbar"], div[data-testid="stDecoration"], footer, #MainMenu { display: none !important; }
-header[data-testid="stHeader"] { background: transparent !important; height: 2.4rem !important; }
-.bt-appbar { display: flex; align-items: center; gap: 14px; padding: 9px 16px; margin: 0;
-  background: #0E1726; color: #E6EEF7; border: 1px solid #1F2E45; border-bottom: 0; border-radius: 8px 8px 0 0;
-  position: relative; }
-.bt-appbar::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: var(--bt-grad); }
-.bt-appicon { display: inline-flex; width: 28px; height: 28px; border-radius: 6px; background: var(--bt-grad);
-  align-items: center; justify-content: center; flex: none; }
-.bt-appname { font-weight: 650; font-size: 1.02rem; letter-spacing: -0.01em; }
-.bt-appmeta { color: #8EA3BA; font-size: 0.86rem; }
-.bt-appright { margin-left: auto; color: #8EA3BA; font-size: 0.82rem; }
-.bt-statusbar { margin: 0 0 10px 0 !important; border-radius: 0 0 8px 8px !important; border-top: 0 !important;
-  padding: 6px 16px !important; box-shadow: none !important; }
-div[data-testid="stButtonGroup"] { border-bottom: 1px solid var(--bt-border); gap: 0 !important; margin-bottom: 6px; }
-div[data-testid="stButtonGroup"] button { border-radius: 6px 6px 0 0 !important; border: 1px solid transparent !important;
-  border-bottom: 0 !important; background: transparent !important; padding: 6px 16px !important; font-weight: 500 !important;
-  margin-bottom: -1px; }
-div[data-testid="stButtonGroup"] button[kind$="Active"], div[data-testid="stButtonGroup"] button[aria-checked="true"] {
-  background: var(--bt-surface) !important; border-color: var(--bt-border) !important; font-weight: 650 !important;
-  box-shadow: inset 0 3px 0 0 #0072B2 !important; }
-.bt-section { font-size: 1.02rem !important; font-weight: 650 !important; margin: 1.4rem 0 0.6rem 0 !important;
-  padding: 7px 12px !important; border: 1px solid var(--bt-border) !important; border-radius: 6px !important;
-  background: var(--bt-surface); animation: none !important; }
-.bt-section .bt-num { width: 24px !important; height: 24px !important; border-radius: 5px !important; font-size: 0.78rem !important; }
-div[data-testid="stVerticalBlockBorderWrapper"] { border-radius: 6px !important; }
-div[data-testid="stExpander"] details { border-radius: 6px !important; }
-div[data-testid="stWidgetLabel"] p { font-size: 0.84rem !important; font-weight: 500 !important; }
-.stButton > button, .stDownloadButton > button { border-radius: 6px !important; padding: 0.3rem 0.9rem !important; }
-.bt-context { border-radius: 6px !important; }
+  font-size: 0.86rem !important; background: var(--dz-ink) !important; border-color: var(--dz-line) !important; }
+@media (prefers-reduced-motion: reduce) { .bt-dot, .bt-pkt, .bt-scan { animation: none !important; } }
 </style>"""
 
 
@@ -623,8 +606,6 @@ EXPLAIN: Dict[str, str] = {
     "uf_fig": "Tracking accuracy when the twin is updated every m cycles: it shows how rarely the twin can be updated without losing accuracy (Mission 2).",
     # models
     "acc_board": "Every model with the same held-out batteries and origins. Bars: mean error ± 95% CI; dashed line: the best baseline. A model is only worth using if it beats that line clearly.",
-    "pinn_forecast_fig": "Level 4: forecasts of the physics-informed network and of the same network without physics (the ablation), from the training | test line.",
-    "pinn_mech": "The PINN's decomposition of the predicted capacity loss into its three mechanisms, from the origin to the last cycle. A late rise of plating is the mechanism behind a knee.",
     "tr_forecast_fig": "Level 2 in forecast mode: cycle-by-cycle predictions from what is known at the training | test line plus the operating conditions.",
     "tr_measured_fig": "Level 2 in measured mode: each test cycle's SOH estimated from that cycle's measured parameters.",
     "dl_forecast_fig": "Level 3 in forecast mode: neural networks, same question and data as Level 2.",
@@ -2585,12 +2566,13 @@ HERO_ART = re.sub(r"<!--.*?-->", "", HERO_ART)
 HERO_ART = " ".join(line.strip() for line in HERO_ART.splitlines())      # one line: no markdown code blocks
 HERO_CSS = " ".join(line.strip() for line in HERO_CSS.splitlines())
 st.markdown(
-    '<div class="bt-appbar"><span class="bt-appicon"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">'
-    '<rect x="3" y="2.5" width="10" height="12" rx="2" fill="none" stroke="#fff" stroke-width="1.5"/>'
-    '<rect x="6" y="0.8" width="4" height="1.8" rx="0.6" fill="#fff"/><rect x="5" y="7.5" width="6" height="5" rx="1" fill="#fff"/>'
-    '</svg></span><span class="bt-appname">Battery Digital Twin</span>'
-    '<span class="bt-appmeta">NASA Ames lithium-ion ageing data</span>'
-    f'<span class="bt-appright">Engine {te.ENGINE_VERSION}</span></div>',
+    HERO_CSS +
+    '<div class="bt-hero"><div class="bt-hero-text">'
+    '<div class="bt-kicker">NASA Ames lithium-ion ageing data</div>'
+    '<div class="bt-title">Battery digital twin</div>'
+    '<div class="bt-sub">A physical cell and its virtual copy, synchronised cycle by cycle: diagnose ageing, '
+    'forecast remaining life and decide when to act.</div>'
+    '</div>' + HERO_ART + '</div>',
     unsafe_allow_html=True,
 )
 
@@ -2667,6 +2649,7 @@ _n_warn = int((_fs_bar["Risk"] == "Warning").sum()) if len(_fs_bar) else 0
 st.markdown(
     '<div class="bt-statusbar">'
     '<span class="bt-live"><span class="bt-dot"></span>Replaying recorded data</span>'
+    f'<span>Engine <b>v{te.ENGINE_VERSION}</b></span>'
     f'<span>Source <b>{"synthetic demo" if st.session_state.get("demo") else "telemetry"}</b></span>'
     f'<span><b>{len(meta)}</b> cells, <b>{int(ct["n"].count()):,}</b> cycles</span>'
     f'<span class="bt-sev bt-sev-crit">{_n_crit} critical</span>'
@@ -3530,8 +3513,6 @@ def _reco_items(view: str) -> List[Tuple[str, str]]:
             items.append(("trending_up", "Next: **Level 2 · Machine learning**, then compare in the leaderboard."))
         elif 3 not in done:
             items.append(("trending_up", "Next: **Level 3 · Deep learning**: does it beat Level 2 on the same test?"))
-        elif 4 not in done:
-            items.append(("trending_up", "Next: **Level 4 · Physics-informed**: does the physics improve the forecast?"))
         items.append(("fact_check", "One battery is an anecdote: confirm the ranking with the **Same operating conditions** "
                                     "or **Across batteries** scheme and several test batteries."))
     elif view == "ops":
@@ -4492,7 +4473,6 @@ LEVEL_INFO = {
     1: ("Baselines", "Persistence, linear trend and fleet shape: references that need no learning."),
     2: ("Machine learning", "SOH of every cycle learned from all training batteries: conditions and health parameters."),
     3: ("Deep learning", "MLP on the Level-2 inputs, GRU and Transformer over the last cycles: same question, neural networks."),
-    4: ("Physics-informed", "Neural network constrained by the electrochemistry and degradation-mechanism equations."),
     4: ("Deep learning", "GRU recurrent network and Transformer: learn from sequences of past SOH."),
     5: ("Hybrid & physics-informed", "Mechanistic PINN and hierarchical Bayes: equations plus learning."),
     6: ("First principles", "Single-particle electrochemical model with SEI growth: physics only, calibrated."),
@@ -4883,12 +4863,12 @@ def ladder_leaderboard() -> None:
         st.rerun()
 
 
-ACTIVE_LEVELS = (1, 2, 3, 4)     # independent levels, compared only in the leaderboard and the assessment
+ACTIVE_LEVELS = (1, 2, 3)        # independent levels; advanced ones (hybrid, physics) are added back step by step
 
 
 FAMILY_COLORS = {"Baselines": "#8C8C8C", "Machine learning (forecast)": "#0072B2",
                  "Machine learning (measured)": "#56B4E9", "Deep learning (forecast)": "#AA4499",
-                 "Deep learning (measured)": "#CC79A7", "Physics-informed (PINN)": "#882255"}
+                 "Deep learning (measured)": "#CC79A7"}
 
 
 def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
@@ -4910,7 +4890,7 @@ def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
 
 
 
-ASSESS_SECONDS = {"PINN": 8.0, "PINN-ablation": 4.0, "persistence": 0.3, "trend": 0.3, "shape": 1.0, "Bayesian Ridge": 1.5, "Decision Tree": 1.5,
+ASSESS_SECONDS = {"persistence": 0.3, "trend": 0.3, "shape": 1.0, "Bayesian Ridge": 1.5, "Decision Tree": 1.5,
                   "Random Forest": 3.0, "SVM": 2.0, "Gaussian Process": 12.0, "XGBoost": 3.0, "LightGBM": 2.0,
                   "MLP": 2.0, "GRU": 6.0, "Transformer": 4.0}
 
@@ -4947,8 +4927,8 @@ def assessment_section() -> None:
                              default=[0.3], key="acc_origins", format_func=lambda v: f"{100 * v:.0f}%")
     av = te.available_models()
     options = (["persistence", "trend", "shape"] + [f"traj:{m}" for m in av] + [f"trajm:{m}" for m in av]
-               + [f"dl:{k}" for k in te.DL_MODELS] + [f"dlm:{k}" for k in te.DL_MODELS] + [f"pinn:{k}" for k in te.PINN_MODELS])
-    keys = st.multiselect("Models (level 1 baselines, 2 machine learning, 3 deep learning, 4 physics-informed)", options,
+               + [f"dl:{k}" for k in te.DL_MODELS] + [f"dlm:{k}" for k in te.DL_MODELS])
+    keys = st.multiselect("Models (level 1 baselines, level 2 machine learning, level 3 deep learning)", options,
                           default=["trend", "shape"] + [f"traj:{m}" for m in ("Bayesian Ridge", "Random Forest", "SVM")
                                                         if m in av] + ["dl:GRU"],
                           key="acc_models", format_func=lambda k: te.PROTOCOL_MODELS[k][1])
@@ -5070,8 +5050,7 @@ def _level_results(res: Sequence[Any], show_t: str, level: int, key: str) -> Non
 
 
 def model_level_section(level: int, title: str, intro: str, models: Dict[str, str], default: Sequence[str],
-                        trainer: Callable[..., Any], key: str, extra: Optional[Callable[[], Dict[str, Any]]] = None,
-                        modes: Sequence[str] = ("forecast", "measured")) -> None:
+                        trainer: Callable[..., Any], key: str, extra: Optional[Callable[[], Dict[str, Any]]] = None) -> None:
     """One independent level with the two modes. Results of each mode are kept separately (tabs), so both stay
     visible after switching mode and training again."""
     section(title)
@@ -5080,7 +5059,7 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
     c1, c2 = st.columns([2, 1])
     mdls = c1.multiselect("Models", list(models), default=[m for m in default if m in models], key=f"{key}_models",
                           format_func=lambda m: models[m])
-    mode = c2.radio("Mode to train", list(modes), key=f"{key}_mode", format_func=te.TRAJ_MODES.get,
+    mode = c2.radio("Mode to train", list(te.TRAJ_MODES), key=f"{key}_mode", format_func=te.TRAJ_MODES.get,
                     help="Forecast: only what is known at the training | test line (a real forecast). Measured: each "
                          "test cycle's own measured parameters (estimation). Results of both modes are kept below.")
     kw = extra() if extra else {}
@@ -5164,8 +5143,8 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
     store_ = st.session_state.get(key, {})
     show_t = sc.get("show", sc["targets"][0])
     tabs = st.tabs([f"{'Forecast' if md == 'forecast' else 'Measured'} mode" + (" ✓" if store_.get(md, {}).get(show_t) else "")
-                    for md in modes])
-    for tab, md in zip(tabs, modes):
+                    for md in te.TRAJ_MODES])
+    for tab, md in zip(tabs, te.TRAJ_MODES):
         with tab:
             res = store_.get(md, {}).get(show_t, [])
             if res:
@@ -5202,48 +5181,6 @@ def deep_section() -> None:
         "dl")
 
 
-def fig_mechanisms(f: Any, P: Palette, battery: str) -> go.Figure:
-    mech = f.mechanisms
-    fig = go.Figure()
-    cols = {"LLI by SEI growth": "#0072B2", "LLI by lithium plating": "#AA4499", "Loss of active material": "#56B4E9"}
-    for k, col in cols.items():
-        fig.add_trace(go.Scatter(x=mech["n"], y=100 * np.asarray(mech[k]), mode="lines", name=k, stackgroup="m",
-                                 line=dict(color=col, width=1.5), hovertemplate="cycle %{x}: %{y:.1f}%<extra>" + k + "</extra>"))
-    fig.update_xaxes(title_text="Discharge cycle n (from the origin)")
-    fig.update_yaxes(title_text="Capacity lost (% of initial)")
-    return style_fig(fig, P, 400, f"Which mechanisms does the PINN attribute {battery}'s ageing to?")
-
-
-def pinn_section() -> None:
-    model_level_section(
-        4, "Level 4 · Physics-informed neural network: does knowing the physics improve the prediction?",
-        "The network learns three hidden degradation states (lithium lost to **SEI growth**, lithium lost to **plating**, "
-        "**loss of active material**) from all training batteries and the selected battery's own cycles. Electrochemistry "
-        "links them to what is measured (SOH = (1 − LLI) × (1 − LAM); resistance grows with the SEI film), and the "
-        "**degradation equations** are enforced, also over the battery's future: SEI growth that slows as the film "
-        "thickens and speeds up with temperature (Arrhenius); plating that grows in the cold, at high current and as "
-        "active material is lost (the cause of knees); loss of active material with cycling. The **same network "
-        "without physics** is included as an ablation, so you can see what the physics itself contributes. Forecast "
-        "mode only: the PINN models how the battery evolves.",
-        te.PINN_MODELS, ("PINN", "PINN-ablation"),
-        lambda t, n0, m, mode, train, model_params=None, **_: te.train_pinn_model(ct, imp, t, n0, m, mode, train,
-                                                                                  float(eol_ah), model_params),
-        "pinn", modes=("forecast",))
-    sc = scheme()
-    show_t = sc.get("show", sc["targets"][0])
-    res = (st.session_state.get("pinn", {}).get("forecast", {}) or {}).get(show_t, [])
-    phys = [f for f in res if getattr(f, "mechanisms", None) is not None and f.model.endswith("physics-informed")]
-    if phys:
-        f = phys[0]
-        show(fig_mechanisms(f, P, show_t), key="pinn_mech", export=False)
-        learned = {k: v for k, v in f.inputs_at_origin.items() if not k.startswith("At the last cycle")}
-        show_table(pd.DataFrame({"Learned physics": list(learned), "Value": list(learned.values())})
-                   .set_index("Learned physics").style.format({"Value": "{:.4g}"}),
-                   note="Fitted across the training batteries. Effects of conditions that do not vary among the "
-                        "training batteries (for example cold or current within one group) cannot be learned: they stay "
-                        "at their starting values.")
-
-
 def view_models() -> None:
     recommendations("models")
     section("Forecasting models: baselines and machine learning (levels 1–3)")
@@ -5254,7 +5191,6 @@ def view_models() -> None:
     ladder_baselines()
     trajectory_section()
     deep_section()
-    pinn_section()
     ladder_leaderboard()
     assessment_section()
 
