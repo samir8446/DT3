@@ -1129,6 +1129,37 @@ def test_training_with_all_batteries_survives_unusable_ones():
         assert np.isfinite(g.metrics.rmse)
 
 
+def test_pinn_level_physics_ablation_no_leakage_and_assessment():
+    m, imp, _ = te.make_synthetic_master(n_cells=5, n_cycles=100, ambients=(24,) * 5, seed=3, noise_v=0.01)
+    store = te.ParquetStore.from_dataframe(m)
+    ct = te.build_cycle_table(store)
+    n0 = 30
+    prm = {"iterations": 300}
+    f = te.train_pinn_model(ct, imp, "S001", n0, "PINN", "forecast", eol_ah=1.6, model_params=prm)
+    g = te.train_pinn_model(ct, imp, "S001", n0, "PINN-ablation", "forecast", eol_ah=1.6, model_params=prm)
+    i = int(np.searchsorted(f.n_grid, n0 + 1))
+    assert abs(f.soh[i] - f.soh[i - 1]) < 0.02 and f.model.endswith("physics-informed")
+    assert g.model.endswith("without physics") and not np.allclose(f.soh, g.soh)
+    assert all(np.all(np.asarray(f.mechanisms[k]) >= 0) for k in ("LLI by SEI growth", "LLI by lithium plating",
+                                                                 "Loss of active material"))
+    assert "Activation energy, SEI (kJ/mol)" in f.inputs_at_origin and np.isfinite(f.cv_rmse)
+    ct2 = ct.copy()
+    later = (ct2["Cell_ID"] == "S001") & (ct2["n"] > n0)
+    ct2.loc[later, ["SOH", "Capacity_Ah", "R_dc_ohm"]] *= 0.9
+    f2 = te.train_pinn_model(ct2, imp, "S001", n0, "PINN", "forecast", eol_ah=1.6, model_params=prm)
+    fut = f.n_grid > n0
+    assert np.allclose(f.soh[fut], f2.soh[fut])                           # the future never enters training
+    try:
+        te.train_pinn_model(ct, imp, "S001", n0, "PINN", "measured", eol_ah=1.6)
+        raise AssertionError("measured mode should be refused")
+    except ValueError:
+        pass
+    r = te.tune_level_model(ct, imp, "S001", n0, "PINN", n_iter=2)
+    assert "physics_weight" in r.best_params and r.best_score <= r.default_score + 1e-12
+    res = te.run_protocol(store, ct, imp, ["S001", "S002", "S003"], ["trend", "pinn:PINN"], (0.4,), 1.6)
+    assert (res["status"] == "ok").all() and "PINN · physics-informed" in te.protocol_scoreboard(res).index
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
