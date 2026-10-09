@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.8.0"
+REQUIRED_ENGINE = "5.9.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -60,7 +60,7 @@ st.set_page_config(
 
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
-                   "tune_level_model", "run_protocol_task", "train_pinn_model")
+                   "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -270,8 +270,7 @@ header[data-testid="stHeader"] { background: transparent !important; height: 2.4
 .bt-appname { font-weight: 650; font-size: 1.02rem; letter-spacing: -0.01em; }
 .bt-appmeta { color: #8EA3BA; font-size: 0.86rem; }
 .bt-appright { margin-left: auto; color: #8EA3BA; font-size: 0.82rem; }
-.bt-statusbar { margin: 0 0 10px 0 !important; border-radius: 0 0 8px 8px !important; border-top: 0 !important;
-  padding: 6px 16px !important; box-shadow: none !important; }
+.bt-statusbar { margin: 10px 0 10px 0 !important; padding: 6px 16px !important; }
 div[data-testid="stButtonGroup"] { border-bottom: 1px solid var(--bt-border); gap: 0 !important; margin-bottom: 6px; }
 div[data-testid="stButtonGroup"] button { border-radius: 6px 6px 0 0 !important; border: 1px solid transparent !important;
   border-bottom: 0 !important; background: transparent !important; padding: 6px 16px !important; font-weight: 500 !important;
@@ -2599,12 +2598,13 @@ HERO_ART = re.sub(r"<!--.*?-->", "", HERO_ART)
 HERO_ART = " ".join(line.strip() for line in HERO_ART.splitlines())      # one line: no markdown code blocks
 HERO_CSS = " ".join(line.strip() for line in HERO_CSS.splitlines())
 st.markdown(
-    '<div class="bt-appbar"><span class="bt-appicon"><svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">'
-    '<rect x="3" y="2.5" width="10" height="12" rx="2" fill="none" stroke="#fff" stroke-width="1.5"/>'
-    '<rect x="6" y="0.8" width="4" height="1.8" rx="0.6" fill="#fff"/><rect x="5" y="7.5" width="6" height="5" rx="1" fill="#fff"/>'
-    '</svg></span><span class="bt-appname">Battery Digital Twin</span>'
-    '<span class="bt-appmeta">NASA Ames lithium-ion ageing data</span>'
-    f'<span class="bt-appright">Engine {te.ENGINE_VERSION}</span></div>',
+    HERO_CSS +
+    '<div class="bt-hero"><div class="bt-hero-text">'
+    '<div class="bt-kicker">NASA Ames lithium-ion ageing data</div>'
+    '<div class="bt-title">Battery Digital Twin</div>'
+    '<div class="bt-sub">A physical cell and its virtual copy, synchronised cycle by cycle: diagnose ageing, '
+    'forecast remaining life and decide when to act.</div>'
+    '</div>' + HERO_ART + '</div>',
     unsafe_allow_html=True,
 )
 
@@ -2688,6 +2688,7 @@ _n_warn = int((_fs_bar["Risk"] == "Warning").sum()) if len(_fs_bar) else 0
 st.markdown(
     '<div class="bt-statusbar">'
     '<span class="bt-live"><span class="bt-dot"></span>Replaying recorded data</span>'
+    f'<span>Engine <b>v{te.ENGINE_VERSION}</b></span>'
     f'<span>Source <b>{"synthetic demo" if st.session_state.get("demo") else "telemetry"}</b></span>'
     f'<span><b>{len(meta)}</b> cells, <b>{int(ct["n"].count()):,}</b> cycles</span>'
     f'<span class="bt-sev bt-sev-crit">{_n_crit} critical</span>'
@@ -4732,6 +4733,15 @@ def ladder_baselines() -> None:
     st.markdown("Three forecasts that need no learning at all: **persistence** (SOH stays), **linear trend** (the "
                 "recent slope continues) and **fleet shape** (the typical fade curve of similar batteries, placed at this "
                 "battery's state and speed). If a model cannot beat the best of them, its complexity is not paying off.")
+    _names = {"persistence": "Persistence", "trend": "Linear trend", "shape": "Fleet shape"}
+    _cols = st.columns(3)
+    for _c, (_k, _lab) in zip(_cols, _names.items()):
+        with (_c.popover(_lab, icon=":material/functions:", use_container_width=True) if hasattr(st, "popover")
+              else _c.expander(_lab, icon=":material/functions:")):
+            for text, tex in MODEL_EQUATIONS[_k]:
+                if text:
+                    st.caption(text)
+                st.latex(tex)
     if st.button("Run baselines", key="lad_b_go", icon=":material/play_arrow:", type="primary"):
         sc_b = scheme()
         def run(t, n0):
@@ -5090,6 +5100,121 @@ def _level_results(res: Sequence[Any], show_t: str, level: int, key: str) -> Non
                        note="Values at the origin for the best model of this run.")
 
 
+# Defining equations of every model, shown behind a small ∑ icon next to the model choices.
+MODEL_EQUATIONS: Dict[str, List[Tuple[str, str]]] = {
+    "persistence": [("SOH stays at its value at the origin n₀:", r"\widehat{SOH}(n) = SOH(n_0)")],
+    "trend": [("Robust (Theil–Sen) straight line through the last 20 cycles before the origin:",
+               r"\widehat{SOH}(n) = SOH(n_0) + b\,(n - n_0),\quad b = \operatorname{median}_{i<j}\frac{SOH_j - SOH_i}{n_j - n_i}")],
+    "shape": [("Typical fade curve of the training batteries against charge throughput A (median):", r"F(A) = \operatorname{median}_b\, SOH_b(A)"),
+              ("Equivalent age and relative speed of this battery:", r"F(a^*) = SOH(n_0),\qquad k = \Big(\frac{dSOH/dA\,|_{battery}}{dF/dA\,|_{a^*}}\Big)^{0.7}"),
+              ("Forecast:", r"\widehat{SOH}(n) = SOH(n_0) + F\big(a^* + k\,\Delta A(n)\big) - F(a^*)")],
+    "_traj": [("Forecast mode, smooth models (SOH change, anchored at today's value):",
+               r"\widehat{SOH}(m) = SOH(n_0) + f(\mathbf{x}_{m}) - f(\mathbf{x}_{m}\,|\,m{=}n_0)"),
+              ("Forecast mode, tree models (average fade rate per Ah since the origin):",
+               r"\widehat{SOH}(m) = SOH(n_0) + \min\big(f(\mathbf{x}_m),0\big)\,\Delta A_m"),
+              ("Measured mode (each cycle from its own measurements, 5-cycle trailing median):", r"\widehat{SOH}(m) = f(\mathbf{x}_m)")],
+    "Bayesian Ridge": [("Linear model with Gaussian priors (weights and noise precisions estimated from the data):",
+                        r"y = \mathbf{w}^\top \mathbf{x} + \varepsilon,\quad \mathbf{w}\sim\mathcal N(0,\lambda^{-1}I),\quad \varepsilon\sim\mathcal N(0,\alpha^{-1})")],
+    "Decision Tree": [("Piecewise-constant prediction: the mean of the training targets in the leaf R(x):", r"f(\mathbf{x}) = \bar y_{R(\mathbf{x})}")],
+    "Random Forest": [("Average of B trees, each grown on a bootstrap sample with random feature subsets:",
+                       r"f(\mathbf{x}) = \frac{1}{B}\sum_{b=1}^{B} T_b(\mathbf{x})")],
+    "SVM": [("Support-vector regression with an RBF kernel and an ε-insensitive loss:",
+             r"f(\mathbf{x}) = \sum_i (\alpha_i - \alpha_i^*)\,K(\mathbf{x}_i, \mathbf{x}) + b,\quad K(\mathbf{x},\mathbf{x}') = e^{-\gamma\lVert\mathbf{x}-\mathbf{x}'\rVert^2}")],
+    "Gaussian Process": [("Gaussian process with one length scale per input plus a linear trend term and noise:",
+                          r"k(\mathbf{x},\mathbf{x}') = \sigma^2\exp\!\Big(-\tfrac12\sum_d \tfrac{(x_d-x_d')^2}{\ell_d^2}\Big) + \sigma_{lin}^2\,\mathbf{x}^\top\mathbf{x}' + \sigma_n^2\,\delta_{\mathbf{x}\mathbf{x}'}")],
+    "XGBoost": [("Gradient boosting: each new tree fits the gradient of the loss, added with a learning rate η:",
+                 r"F_M(\mathbf{x}) = \sum_{m=1}^{M} \eta\, f_m(\mathbf{x}),\quad \mathcal L = \sum_i \ell(y_i, F(\mathbf{x}_i)) + \sum_m\big(\gamma T_m + \tfrac{\lambda}{2}\lVert w_m\rVert^2\big)")],
+    "LightGBM": [("Gradient boosting with leaf-wise trees and histogram splits:", r"F_M(\mathbf{x}) = \sum_{m=1}^{M} \eta\, f_m(\mathbf{x})")],
+    "MLP": [("Feed-forward network (ReLU layers, L2 penalty α, early stopping):",
+             r"\mathbf{h}_{l} = \max(0,\, W_l\,\mathbf{h}_{l-1} + \mathbf{b}_l),\quad f(\mathbf{x}) = \mathbf{w}^\top \mathbf{h}_L + b")],
+    "GRU": [("Gated recurrent unit over the last cycles, then a dense output layer:",
+             r"z_t=\sigma(W_z x_t+U_z h_{t-1}+b_z),\ r_t=\sigma(W_r x_t+U_r h_{t-1}+b_r)"),
+            ("", r"\tilde h_t=\tanh\big(W_h x_t+U_h(r_t\odot h_{t-1})+b_h\big),\quad h_t=(1-z_t)\odot h_{t-1}+z_t\odot\tilde h_t")],
+    "Transformer": [("Self-attention over the last cycles, then a dense output layer:",
+                     r"\operatorname{Attention}(Q,K,V) = \operatorname{softmax}\!\Big(\frac{QK^\top}{\sqrt{d}}\Big)V")],
+    "PINN": [("Observation (electrochemistry):", r"SOH = (1 - LLI_{SEI} - LLI_{pl})\,(1 - LAM),\qquad R/R_0 = 1 + g\,LLI_{SEI}"),
+             ("SEI growth (diffusion-limited, Arrhenius):", r"\frac{dLLI_{SEI}}{dA} = \frac{k_{SEI}\, e^{\frac{E_a}{R}\left(\frac{1}{T_{ref}}-\frac{1}{T}\right)}}{LLI_{SEI}+\delta_0}"),
+             ("Lithium plating (cold, high current, promoted by LAM: knees):",
+              r"\frac{dLLI_{pl}}{dA} = k_{pl}\, e^{b_C\,x_C}\Big(\frac{I}{2\,A}\Big)^{a_I}(1 + c\,LAM)"),
+             ("Loss of active material:", r"\frac{dLAM}{dA} = k_{LAM}\Big(\frac{I}{2\,A}\Big)^{a_L}"),
+             ("Training loss (data + physics residuals at collocation points):",
+              r"\mathcal L = \tfrac{1}{\sigma^2}\lVert \widehat{SOH}-SOH\rVert^2 + w_R\lVert \widehat R - R\rVert^2 + \lambda_{phys}\sum_{j}\lVert \tfrac{d s_j}{dA} - g_j(s)\rVert^2")],
+    "PINN-ablation": [("The same network and data term without the physics residuals (λ_phys = 0):",
+                       r"\mathcal L = \tfrac{1}{\sigma^2}\lVert \widehat{SOH}-SOH\rVert^2 + w_R\lVert \widehat R - R\rVert^2")],
+}
+
+
+def equation_icons(models: Sequence[str], common: Optional[str] = None) -> None:
+    """A small ∑ button per model with equations; clicking it shows them."""
+    items = [m for m in models if m in MODEL_EQUATIONS]
+    if not items and common is None:
+        return
+    pop = getattr(st, "popover", None)
+    cols = st.columns(min(len(items) + (1 if common else 0), 6) or 1)
+    k = 0
+    for name in ([common] if common else []) + items:
+        label = "How Level 2–3 predict" if name == "_traj" else name
+        with (cols[k % len(cols)].popover(label, icon=":material/functions:", use_container_width=True)
+              if pop else cols[k % len(cols)].expander(label, icon=":material/functions:")):
+            for text, tex in MODEL_EQUATIONS[name]:
+                if text:
+                    st.caption(text)
+                st.latex(tex)
+        k += 1
+
+
+def influence_panel(level: int, key: str, mdls: Sequence[str], mode: str, train: Optional[List[str]], show_t: str,
+                    n0: int, params: Dict[str, Dict[str, Any]]) -> None:
+    family = {2: "ml", 3: "dl", 4: "pinn"}[level]
+    with st.expander("Which training batteries perturb the models?", icon=":material/troubleshoot:"):
+        st.caption("Retrains the chosen model once without each training battery and measures how the forecast error on "
+                   f"{show_t} changes. A battery is said to **perturb** the model when the error falls without it. This "
+                   "compares with the battery's actual later cycles, so it is a diagnostic of the training data, not part "
+                   "of the forecast. It takes one training per training battery.")
+        if not mdls:
+            st.caption("Select a model above first.")
+            return
+        c1, c2 = st.columns([2, 1])
+        m = c1.selectbox("Model to analyse", list(mdls), key=f"{key}_inf_model")
+        thr = c2.select_slider("Neutral below (SOH points)", [0.05, 0.1, 0.2, 0.5], value=0.1, key=f"{key}_inf_thr")
+        n_tr = len(train) if train is not None else len(te.v2_training_pool(ct, show_t))
+        if st.button(f"Analyse {n_tr} training batteries for {m} ({mode} mode)", key=f"{key}_inf_go",
+                     icon=":material/troubleshoot:"):
+            prog = st.progress(0.0)
+            try:
+                st.session_state[f"{key}_inf"] = (m, mode, show_t, te.training_influence(
+                    ct, imp, show_t, n0, m, family, mode, train, float(eol_ah), params.get(m), float(thr),
+                    progress=lambda f_, msg: prog.progress(min(max(float(f_), 0.0), 1.0), text=msg)))
+            except Exception as exc:
+                st.warning(f"Analysis failed: {exc}")
+            prog.empty()
+        saved = st.session_state.get(f"{key}_inf")
+        if saved:
+            m_, md_, t_, tab = saved
+            pert = tab[tab["Effect"] == "perturbs"]
+            helps = tab[tab["Effect"] == "helps"]
+            known = pert[pert["Group"].isin(te.GROUP_ISSUES)]
+            lines = [f"**{m_}** on **{t_}** ({md_} mode): error with all training batteries "
+                     f"{tab.attrs.get('base_rmse', float('nan')):.2f} SOH points."]
+            if len(pert):
+                lines.append(f"**{len(pert)} batteries perturb the model**: " + ", ".join(
+                    f"{b} ({-d:.2f})" for b, d in pert["Change (SOH pts)"].items()) + " (error decrease without them).")
+            else:
+                lines.append("No training battery perturbs the model beyond the threshold.")
+            if len(known):
+                lines.append(f"Of these, {len(known)} have a known data issue: " + ", ".join(
+                    f"{b} ({g})" for b, g in known["Group"].items()) + ".")
+            if len(helps):
+                lines.append(f"{len(helps)} batteries help the most: " + ", ".join(helps.index[-3:][::-1]) + ".")
+            card("Training-data diagnosis", lines)
+            show_table(tab.style.format({"Error without it (SOH pts)": "{:.2f}", "Change (SOH pts)": "{:+.2f}"}, na_rep="—")
+                       .apply(lambda col: ["color: #E07B39; font-weight: 600" if v == "perturbs" else
+                                           ("color: #2FA7A0" if v == "helps" else "") for v in col], subset=["Effect"]),
+                       note="Change = error without the battery minus error with all of them: negative means the "
+                            "battery perturbs the model. The comment names the likely cause when its group has a "
+                            "known data issue.")
+
+
 def model_level_section(level: int, title: str, intro: str, models: Dict[str, str], default: Sequence[str],
                         trainer: Callable[..., Any], key: str, extra: Optional[Callable[[], Dict[str, Any]]] = None,
                         modes: Sequence[str] = ("forecast", "measured")) -> None:
@@ -5101,6 +5226,7 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
     c1, c2 = st.columns([2, 1])
     mdls = c1.multiselect("Models", list(models), default=[m for m in default if m in models], key=f"{key}_models",
                           format_func=lambda m: models[m])
+    equation_icons(mdls, "_traj" if level in (2, 3) else None)
     mode = c2.radio("Mode to train", list(modes), key=f"{key}_mode", format_func=te.TRAJ_MODES.get,
                     help="Forecast: only what is known at the training | test line (a real forecast). Measured: each "
                          "test cycle's own measured parameters (estimation). Results of both modes are kept below.")
@@ -5110,9 +5236,9 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
         grp_ = te.condition_groups(ct)["Group"]
         odd = sorted(c for c in train if grp_.get(c) in te.V2_EXCLUDED_GROUPS)
         if odd:
-            st.info(f"{len(odd)} training batteries come from groups that are usually excluded (mixed loads, corrupted "
-                    f"logging, pulsed load): {', '.join(odd)}. Their capacity behaves differently, which can mislead the "
-                    "models; compare with a training set without them.")
+            st.caption(f"The training set keeps the data as they are, including {len(odd)} batteries from groups with "
+                       "known data issues (mixed loads, corrupted logging, pulsed load). After training, 'Which training "
+                       "batteries perturb the models?' below shows which ones actually hurt the prediction.")
     hp_prefix = f"{key}_hp"
     pending = st.session_state.pop(f"{key}_pending", None)      # tuned values from the last automatic selection
     if pending:
@@ -5194,6 +5320,7 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
             else:
                 placeholder(f"Select '{te.TRAJ_MODES[md]}' above and press Train: the results of this mode appear here "
                             "and stay available when you train the other mode.")
+    influence_panel(level, key, mdls, mode, train, show_t, sc["n0"][show_t], params)
 
 
 def trajectory_section() -> None:

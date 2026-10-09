@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.8.0"
+ENGINE_VERSION = "5.9.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -8364,3 +8364,66 @@ def _protocol_forecast(key, store, ct, imp, cell, n0, train, eol_ah):  # noqa: F
     if key.startswith("pinn:"):
         return train_pinn_model(ct, imp, cell, n0, key.split(":", 1)[1], "forecast", train, eol_ah)
     return _protocol_forecast_l3(key, store, ct, imp, cell, n0, train, eol_ah)
+
+
+# =============================================================================
+# 38. WHICH TRAINING BATTERIES PERTURB A MODEL? (leave-one-battery-out influence, data kept as they are)
+# =============================================================================
+GROUP_ISSUES = {
+    "Corrupted logging": "data logging crashed; long runs of very low or invalid capacities",
+    "Mixed conditions": "load current and ambient temperature change during the test, so capacity jumps with the load",
+    "Pulsed load": "square-wave (pulsed) discharge: capacity and voltage behave unlike constant-current tests",
+    "Cold": "4 °C ageing; some unexplained very-low-capacity runs",
+    "Hot": "43 °C at 4 A: temperature and current effects are mixed",
+}
+
+
+def training_influence(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str, n0: int, model: str,
+                       family: str = "ml", mode: str = "forecast", train_cells: Optional[Sequence[str]] = None,
+                       eol_ah: float = DEFAULT_EOL_AH, model_params: Optional[Dict[str, Any]] = None,
+                       threshold: float = 0.1, progress: ProgressFn = None) -> pd.DataFrame:
+    """Retrain the model once without each training battery and measure the change of the predicted battery's error
+    (SOH points) on its cycles after the origin. Negative change = the model is better without that battery: it
+    perturbs the model. This uses the battery's actual later cycles: a diagnostic, not part of the forecast.
+    family: "ml" (Level 2), "dl" (Level 3) or "pinn" (Level 4). threshold: SOH points below which the effect is neutral."""
+    pool = [c for c in (train_cells if train_cells is not None else v2_training_pool(ct, cell_id)) if c != cell_id]
+
+    def fit(cells):
+        if family == "dl":
+            return train_deep_trajectory(ct, imp, cell_id, n0, model, mode, list(cells), eol_ah, cv_folds=1,
+                                         importance=False, model_params=model_params)
+        if family == "pinn":
+            return train_pinn_model(ct, imp, cell_id, n0, model, mode, list(cells), eol_ah, model_params, cv_folds=1)
+        return train_trajectory_model(ct, imp, cell_id, n0, model, mode, list(cells), eol_ah, cv_folds=1,
+                                      importance=False, model_params=model_params)
+
+    base = fit(pool).metrics.rmse * 100
+    grp = condition_groups(ct)["Group"]
+    rows = []
+    for i, c in enumerate(pool):
+        _report(progress, i / max(len(pool), 1), f"without {c}")
+        try:
+            r = fit([x for x in pool if x != c]).metrics.rmse * 100
+        except Exception as exc:
+            rows.append({"Battery": c, "Group": grp.get(c, "—"), "Error without it (SOH pts)": np.nan,
+                         "Change (SOH pts)": np.nan, "Effect": "could not retrain", "Comment": str(exc)[:80]})
+            continue
+        d = r - base
+        g = grp.get(c, "—")
+        if d < -threshold:
+            eff = "perturbs"
+            com = f"Without {c} the error falls by {-d:.2f} SOH points."
+        elif d > threshold:
+            eff = "helps"
+            com = f"Without {c} the error rises by {d:.2f} SOH points."
+        else:
+            eff = "neutral"
+            com = f"Removing {c} changes the error by less than {threshold:.2f} SOH points."
+        if eff == "perturbs" and g in GROUP_ISSUES:
+            com += f" Likely cause: {GROUP_ISSUES[g]}."
+        rows.append({"Battery": c, "Group": g, "Error without it (SOH pts)": r, "Change (SOH pts)": d, "Effect": eff,
+                     "Comment": com})
+    _report(progress, 1.0, "done")
+    out = pd.DataFrame(rows).sort_values("Change (SOH pts)").set_index("Battery")
+    out.attrs["base_rmse"] = base
+    return out

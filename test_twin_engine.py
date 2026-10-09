@@ -1160,6 +1160,20 @@ def test_pinn_level_physics_ablation_no_leakage_and_assessment():
     assert (res["status"] == "ok").all() and "PINN · physics-informed" in te.protocol_scoreboard(res).index
 
 
+def test_training_influence_flags_a_perturbing_battery():
+    m, imp, _ = te.make_synthetic_master(n_cells=6, n_cycles=110, ambients=(24,) * 6, seed=3, noise_v=0.01)
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    bad = (ct["Cell_ID"] == "S006") & (ct["n"] % 3 == 0)
+    ct.loc[bad, "SOH"] *= 0.85
+    ct.loc[bad, "Capacity_Ah"] *= 0.85
+    train = ["S002", "S003", "S004", "S005", "S006"]
+    inf = te.training_influence(ct, imp, "S001", 33, "Bayesian Ridge", "ml", "forecast", train, 1.6)
+    assert set(inf.index) == set(train) and np.isfinite(inf.attrs["base_rmse"])
+    assert inf.loc["S006", "Effect"] == "perturbs" and inf.loc["S006", "Change (SOH pts)"] < 0
+    assert set(inf["Effect"]) <= {"perturbs", "helps", "neutral", "could not retrain"}
+    assert list(inf["Change (SOH pts)"]) == sorted(inf["Change (SOH pts)"])        # most perturbing first
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

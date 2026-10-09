@@ -1,9 +1,20 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.8.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.9.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Training-data diagnosis, equations, banner restored (v5.9.0)
+
+- `training_influence`: retrains a Level-2/3/4 model once without each training battery and reports how the predicted
+  battery's error changes (negative = the battery perturbs the model), with a comment naming the likely cause for groups
+  with known data issues (`GROUP_ISSUES`). The data are kept as they are; this shows which batteries actually hurt.
+  Diagnostic only (it compares with the battery's actual later cycles). App: "Which training batteries perturb the
+  models?" under each level.
+- Equations: a ∑ button next to every model (Levels 1-4) shows its defining equations (`MODEL_EQUATIONS`), plus how
+  Levels 2-3 turn a model into a forecast.
+- The animated cell <-> twin banner is back at the top (the compact title bar is removed); status strip below it.
 
 ## Level 4 · Physics-informed neural network (v5.8.0)
 
