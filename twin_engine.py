@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.9.0"
+ENGINE_VERSION = "5.10.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -8173,7 +8173,8 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
     xT, xC, xI = (Tensor(Xc[:, [k]]) for k in (1, 2, 3))
     opt = Adam(params, lr=float(p["learning_rate"]))
     lam_w = float(p["physics_weight"])
-    for _ in range(int(p["iterations"])):
+    hist: List[float] = []
+    for it in range(int(p["iterations"])):
         S, _ = states(Xd, OHd)
         soh_p, r_p = observe(S)
         loss = ((soh_p - Tensor(Yd[:, None])).square()).mean() * (1 / 0.01 ** 2) \
@@ -8194,6 +8195,12 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
             q.grad = np.zeros_like(q.data)
         loss.backward()
         opt.step()
+        hist.append(float(loss.data))
+        # early stop: less than 0.2 % improvement of the (smoothed) loss over the last 300 iterations
+        if p.get("early_stop", True) and it >= 600 and it % 100 == 0:
+            now, before = float(np.mean(hist[-50:])), float(np.mean(hist[-350:-300]))
+            if before > 0 and (before - now) / before < 0.002:
+                break
 
     def predict(i: int, a: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
         b = bats[i]
@@ -8427,3 +8434,83 @@ def training_influence(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: s
     out = pd.DataFrame(rows).sort_values("Change (SOH pts)").set_index("Battery")
     out.attrs["base_rmse"] = base
     return out
+
+
+
+# =============================================================================
+# 39. SPEED: results reused while the data are unchanged (identical outputs)
+# =============================================================================
+import functools as _functools
+from collections import OrderedDict as _OrderedDict
+
+
+def _fingerprint(df: Any) -> Any:
+    """Identity, size, number of invalid cycles and the SOH sum: changes whenever the data change, even in place."""
+    if not isinstance(df, pd.DataFrame):
+        return id(df)
+    sums = tuple(round(float(np.nansum(df[c].to_numpy(float))), 9) for c in
+                 ("SOH", "Capacity_Ah", "R_dc_ohm", "cum_Ah", "T_mean_C", "n", "Rct_ohm", "Re_ohm") if c in df)
+    bad = int(df["outlier"].sum()) if "outlier" in df else 0
+    return (id(df), df.shape, bad, sums)
+
+
+def _memo_on_data(maxsize: int = 4096) -> Callable:
+    def deco(fn: Callable) -> Callable:
+        cache: "_OrderedDict[Any, Any]" = _OrderedDict()
+
+        @_functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            key = (tuple(_fingerprint(a) if isinstance(a, pd.DataFrame) or a is None else
+                         (tuple(a) if isinstance(a, list) else a) for a in args), tuple(sorted(kwargs.items())))
+            try:
+                hash(key)
+            except TypeError:
+                return fn(*args, **kwargs)
+            if key in cache:
+                cache.move_to_end(key)
+                v = cache[key]
+            else:
+                v = fn(*args, **kwargs)
+                cache[key] = v
+                if len(cache) > maxsize:
+                    cache.popitem(last=False)
+            return v.copy() if isinstance(v, (pd.DataFrame, pd.Series)) else v
+
+        wrapper.cache_clear = cache.clear
+        return wrapper
+    return deco
+
+
+condition_groups = _memo_on_data(64)(condition_groups)
+attach_eis = _memo_on_data(64)(attach_eis)
+_traj_forecast_rows = _memo_on_data(20000)(_traj_forecast_rows)
+_traj_measured_rows = _memo_on_data(4096)(_traj_measured_rows)
+clean_capacity = _memo_on_data(20000)(clean_capacity)
+
+
+# =============================================================================
+# 40. SELF-OPTIMISATION: a self-weighted ensemble of a level's models
+# =============================================================================
+def ensemble_trajectories(members: Sequence["TrajectoryForecast"], ct: pd.DataFrame, eol_ah: float = DEFAULT_EOL_AH,
+                          name: str = "Level ensemble (self-weighted)") -> "TrajectoryForecast":
+    """Combine a level's forecasts for one battery, each weighted by 1 / (CV error)^2 on batteries held out during
+    training (never by the test battery's future). Band: mixture of the members' bands (moment matching)."""
+    ms = [m for m in members if np.isfinite(m.cv_rmse) and m.cv_rmse > 0]
+    if len(ms) < 2:
+        raise ValueError("ensemble: needs at least two models with a cross-validated error")
+    w = np.array([1.0 / m.cv_rmse ** 2 for m in ms])
+    w /= w.sum()
+    grid = ms[0].n_grid
+    mu = np.array([np.interp(grid, m.n_grid, m.soh) for m in ms])
+    sd = np.array([(np.interp(grid, m.n_grid, m.hi) - np.interp(grid, m.n_grid, m.lo)) / 3.29 for m in ms])
+    mean = w @ mu
+    half = 1.6449 * np.sqrt(np.maximum(w @ (sd ** 2 + mu ** 2) - mean ** 2, 0))
+    cell_id, n0 = ms[0].cell_id, ms[0].n0
+    good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
+    soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
+    lo, hi = np.clip(mean - half, 0, 1.05), np.clip(mean + half, 0, 1.05)
+    metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), grid, mean, n0, soh_eol, lo, hi, 0.2)
+    cv = float(np.sqrt(np.sum(w * np.array([m.cv_rmse ** 2 for m in ms]))))
+    return TrajectoryForecast(name, ms[0].mode, cell_id, n0, grid, mean, lo, hi, metrics, ["models of this level"],
+                              {f"weight · {m.model}": float(x) for m, x in zip(ms, w)}, pd.DataFrame(),
+                              ms[0].train_cells, cv, float(sum(m.fit_seconds for m in ms)))

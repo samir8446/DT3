@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.9.0"
+REQUIRED_ENGINE = "5.10.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -60,7 +60,8 @@ st.set_page_config(
 
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
-                   "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence")
+                   "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
+                   "ensemble_trajectories")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -5079,14 +5080,17 @@ def _level_results(res: Sequence[Any], show_t: str, level: int, key: str) -> Non
                 "target": show_t} for f in res]
     show(fig_ladder(entries, res[0].n0, P, f"Level {level} · {LEVEL_INFO[level][0]}", show_t), key=f"{key}_fig",
          export=False)
-    rows = [{"Model": f.model, "Accuracy (%)": f.metrics.accuracy, "RMSE": f.metrics.rmse, "Coverage": f.metrics.coverage,
-             "CV RMSE (held-out batteries)": f.cv_rmse, "Training batteries": len(f.train_cells), "Time (s)": f.fit_seconds}
-            for f in res]
+    singles = [f for f in res if np.isfinite(f.cv_rmse) and not f.model.startswith("Level ensemble")]
+    rec = min(singles, key=lambda f: f.cv_rmse).model if singles else None
+    rows = [{"Model": f.model + ("  ★ recommended" if f.model == rec else ""), "Accuracy (%)": f.metrics.accuracy,
+             "RMSE": f.metrics.rmse, "Coverage": f.metrics.coverage, "CV RMSE (held-out batteries)": f.cv_rmse,
+             "Training batteries": len(f.train_cells), "Time (s)": f.fit_seconds} for f in res]
     show_table(pd.DataFrame(rows).set_index("Model").sort_values("RMSE").style.format(
         {"Accuracy (%)": "{:.2f}", "RMSE": "{:.4f}", "Coverage": "{:.0%}", "CV RMSE (held-out batteries)": "{:.4f}",
          "Time (s)": "{:.1f}"}),
         note="RMSE on this battery's test cycles (SOH units). CV RMSE: error on batteries held out during training, "
-             "the better guide to how the model generalises. All models also appear in the leaderboard below.")
+             "the better guide to how the model generalises: ★ marks the model with the lowest CV RMSE, chosen without "
+             "looking at this battery's future. The self-weighted ensemble combines the models by their CV RMSE.")
     with_imp = [f for f in res if f.importance is not None and len(f.importance)]
     if with_imp:
         best = min(with_imp, key=lambda f: f.metrics.rmse)
@@ -5215,6 +5219,32 @@ def influence_panel(level: int, key: str, mdls: Sequence[str], mode: str, train:
                             "known data issue.")
 
 
+def _level_fit(ct_: pd.DataFrame, imp_: Optional[pd.DataFrame], level: int, t: str, n0: int, m: str, mode: str,
+               train: Optional[List[str]], prm: Optional[Dict[str, Any]], eol: float, importance: bool) -> Any:
+    if level == 4:
+        return te.train_pinn_model(ct_, imp_, t, n0, m, mode, train, eol, prm)
+    if level == 3 and m in ("GRU", "Transformer"):
+        return te.train_deep_trajectory(ct_, imp_, t, n0, m, mode, train, eol, model_params=prm, importance=importance)
+    return te.train_trajectory_model(ct_, imp_, t, n0, m, mode, train, eol, model_params=prm, importance=importance)
+
+
+@st.cache_data(show_spinner=False, max_entries=500)
+def level_fit_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], data_key: str, level: int, t: str, n0: int, m: str,
+                     mode: str, train: Optional[Tuple[str, ...]], prm_json: str, eol: float, importance: bool) -> Any:
+    """Same model, battery, settings and data: the trained result is reused instantly."""
+    prm = json.loads(prm_json) or None
+    return _level_fit(_ct, _imp, level, t, n0, m, mode, list(train) if train is not None else None, prm, eol, importance)
+
+
+@st.cache_data(show_spinner=False, max_entries=500)
+def self_tune_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], data_key: str, t: str, n0: int, m: str, mode: str,
+                     train: Optional[Tuple[str, ...]], eol: float, n_iter: int) -> Dict[str, Any]:
+    """Self-optimisation memory: the best settings found for this model, battery set and mode are remembered."""
+    r = te.tune_level_model(_ct, _imp, t, n0, m, mode, list(train) if train is not None else None, eol,
+                            n_iter=n_iter, method="bayesian")
+    return {"params": r.best_params, "default": r.default_score, "best": r.best_score, "gain": r.improvement_pct}
+
+
 def model_level_section(level: int, title: str, intro: str, models: Dict[str, str], default: Sequence[str],
                         trainer: Callable[..., Any], key: str, extra: Optional[Callable[[], Dict[str, Any]]] = None,
                         modes: Sequence[str] = ("forecast", "measured")) -> None:
@@ -5291,23 +5321,70 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
         st.caption(f"Within scheme: trained on {len(pool)} batteries ({', '.join(pool[:6])}{'…' if len(pool) > 6 else ''}): "
                    "the same condition group when it has at least 3 other batteries, otherwise all comparable batteries, "
                    "plus this battery's own cycles up to the origin.")
+    so1, so2 = st.columns([1, 2])
+    self_opt = so1.toggle("Self-optimise", value=False, key=f"{key}_selfopt",
+                          help="Before training, each model tunes its own parameters (Bayesian search on held-out training "
+                               "batteries) and remembers the best settings for this battery set, so the next run reuses "
+                               "them instantly. The test battery's future is never used.")
+    so2.caption("Self-optimise: each model tunes itself once per battery set and remembers it (the first run takes "
+                "longer). After training, the models are also combined into a self-weighted ensemble.")
     if st.button(f"Train in {mode} mode ({len(mdls) * len(sc['targets'])} runs)", key=f"{key}_go", type="primary",
                  icon=":material/timeline:", disabled=not mdls):
         prog = st.progress(0.0)
         out: Dict[str, List[Any]] = {}
         k_ = 0
+        tuned: Dict[str, Any] = {}
+        tr_key = tuple(train) if train is not None else None
         for t in sc["targets"]:
             for m in mdls:
-                prog.progress(k_ / max(len(mdls) * len(sc["targets"]), 1), text=f"{m} on {t}")
+                prog.progress(k_ / max(len(mdls) * len(sc["targets"]), 1),
+                              text=f"{'Self-optimising and training' if self_opt else 'Training'} {m} on {t}")
                 k_ += 1
                 try:
-                    f = trainer(t, sc["n0"][t], m, mode, train, model_params=params.get(m), **kw)
+                    prm = params.get(m)
+                    if self_opt:
+                        so = self_tune_cached(ct, imp, DATA_KEY, t, sc["n0"][t], m, mode, tr_key, float(eol_ah), 8)
+                        prm, tuned[m] = so["params"], so
+                    f = level_fit_cached(ct, imp, DATA_KEY, level, t, sc["n0"][t], m, mode, tr_key,
+                                         json.dumps(prm or {}, sort_keys=True, default=float), float(eol_ah), False)
                     out.setdefault(t, []).append(f)
                     ladder_add(f.model, level, sc["n0"][t], f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
                 except Exception as exc:
                     st.warning(f"{m} on {t}: {exc}")
+            res_t = out.get(t, [])
+            # importance only for the recommended model (lowest error on held-out training batteries)
+            cand = [f for f in res_t if np.isfinite(f.cv_rmse)]
+            if cand and level in (2, 3):
+                best = min(cand, key=lambda f: f.cv_rmse)
+                bm = best.model.split(" · ", 1)[1].replace(" (measured)", "")
+                if bm not in ("GRU", "Transformer"):
+                    try:
+                        prm_b = tuned[bm]["params"] if bm in tuned else params.get(bm)
+                        fb = level_fit_cached(ct, imp, DATA_KEY, level, t, sc["n0"][t], bm, mode, tr_key,
+                                              json.dumps(prm_b or {}, sort_keys=True, default=float), float(eol_ah), True)
+                        res_t[res_t.index(best)] = fb
+                    except Exception:
+                        pass
+            if len(cand) >= 2:
+                try:
+                    e = te.ensemble_trajectories(res_t, ct, float(eol_ah))
+                    res_t.append(e)
+                    ladder_add(e.model, level, sc["n0"][t], e.n_grid, e.soh, e.lo, e.hi, e.metrics, t)
+                except Exception as exc:
+                    st.warning(f"Ensemble on {t}: {exc}")
         prog.empty()
         st.session_state.setdefault(key, {})[mode] = out
+        if tuned:
+            st.session_state[f"{key}_pending"] = {m_: v["params"] for m_, v in tuned.items()}
+            st.session_state[f"{key}_selfopt_log"] = pd.DataFrame(
+                [{"Model": m_, "Default CV RMSE": v["default"], "Self-optimised CV RMSE": v["best"],
+                  "Improvement (%)": v["gain"]} for m_, v in tuned.items()]).set_index("Model")
+    so_log = st.session_state.get(f"{key}_selfopt_log")
+    if so_log is not None and len(so_log):
+        show_table(so_log.style.format({"Default CV RMSE": "{:.4f}", "Self-optimised CV RMSE": "{:.4f}",
+                                        "Improvement (%)": "{:+.0f}"}),
+                   note="Self-optimisation: the error of each model on held-out training batteries with its default and "
+                        "with its self-chosen settings. The chosen settings are now shown in 'Model parameters'.")
     store_ = st.session_state.get(key, {})
     show_t = sc.get("show", sc["targets"][0])
     tabs = st.tabs([f"{'Forecast' if md == 'forecast' else 'Measured'} mode" + (" ✓" if store_.get(md, {}).get(show_t) else "")

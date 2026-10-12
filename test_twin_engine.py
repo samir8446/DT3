@@ -1174,6 +1174,26 @@ def test_training_influence_flags_a_perturbing_battery():
     assert list(inf["Change (SOH pts)"]) == sorted(inf["Change (SOH pts)"])        # most perturbing first
 
 
+def test_speed_caches_are_exact_and_ensemble_is_self_weighted():
+    m, imp, _ = te.make_synthetic_master(n_cells=5, n_cycles=90, ambients=(24,) * 5, seed=3, noise_v=0.01)
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    a = te.train_trajectory_model(ct, imp, "S001", 30, "Bayesian Ridge", "forecast", eol_ah=1.6, importance=False)
+    b = te.train_trajectory_model(ct, imp, "S001", 30, "Bayesian Ridge", "forecast", eol_ah=1.6, importance=False)
+    assert np.allclose(a.soh, b.soh)                                             # cached path gives the same result
+    rows1 = te._traj_forecast_rows(ct, "S002", 30)
+    ct.loc[(ct["Cell_ID"] == "S002") & (ct["n"] > 15), "R_dc_ohm"] *= 1.5          # in-place change of another column
+    rows2 = te._traj_forecast_rows(ct, "S002", 30)
+    assert not np.allclose(rows1["r_rel0"].to_numpy(), rows2["r_rel0"].to_numpy()) or rows1["r_rel0"].isna().all()
+    fs = [te.train_trajectory_model(ct, imp, "S001", 30, mdl, "forecast", eol_ah=1.6, importance=False)
+          for mdl in ("Bayesian Ridge", "Random Forest", "SVM")]
+    e = te.ensemble_trajectories(fs, ct, 1.6)
+    w = {k.split("weight · ")[1]: v for k, v in e.inputs_at_origin.items()}
+    assert abs(sum(w.values()) - 1) < 1e-9
+    best = min(fs, key=lambda f: f.cv_rmse)
+    assert max(w, key=w.get) == best.model                                     # the most reliable model counts most
+    assert np.isfinite(e.metrics.rmse) and e.model.startswith("Level ensemble")
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
