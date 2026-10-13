@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.10.0"
+REQUIRED_ENGINE = "5.10.1"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -5327,7 +5327,9 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
                                "batteries) and remembers the best settings for this battery set, so the next run reuses "
                                "them instantly. The test battery's future is never used.")
     so2.caption("Self-optimise: each model tunes itself once per battery set and remembers it (the first run takes "
-                "longer). After training, the models are also combined into a self-weighted ensemble.")
+                "longer). After training, the models are also combined into a self-weighted ensemble. With many "
+                f"training batteries, training rows are sampled evenly across batteries (at most {te.TRAJ_MAX_ROWS:,}, "
+                f"SVM {te.TRAJ_MAX_ROWS_SVM:,}) to keep training fast; the predicted battery keeps all its rows.")
     if st.button(f"Train in {mode} mode ({len(mdls) * len(sc['targets'])} runs)", key=f"{key}_go", type="primary",
                  icon=":material/timeline:", disabled=not mdls):
         prog = st.progress(0.0)

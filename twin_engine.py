@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.10.0"
+ENGINE_VERSION = "5.10.1"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -7502,6 +7502,8 @@ def estimation_protocol(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Se
 #               (resistance, temperature rise, charge times, mean voltage, efficiency, EIS); target = SOH(m).
 #               Needs the measurements of each cycle (estimation), shows whether the model has learned how the
 #               measured parameters relate to health.
+TRAJ_MAX_ROWS = 6000          # training rows kept per fit (sampled evenly across training batteries)
+TRAJ_MAX_ROWS_SVM = 4000      # kernel SVM: cost grows with the square of the rows
 TRAJ_RATE_MODELS = ("Decision Tree", "Random Forest", "XGBoost", "LightGBM")
 TRAJ_MODES = {"forecast": "Forecast (only what is known at the origin)",
               "measured": "Per cycle with that cycle's measured parameters"}
@@ -7602,7 +7604,8 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
                            level: float = 0.9, origin_fracs: Sequence[float] = (0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6),
                            step: int = 2, cv_folds: int = 3, seed: int = 0, horizon_factor: float = 1.0,
                            target: str = "auto", importance: bool = True,
-                           model_params: Optional[Dict[str, Any]] = None) -> TrajectoryForecast:
+                           model_params: Optional[Dict[str, Any]] = None,
+                           max_rows: Optional[int] = None) -> TrajectoryForecast:
     """Learn SOH of every cycle from all training batteries and predict the target battery cycle by cycle.
     forecast mode: rows (origin k, future cycle m) from each training battery at several origins; the target is
     predicted from its own state at n0. measured mode: rows = cycles with their own measurements. The band comes
@@ -7670,6 +7673,16 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         tab["y"] = tab["y"].clip(-0.02, 0.0)
     if len(tab) < 50 or tab["Cell_ID"].nunique() < 2:
         raise ValueError("trajectory model: not enough training cycles (choose more training batteries)")
+    # speed: rows from neighbouring origins and cycles are highly redundant; cap them with the same share per training
+    # battery (every battery stays represented); the predicted battery keeps all its own rows. Kernel SVM costs grow
+    # with the square of the rows, so it gets a tighter cap.
+    cap = max_rows if max_rows is not None else (TRAJ_MAX_ROWS_SVM if model_name == "SVM" else TRAJ_MAX_ROWS)
+    if cap and len(tab) > cap:
+        own = tab[tab["Cell_ID"] == cell_id]
+        rest = tab[tab["Cell_ID"] != cell_id]
+        per = max(20, (cap - len(own)) // max(rest["Cell_ID"].nunique(), 1))
+        rest = rest.sample(frac=1.0, random_state=seed).groupby("Cell_ID", sort=False).head(per)
+        tab = pd.concat([rest, own], ignore_index=True)
     feats = [f for f in feats if tab[f].notna().mean() > 0.5]
     med = tab[feats].median()
     X = tab[feats].fillna(med).to_numpy(float)
@@ -8128,9 +8141,12 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
     predictor of SOH and mechanism states for any battery of the list at any throughput, and the learned physics."""
     rng = np.random.default_rng(seed)
     nb = len(bats)
+    # speed: keep the work per iteration roughly constant as the number of batteries grows
+    full_step = int(np.clip(round(nb / 6), 2, 6)) if p.get("adaptive", True) else 2
+    n_col = int(np.clip(1600 // max(nb, 1), 20, 50)) if p.get("adaptive", True) else 50
     Xd, Bd, Yd, Rd, Rm = [], [], [], [], []
     for i, b in enumerate(bats):
-        step = 1 if b.get("cut") else 2
+        step = 1 if b.get("cut") else full_step
         for j in range(0, len(b["a"]), step):
             Xd.append([b["a"][j], b["xT"], b["xC"], b["xI"]]); Bd.append(i); Yd.append(b["soh"][j])
             rv = b["r"][j] if b["r"] is not None and j < len(b["r"]) else np.nan
@@ -8138,7 +8154,7 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
     Xd, Bd, Yd, Rd, Rm = map(np.array, (Xd, Bd, Yd, Rd, Rm))
     Xc, Bc = [], []
     for i, b in enumerate(bats):
-        for a in np.linspace(0.0, max(b["a_end"], 0.05), 50):
+        for a in np.linspace(0.0, max(b["a_end"], 0.05), n_col):
             Xc.append([a, b["xT"], b["xC"], b["xI"]]); Bc.append(i)
     Xc, Bc = np.array(Xc), np.array(Bc)
     OHd, OHc = np.eye(nb)[Bd], np.eye(nb)[Bc]
@@ -8268,7 +8284,8 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
         if not cuts:
             continue
         bl = [full[c] for c in cells if c not in fold] + [x[0] for x in cuts] + [tgt]
-        fit_k = _pinn_fit(bl, p, seed + 10 + k)
+        # the held-out fits only set the band: 60 % of the iterations (the forecast uses the full final fit)
+        fit_k = _pinn_fit(bl, {**p, "iterations": max(300, int(0.6 * int(p["iterations"])))}, seed + 10 + k)
         off = len(cells) - len(fold)
         for j, (b, g, cut) in enumerate(cuts):
             n_f, pr, _ = _pinn_forecast(fit_k, off + j, b, cut, int(g["n"].max()))

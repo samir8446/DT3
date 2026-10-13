@@ -1194,6 +1194,18 @@ def test_speed_caches_are_exact_and_ensemble_is_self_weighted():
     assert np.isfinite(e.metrics.rmse) and e.model.startswith("Level ensemble")
 
 
+def test_training_row_cap_keeps_every_battery():
+    m, imp, _ = te.make_synthetic_master(n_cells=10, n_cycles=100, ambients=(24,) * 10, seed=3, noise_v=0.01)
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    train = [c for c in ct["Cell_ID"].unique() if c != "S001"]
+    f = te.train_trajectory_model(ct, imp, "S001", 30, "Random Forest", "forecast", train, 1.6, importance=False,
+                                  max_rows=400)
+    assert np.isfinite(f.metrics.rmse) and set(train) <= set(f.train_cells)
+    g = te.train_trajectory_model(ct, imp, "S001", 30, "Random Forest", "forecast", train, 1.6, importance=False,
+                                  max_rows=0)                                  # 0 = no cap
+    assert np.isfinite(g.metrics.rmse)
+
+
 if __name__ == "__main__":                            # minimal runner when pytest is absent
     failures = 0
     tests = [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
