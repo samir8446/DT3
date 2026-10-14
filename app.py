@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.12.1"
+REQUIRED_ENGINE = "5.13.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -604,7 +604,7 @@ PLOT_CONFIG = {
 def image_name(fig: go.Figure, key: str) -> str:
     """File name of a chart image: chart id, battery (or condition group for group-level charts), chart title, date,
     engine version. Lets a saved image be identified without opening it, e.g.
-    acc_board__Reference__prediction-accuracy-assessment__2026-10-14__v5.12.1."""
+    acc_board__Reference__prediction-accuracy-assessment__2026-10-14__v5.13.0."""
     def slug(x: Any, n: int = 60, lower: bool = True) -> str:
         x = re.sub(r"<[^>]+>", " ", str(x or ""))
         x = re.sub(r"[^A-Za-z0-9]+", "-", x).strip("-")
@@ -5063,7 +5063,7 @@ def assessment_section() -> None:
                               default=["trend", "shape"] + [f"traj:{m}" for m in ("Bayesian Ridge", "Random Forest", "SVM")
                                                             if m in av] + ["dl:GRU"],
                               key="acc_models", format_func=lambda k: te.PROTOCOL_MODELS[k][1])
-    view = (lambda r: te.select_by_cv(r, 2)[0]) if cv_mode else (lambda r: r)
+    view = (lambda r: te.select_by_cv(r, 2, keys)[0]) if cv_mode else (lambda r: r)
     cells_g = tuple(te.protocol_cells(ct, grp))
     tasks = [(c, o, k) for c in cells_g for o in sorted(origins) for k in keys]
     secs = sum(ASSESS_SECONDS.get(k.split(":", 1)[-1], 3.0) for _, _, k in tasks)
@@ -5104,7 +5104,13 @@ def assessment_section() -> None:
     res_all = res
     picks = pd.DataFrame()
     if cv_mode:
-        res, picks = te.select_by_cv(res_all, 2)
+        res, picks = te.select_by_cv(res_all, 2, keys)
+        n_inc = int(res["status"].astype(str).str.startswith("incomplete").sum())
+        if n_inc:
+            st.warning(f"The run stopped before every model of a level had finished on some batteries ({n_inc // 2} "
+                       "battery-level combinations): no model is picked there, because choosing among the models that "
+                       "happened to finish is not the method being assessed. Press 'Run the assessment' again without "
+                       "touching the page; finished forecasts are reused.")
     sb = te.protocol_scoreboard(res)
     if sb.empty:
         st.warning("No forecast succeeded: " + "; ".join(sorted(set(res["status"].astype(str).str[:70]))[:3]))

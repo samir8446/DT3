@@ -1,9 +1,28 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.12.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.13.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Level 2 CV no longer sees the test cycles (v5.13.0)
+
+1. Bug: in `train_trajectory_model` the predicted battery's own past rows were in the CV pool, so a fold could hold
+   out the predicted battery and score it on its cycles after the origin, i.e. the test cycles. The test RMSE was
+   not affected (the final model is fitted separately), but the CV error, the CV picks / star, self-optimisation and
+   the Level 2 forecast bands (coverage) were. Found while checking a real Reference run. DL and PINN CV were clean.
+2. Fix: CV folds are built from the training batteries only; the predicted battery's rows always stay in the fit.
+3. Measured mode: a held-out battery now keeps its own cycles up to the same share of its life in the fold's fit,
+   exactly like the predicted battery in the test (before, CV was a harder task: errors 12-22 vs ~3 on test).
+4. Test `test_cv_never_sees_the_target_future`: halving the target's SOH after the origin leaves the CV error
+   unchanged (forecast and measured, two models); it fails on v5.12.2.
+
+## Interrupted runs no longer produce a CV pick (v5.12.2)
+
+1. `select_by_cv(res, k, keys)`: when not every model of a level has run on a (battery, origin), that level gets no
+   pick there (status "incomplete: n of N models of this level ran"); choosing among the models that happened to
+   finish is not the method being assessed. Found on a real Reference run interrupted after 3 of 7 ML models.
+2. The app warns about such incomplete levels and tells how to resume. Test added (4 tests in test_cv_selection.py).
 
 ## Charts saved as named images (v5.12.1)
 

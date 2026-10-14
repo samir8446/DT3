@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.12.1"
+ENGINE_VERSION = "5.13.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -7729,15 +7729,33 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         return pd.Series(p).rolling(5, min_periods=1).median().to_numpy()
 
     rng = np.random.default_rng(seed)
-    cells_u = np.unique(g)
-    folds = np.array_split(rng.permutation(cells_u), min(cv_folds, len(cells_u))) if len(cells_u) >= 3 else []
+    # CV folds hold out TRAINING batteries only. The predicted battery's own rows (its cycles up to the origin) always
+    # stay in the fit: before v5.13 it could itself be held out and then be scored on its cycles after the origin,
+    # i.e. on the test cycles, which leaked into the CV error, the star, self-optimisation and the forecast bands.
+    cells_u = np.unique(g[g != cell_id])
+    folds = np.array_split(rng.permutation(cells_u), min(cv_folds, len(cells_u))) if len(cells_u) >= 2 else []
+    n_tab = tab["n"].to_numpy(float) if "n" in tab else np.full(len(tab), np.inf)
+
+    def cut_of(c: str) -> int:
+        gc_ = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]]
+        return int(max(10, round(share * gc_["n"].max()))) if len(gc_) else 0
+
     res, ahead, imp_vals = [], [], np.zeros(len(feats))
     n_imp = 0
     for fold in folds:
         te_m = np.isin(g, fold)
         if te_m.all() or not te_m.any():
             continue
-        mm = fit(X[~te_m], y[~te_m])
+        fit_m = ~te_m
+        if mode == "measured":
+            # same task as the test: the predicted battery is estimated with its own cycles up to the origin in the
+            # fit, so a held-out battery keeps its cycles up to the same share of its life in the fit as well
+            cuts = {c: cut_of(c) for c in fold}
+            fit_m = fit_m | (te_m & (n_tab <= np.array([cuts.get(c, -1) for c in g], float)))
+        te_m = te_m & ~fit_m                               # rows scored = rows not seen by this fold's model
+        if not te_m.any():
+            continue
+        mm = fit(X[fit_m], y[fit_m])
         pr = mm.predict(clip_x(X[te_m]))
         # score each held-out battery on the SAME task as the predicted battery: cut at the same share of its life,
         # forecast (or estimate) its later cycles with the same anchoring, compare with its actual SOH
@@ -8649,19 +8667,34 @@ CV_SELECT_FAMILIES: Dict[str, str] = {"Machine learning (forecast)": "Level 2 ·
 CV_RANK_NAMES = ("best by CV", "2nd by CV", "3rd by CV")
 
 
-def select_by_cv(res: pd.DataFrame, k: int = 2) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def select_by_cv(res: pd.DataFrame, k: int = 2, keys: Optional[Sequence[str]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Replace the models of each selectable level by its k models with the lowest CV error, chosen separately for
     every (held-out battery, origin) from the training batteries only. Rows of other families (baselines, PINN) are
     kept unchanged. Returns (rows for the scoreboard, picks table). The picks table also shows how the pick ranked on
-    the held-out battery's test cycles: a diagnostic of the star, never used for the choice."""
+    the held-out battery's test cycles: a diagnostic of the star, never used for the choice.
+    keys: the models that were meant to run. A (battery, origin, level) where some of them have not run yet (interrupted
+    run) gets no pick: choosing among the models that happened to finish is not the procedure being assessed."""
     cvc = "CV RMSE (SOH pts)"
     if res is None or not len(res):
         return res, pd.DataFrame()
     k = int(np.clip(k, 1, len(CV_RANK_NAMES)))
     is_sel = res["family"].isin(list(CV_SELECT_FAMILIES))
     keep = res[~is_sel]
+    expected: Dict[str, int] = {}
+    for key in (keys or ()):
+        fam_ = PROTOCOL_MODELS.get(key, (None,))[0]
+        if fam_ in CV_SELECT_FAMILIES:
+            expected[fam_] = expected.get(fam_, 0) + 1
     sel_rows, picks = [], []
     for (c, o, fam), d in res[is_sel].groupby(["Cell_ID", "origin", "family"], sort=False):
+        if d["key"].nunique() < expected.get(fam, 0):
+            first = d.iloc[0]
+            for r in range(k):
+                sel_rows.append({"Cell_ID": c, "origin": o, "n0": first.get("n0"),
+                                 "model": f"{CV_SELECT_FAMILIES[fam]} · {CV_RANK_NAMES[r]}", "key": f"cvsel:{fam}:{r + 1}",
+                                 "family": fam, "test cycles": first.get("test cycles"), "EOL true": first.get("EOL true"),
+                                 "status": f"incomplete: {d['key'].nunique()} of {expected[fam]} models of this level ran"})
+            continue
         ok = d[d["status"] == "ok"]
         cand = ok[ok[cvc].notna()] if cvc in ok else ok.iloc[0:0]
         cand = cand.sort_values([cvc, "model"])          # ties broken by name: deterministic

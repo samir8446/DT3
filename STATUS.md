@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.12.1 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.13.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.12.1"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.12.1"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.13.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.13.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun at v5.12, file not in the Project) +
   tests/test_cv_selection.py: 3 tests (v5.12), passing
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -42,6 +42,7 @@ Live twin: replay with ECM dual EKF, mechanistic PF, power-law PF, adaptive tren
 update-frequency study; measurement ablation.
 
 ## 4. Decisions (do not reopen without new evidence)
+- CV holds out TRAINING batteries only; the predicted battery's own past always stays in the fit (v5.13).
 - Levels independent (no model uses another's output). Two modes: forecast vs measured.
 - Forecasts anchored at today's SOH; SOH now = median of last 3 valid transient-free cycles (v5.11).
 - Trees learn fade rate per Ah; smooth models learn the change; inputs limited to training range +-50 %; forecast at
@@ -62,8 +63,38 @@ update-frequency study; measurement ablation.
 Caveats: Hot mixes 43 C with 4 A; mixed group shares one test schedule (models learn the protocol); cold cells start
 near 1.4 Ah (use EOL 80 % of initial); B0029 low first cycle biased baselines/Level 2 before v5.11.
 
+## 5a. Reference group with v5.11 (5 batteries: B0005, B0006, B0007, B0018, B0036; origin 30 %; all 25 models)
+- Forecast: NO model beats fleet shape (4.34 +- 1.80 SOH pts). DL MLP 4.47, GP 4.99 (GP 1.25 on B0005 but 7.8 on
+  B0006, 9.1 on B0036: the old "GP wins" was the one-battery anecdote), PINN 6.43 (4 batteries, B0036 missing).
+- Measured (SOH now; compare only with measured models): GRU 2.05 +- 0.98, most stable (worst 3.17); MLP 3.16,
+  Transformer 3.22, Bayesian Ridge 3.49. Trees fail on B0036 (20-29 pts, bias -20 to -28).
+- B0036 (other campaign, same nominal conditions) fades more slowly: all forecasts predict too much fade on it.
+  Without it (sensitivity only): MLP 3.73, GP 3.96 vs fleet shape 4.22, still not clearly better.
+- EOL scored on 3 batteries only (B0007, B0036 never reach EOL). Trend/persistence bands far too narrow (9 %, 5 %).
+- First v5.12 Reference run was interrupted after 6 forecasts (B0005, 3 of 7 ML models): not usable; v5.12.2 now
+  refuses to pick from an incomplete level and says so.
+
+## 5b. Hot group, run before v5.12 (no CV column; B0029-B0032, 43 C; origin 30 %; all 25 models, complete)
+- Each battery has only ~40 cycles: forecast from cycle 12, 28 test cycles, EOL never reached (no EOL scoring).
+- Nearly every model beats every baseline on all 4 batteries (fleet shape 3.21, trend 4.50, persistence 5.09).
+  Forecast: Decision Tree 0.95, PINN 0.97, Bayesian Ridge 1.09, GP 1.16, RF 1.20, MLP 1.22 (top ones overlap within
+  their CIs: no single winner). Measured: Bayesian Ridge 0.87, GP 0.88, MLP 1.09.
+- Physics helps here: PINN 0.97 vs the same network without physics 1.50, better on all 4 batteries.
+- Not comparable to Reference: horizon 28 cycles vs ~120, so the Hot task is much easier. Forecast bands too
+  narrow (coverage 65-84 %). Fleet shape predicts too much fade on all 4, trend too little.
+
+## 5c. Reference with v5.12 (complete: 5 batteries, 25 models, CV picks) and the CV leak found in it
+- Per-model test RMSEs reproduce the v5.11 run (pipeline deterministic) and stay VALID.
+- CV picks / star table INVALID: Level 2 (ML) CV could hold out the predicted battery itself and score it on its
+  test cycles (fixed in v5.13.0, test proves CV no longer changes when the target's future is corrupted). Also
+  affected before v5.13: the Models-view star and self-optimisation for Level 2, and Level 2 forecast bands
+  (coverage). DL and PINN CV were clean. Measured-mode CV was also a harder task than the test (held-out battery
+  had no own cycles in the fit; CV 12-22 vs test ~3); v5.13 keeps its cycles up to the same share, like the test.
+- Even with the leak, the star was poor at Level 2 (best on test in 1 of 5 folds, mean rank 3.2/7 forecast and
+  4.4/7 measured); Level 3 better (mean rank 1.6/3 and 1.8/3). Must be re-measured with v5.13.
+
 ## 6. Next steps (in order)
-1. USER: rerun the accuracy assessment per group with v5.12 ('Best 2 per level' mode, locally), to completion, baselines included:
+1. USER: rerun the accuracy assessment per group with v5.13 ('Best 2 per level' mode, locally; Reference, Hot, Cold), to completion, baselines included:
    Reference 30 %; Hot 30 %; Cold B0045-B0048 30 % with EOL 80 % of initial; Pulsed 40-50 %;
    Mixed 30 % with Reference-condition SOH on. Then send scoreboards/CSVs.
 2. Check on real data with the new star-agreement table: star/self-optimisation agree with test results? Bayesian Ridge CV no longer absurd?
