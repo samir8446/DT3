@@ -46,7 +46,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.10.1"
+REQUIRED_ENGINE = "5.11.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -61,7 +61,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -2655,17 +2655,35 @@ def _cell_label(cid: str) -> str:
 # =============================================================================
 # Global control bar
 # =============================================================================
+@st.cache_data(show_spinner=False)
+def ref_ct_cached(_ct: pd.DataFrame, data_key: str) -> pd.DataFrame:
+    return te.reference_condition_ct(_ct)
+
+
 with st.container(border=True):
     g1, g2, g3 = columns([1.5, 1.0, 2.3], gap="large", vertical_alignment="center")
     with g1:
         cell = st.selectbox("Target cell", cells, key="cell", format_func=_cell_label,
                             index=cells.index("B0005") if "B0005" in cells else 0)
     with g2:
-        eol_ah = st.number_input("End-of-life capacity (Ah)", 0.8, 2.0, float(te.DEFAULT_EOL_AH), 0.05,
-                                 help="The single end-of-life definition used by diagnostics, forecasts, RUL and the "
-                                      "study (NASA convention: 1.4 Ah = 30 % fade of 2 Ah). Each battery's SOH "
-                                      "threshold is this capacity divided by its own beginning-of-life capacity. "
-                                      "The replacement SOH in Operations is a separate, optimised decision.")
+        eol_kind = st.radio("End of life", ["Fixed capacity (Ah)", "% of initial capacity"], horizontal=True,
+                            key="eol_kind", help="Fixed capacity: the NASA convention (1.4 Ah = 30 % fade of 2 Ah), each "
+                                                 "battery's SOH threshold is this capacity divided by its own initial "
+                                                 "capacity. % of initial capacity: the same relative threshold for every "
+                                                 "battery, which suits groups whose cells start near the fixed value "
+                                                 "(cold cells hold much less capacity). The replacement SOH in "
+                                                 "Operations is a separate, optimised decision.")
+        if eol_kind.startswith("Fixed"):
+            eol_ah = st.number_input("End-of-life capacity (Ah)", 1.05, 2.0, float(te.DEFAULT_EOL_AH), 0.05, key="eol_abs")
+        else:
+            eol_ah = st.number_input("End of life (% of initial capacity)", 50, 95, 80, 1, key="eol_rel") / 100.0
+        if st.toggle("Reference-condition SOH", key="ref_soh",
+                     help="Capacity depends on the load and temperature at the moment of measurement. For campaigns "
+                          "whose load or ambient changes during the test (the mixed-conditions group), keep only each "
+                          "battery's cycles at its initial current and ambient, so SOH measures ageing only. Applies to "
+                          "every view; the other cycles are treated as invalid."):
+            ct = ref_ct_cached(ct, DATA_KEY)
+            DATA_KEY = DATA_KEY + "|reference-condition"
 
     c_bol = float(meta.loc[cell, "C_bol_Ah"])
     soh_eol = te.soh_eol_for(c_bol, eol_ah)
@@ -2678,7 +2696,9 @@ with st.container(border=True):
             chips += f'<span class="bt-chip">⚠ {len(cell_errors)} cell(s) skipped</span>'
         st.markdown(
             f'<div class="bt-status">Analysing <b>{html.escape(cell)}</b>: '
-            f'SOH<sub>EOL</sub> = {soh_eol:.3f} ({eol_ah:.2f} Ah of {c_bol:.3f} Ah initial)</div>'
+            f'SOH<sub>EOL</sub> = {soh_eol:.3f} ('
+            + (f'{eol_ah:.2f} Ah of {c_bol:.3f} Ah initial' if eol_ah > 1 else f'{100 * eol_ah:.0f} % of its {c_bol:.3f} Ah initial')
+            + ')</div>'
             f'<div>{chips}</div>',
             unsafe_allow_html=True,
         )
@@ -4611,6 +4631,15 @@ def scheme_controls() -> Dict[str, Any]:
                        "the test battery itself; the other levels learn from the training batteries.")
     gen = "v2"
     sc["gen"] = gen
+    notes = []
+    for t_ in list(sc.get("n0", {})):
+        n_new, note = te.safe_origin(ct, t_, int(sc["n0"][t_]))
+        sc["n0"][t_] = n_new
+        if note:
+            notes.append(note)
+    if notes:
+        st.info("Origins adjusted so that at least " f"{te.MIN_VALID_BEFORE_ORIGIN} valid cycles come before them: "
+                + " ".join(notes))
     st.session_state["_scheme"] = sc
     return sc
 
@@ -4927,7 +4956,10 @@ def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
     d = sb.iloc[::-1]
     fig = go.Figure(go.Bar(y=d.index, x=d["RMSE (SOH pts)"], orientation="h",
                            marker=dict(color=[FAMILY_COLORS.get(f, P.text) for f in d["Family"]]),
-                           error_x=dict(type="data", array=d["95% CI ±"].fillna(0), color=P.muted),
+                           # an error cannot be negative: the lower bar stops at zero
+                           error_x=dict(type="data", array=d["95% CI ±"].fillna(0),
+                                        arrayminus=np.minimum(d["95% CI ±"].fillna(0), d["RMSE (SOH pts)"]),
+                                        symmetric=False, color=P.muted),
                            customdata=np.column_stack([d["Family"], d["Batteries"], d["vs best baseline"]]),
                            hovertemplate="%{y}<br>%{x:.2f} SOH points<br>%{customdata[0]} · %{customdata[1]} batteries"
                                          "<br>%{customdata[2]}<extra></extra>"))
@@ -5027,6 +5059,17 @@ def assessment_section() -> None:
         return
     best, bb = sb.index[0], sb.attrs.get("best_baseline")
     better = sb[sb["vs best baseline"].astype(str).str.startswith("better")]
+    n_done = int(res.loc[res["status"] == "ok", "Cell_ID"].nunique())
+    if 0 < n_done < 3:
+        st.caption(f"With {n_done} batteries no 95% interval is shown: it would be meaningless (too few batteries).")
+    if n_done < len(cells_g):
+        st.warning(f"These results cover only {n_done} of the {len(cells_g)} batteries of the {grp} group: the run was "
+                   "interrupted (any click on the page during a run stops it). Press 'Run the assessment' again without "
+                   "touching the page: finished forecasts are reused, so it continues where it stopped. A 95% interval "
+                   "and a comparison need at least 2 batteries.")
+    if bb is None:
+        st.info("No baseline was selected, so no model can be compared with one. Add 'Fleet shape' (and 'Linear trend') "
+                "to the models to get the verdict 'better / worse than the best baseline'.")
     k = st.columns(4)
     k[0].metric("Lowest error", best, help="Mean RMSE over the held-out batteries.")
     k[1].metric("Its error", f"{sb.loc[best, 'RMSE (SOH pts)']:.2f} SOH pts", delta=f"± {sb.loc[best, '95% CI ±']:.2f} (95% CI)",
@@ -5072,7 +5115,7 @@ def assessment_section() -> None:
              key="acc_csv")
 
 
-def _level_results(res: Sequence[Any], show_t: str, level: int, key: str) -> None:
+def _level_results(res: Sequence[Any], show_t: str, level: int, key: str, ctx: Optional[Dict[str, Any]] = None) -> None:
     """Chart, accuracy table, importance and inputs of one level's runs for one battery and one mode."""
     if res[0].origin_note:
         st.warning(res[0].origin_note)
@@ -5091,10 +5134,32 @@ def _level_results(res: Sequence[Any], show_t: str, level: int, key: str) -> Non
         note="RMSE on this battery's test cycles (SOH units). CV RMSE: error on batteries held out during training, "
              "the better guide to how the model generalises: ★ marks the model with the lowest CV RMSE, chosen without "
              "looking at this battery's future. The self-weighted ensemble combines the models by their CV RMSE.")
-    with_imp = [f for f in res if f.importance is not None and len(f.importance)]
-    if with_imp:
-        best = min(with_imp, key=lambda f: f.metrics.rmse)
-        show(fig_importance(best.importance, P, best.model), key=f"{key}_imp", export=False)
+    base_of = lambda f: f.model.split(" · ", 1)[-1].replace(" (measured)", "")
+    supported = [f for f in res if level in (2, 3) and not f.model.startswith("Level ensemble")
+                 and base_of(f) not in ("GRU", "Transformer")]
+    if supported:
+        names = [f.model for f in supported]
+        default = names.index(rec) if rec in names else 0
+        pick = st.selectbox("Show the indicators of", names, index=default, key=f"{key}_imp_model",
+                            help="Permutation importance on batteries held out during training, computed for the chosen "
+                                 "model when you select it (then remembered). GRU and Transformer read sequences, so "
+                                 "they have no comparable indicator chart.")
+        f_sel = supported[names.index(pick)]
+        imp_tab = f_sel.importance
+        if (imp_tab is None or not len(imp_tab)) and ctx is not None:
+            with st.spinner(f"Computing the indicators of {pick}…"):
+                try:
+                    bm = base_of(f_sel)
+                    fi = level_fit_cached(ct, imp, DATA_KEY, level, show_t, f_sel.n0, bm, f_sel.mode, ctx.get("train"),
+                                          json.dumps(ctx.get("params", {}).get(bm) or {}, sort_keys=True, default=float),
+                                          float(eol_ah), True)
+                    imp_tab = fi.importance
+                except Exception as exc:
+                    st.caption(f"Indicators could not be computed: {exc}")
+        if imp_tab is not None and len(imp_tab):
+            show(fig_importance(imp_tab, P, pick), key=f"{key}_imp", export=False)
+        else:
+            st.caption("Train this level again to compute the indicators of its models.")
     best = min(res, key=lambda f: f.metrics.rmse)
     with st.expander(f"Inputs for {show_t} (origin at cycle {res[0].n0})", icon=":material/fact_check:"):
         st.markdown("**Inputs used:** " + " · ".join(best.features))
@@ -5336,6 +5401,7 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
         out: Dict[str, List[Any]] = {}
         k_ = 0
         tuned: Dict[str, Any] = {}
+        used_prm: Dict[str, Any] = {}
         tr_key = tuple(train) if train is not None else None
         for t in sc["targets"]:
             for m in mdls:
@@ -5347,6 +5413,7 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
                     if self_opt:
                         so = self_tune_cached(ct, imp, DATA_KEY, t, sc["n0"][t], m, mode, tr_key, float(eol_ah), 8)
                         prm, tuned[m] = so["params"], so
+                    used_prm[m] = prm
                     f = level_fit_cached(ct, imp, DATA_KEY, level, t, sc["n0"][t], m, mode, tr_key,
                                          json.dumps(prm or {}, sort_keys=True, default=float), float(eol_ah), False)
                     out.setdefault(t, []).append(f)
@@ -5376,6 +5443,7 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
                     st.warning(f"Ensemble on {t}: {exc}")
         prog.empty()
         st.session_state.setdefault(key, {})[mode] = out
+        st.session_state.setdefault(f"{key}_ctx", {})[mode] = {"train": tr_key, "params": used_prm}
         if tuned:
             st.session_state[f"{key}_pending"] = {m_: v["params"] for m_, v in tuned.items()}
             st.session_state[f"{key}_selfopt_log"] = pd.DataFrame(
@@ -5395,7 +5463,7 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
         with tab:
             res = store_.get(md, {}).get(show_t, [])
             if res:
-                _level_results(res, show_t, level, f"{key}_{md}")
+                _level_results(res, show_t, level, f"{key}_{md}", st.session_state.get(f"{key}_ctx", {}).get(md))
             else:
                 placeholder(f"Select '{te.TRAJ_MODES[md]}' above and press Train: the results of this mode appear here "
                             "and stay available when you train the other mode.")

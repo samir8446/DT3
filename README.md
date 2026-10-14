@@ -1,9 +1,36 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.10.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.11.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Fixes from the first real results across condition groups (v5.11.0)
+
+1. SOH at the origin = median of the last 3 valid, transient-free cycles (a running minimum stayed pinned by a low
+   first cycle, e.g. B0029 at 93 %, and pulled every baseline and Level-2 forecast ~4 points down; synthetic check:
+   forecast error 0.043 -> 0.008).
+2. Held-out (CV) error on the same task as the test: each held-out training battery is cut at the same share of life
+   (3 cuts around it) and forecast with the same anchoring; drives the recommended model, self-optimisation and
+   ensemble weights. On synthetic data agreement with the test error is about the same as before (no gain shown
+   there); the mismatch was large on real data.
+3. Inputs limited to the training range widened by 50 % each side, and forecasts at most 2 SOH points above today's
+   value (Bayesian ridge reached 105 % and CV errors of 10^9 on real data; hard clipping froze legitimate
+   extrapolation, so the range is widened).
+4. `safe_origin`: at least 10 valid cycles before every origin (moved forward and stated otherwise), in the app and in
+   the assessment.
+5. End of life as a fixed capacity (Ah) or as % of each battery's initial capacity (`soh_eol_for`: values <= 1 are
+   fractions).
+6. No 95 % interval with fewer than 3 batteries; error bars stop at zero.
+7. `reference_condition_ct` + "Reference-condition SOH" switch: keep only cycles at each battery's initial current
+   and ambient, so SOH measures ageing only in the mixed-conditions group.
+
+## Indicators for every model (v5.10.2)
+
+A model trained without permutation importance returned a zero-filled table, so the indicator chart showed all zeros.
+It now returns no table; under each level's results a selector chooses the model whose indicators to show (Level 2
+models and the MLP), computed on demand with that run's training batteries and settings, then cached. The accuracy
+assessment now says when results cover only part of the group (interrupted run) and when no baseline was selected.
 
 ## Faster training with many batteries (v5.10.1)
 

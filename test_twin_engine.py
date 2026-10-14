@@ -1088,7 +1088,7 @@ def test_deep_learning_level_same_approach_and_fast_assessment():
     fut = a.n_grid > n0
     assert np.allclose(a.soh[fut], b.soh[fut])
     fast = te.train_trajectory_model(ct, imp, "S001", n0, "Random Forest", "forecast", eol_ah=1.6, importance=False)
-    assert float(fast.importance["Importance (ΔRMSE)"].abs().sum()) == 0.0
+    assert fast.importance.empty                                          # skipped importance: no table at all
     res = te.run_protocol(store, ct, imp, ["S001", "S002", "S003"], ["trend", "dl:MLP", "dlm:GRU"], (0.4,), 1.6)
     assert (res["status"] == "ok").all()
     sb = te.protocol_scoreboard(res)
@@ -1204,6 +1204,43 @@ def test_training_row_cap_keeps_every_battery():
     g = te.train_trajectory_model(ct, imp, "S001", 30, "Random Forest", "forecast", train, 1.6, importance=False,
                                   max_rows=0)                                  # 0 = no cap
     assert np.isfinite(g.metrics.rmse)
+
+
+def test_update_5_11_origin_bounds_eol_intervals_reference():
+    m, imp, _ = te.make_synthetic_master(n_cells=5, n_cycles=90, ambients=(24,) * 5, seed=3, noise_v=0.01)
+    ct = te.build_cycle_table(te.ParquetStore.from_dataframe(m))
+    # 1. a low first cycle (B0029-like) no longer shifts the forecast at the origin
+    first = (ct["Cell_ID"] == "S001") & (ct["n"] == ct.loc[ct["Cell_ID"] == "S001", "n"].min())
+    ct.loc[first, ["SOH", "Capacity_Ah"]] *= 0.93
+    n0 = 30
+    f = te.train_trajectory_model(ct, imp, "S001", n0, "Random Forest", "forecast", eol_ah=1.6, importance=False)
+    s0 = float(ct[(ct["Cell_ID"] == "S001") & (ct["n"] <= n0)]["SOH"].tail(3).median())
+    i = int(np.searchsorted(f.n_grid, n0 + 1))
+    assert abs(f.soh[i] - s0) < 0.01
+    # 2./3. task-matched held-out error is finite; forecasts never rise more than 2 points above today's SOH
+    for mdl in ("Bayesian Ridge", "SVM"):
+        g = te.train_trajectory_model(ct, imp, "S001", n0, mdl, "forecast", eol_ah=1.6, importance=False)
+        assert np.isfinite(g.cv_rmse) and g.cv_rmse < 1.0
+        assert g.soh[g.n_grid > n0].max() <= s0 + 0.02 + 1e-9
+    # 4. origins move forward when too few valid cycles come before them, and say so
+    ct2 = ct.copy()
+    ct2.loc[(ct2["Cell_ID"] == "S002") & (ct2["n"] <= 20), "outlier"] = True
+    n_new, note = te.safe_origin(ct2, "S002", 24)
+    assert n_new > 24 and "moves to cycle" in note
+    assert te.safe_origin(ct, "S003", 24) == (24, "")
+    # 5. relative end of life
+    assert te.soh_eol_for(1.9, 0.8) == 0.8 and abs(te.soh_eol_for(2.0, 1.4) - 0.7) < 1e-12
+    # 6. no interval with fewer than 3 batteries
+    res = te.run_protocol(te.ParquetStore.from_dataframe(m), ct, imp, ["S001", "S002"], ["trend", "persistence"],
+                          (0.4,), 1.6)
+    sb = te.protocol_scoreboard(res)
+    assert sb["95% CI ±"].isna().all()
+    # 7. reference-condition SOH flags only the cycles off the battery's initial load
+    ct3 = ct.copy()
+    ct3.loc[(ct3["Cell_ID"] == "S004") & ct3["n"].between(40, 55), "I_dis_A"] = 1.0
+    r = te.reference_condition_ct(ct3)
+    off = r[r["off_reference"]]
+    assert len(off) and set(off["Cell_ID"]) == {"S004"} and off["n"].between(40, 55).all()
 
 
 if __name__ == "__main__":                            # minimal runner when pytest is absent

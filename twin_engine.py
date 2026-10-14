@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.10.1"
+ENGINE_VERSION = "5.11.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -633,7 +633,10 @@ def cell_meta(ct: pd.DataFrame) -> pd.DataFrame:
 
 
 def soh_eol_for(c_bol_ah: float, eol_ah: float = DEFAULT_EOL_AH) -> float:
-    return float(eol_ah / c_bol_ah)
+    """End-of-life SOH threshold. eol_ah > 1: a fixed capacity in Ah (e.g. 1.4 Ah for the NASA cells);
+    eol_ah <= 1: a fraction of each battery's own initial capacity (0.8 = 80 %), which suits groups whose cells start
+    near a fixed threshold (cold cells hold much less capacity)."""
+    return float(eol_ah) if eol_ah <= 1.0 else float(eol_ah / c_bol_ah)
 
 
 # =============================================================================
@@ -6787,7 +6790,9 @@ def state_features(dc: pd.DataFrame, k: int, c_bol: float, window: int = 10) -> 
     tl = h.tail(15)
     trend_rate = (float(theilslopes(tl["SOH"].rolling(3, center=True, min_periods=1).median(), tl["n"])[0])
                   if len(tl) >= 5 else 0.0)                     # actual SOH on transient-free cycles (see _slope_ah)
-    return {"soh_now": float(last["SOH_causal"].iloc[-1]), "soh_slope": 100 * min(trend_rate, 0.0),
+    # SOH now: median of the last 3 valid, transient-free cycles. (A running minimum stayed pinned by one low early
+    # cycle, e.g. a first discharge 7 % low, and shifted every forecast of that battery.)
+    return {"soh_now": float(h["SOH"].tail(3).median()), "soh_slope": 100 * min(trend_rate, 0.0),
             "r_rel": rel("R_dc_ohm"), "r_slope": trend("R_dc_ohm"), "dT_now": float(last["dT_C"].tail(5).median()) if "dT_C" in h else np.nan,
             "dT_slope": trend("dT_C", norm=False), "tcv_rel": rel("t_cv_s"), "tcv_slope": trend("t_cv_s"),
             "vmean_rel": rel("V_mean_V"), "eff_now": float(last["eff_energy"].tail(5).median()) if "eff_energy" in h else np.nan,
@@ -7386,7 +7391,7 @@ def run_protocol(store: Any, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell
         eol_true, eol_status = eol_crossing(good["n"].to_numpy(), good["SOH"].to_numpy(), soh_eol, eol_k)
         train = [x for x in cells if x != c]
         for o in origins:
-            n0 = int(max(10, round(o * n_last)))
+            n0, _note = safe_origin(ct, c, int(max(10, round(o * n_last))))
             fut = good[good["n"] > n0]
             for key in models:
                 k_ += 1
@@ -7438,7 +7443,8 @@ def protocol_scoreboard(res: pd.DataFrame, baseline_label: Optional[str] = None)
     for (m, fam), d in per.groupby(["model", "family"]):
         x = d["rmse"].to_numpy()
         n = len(x)
-        half = float(t_dist.ppf(0.975, n - 1) * x.std(ddof=1) / np.sqrt(n)) if n >= 2 else np.nan
+        # with fewer than 3 batteries the t-interval explodes (t = 12.7 for 2) and is meaningless: report none
+        half = float(t_dist.ppf(0.975, n - 1) * x.std(ddof=1) / np.sqrt(n)) if n >= 3 else np.nan
         paired = d.set_index("Cell_ID")["rmse"].reindex(bpc.index).dropna()
         b = bpc.reindex(paired.index)
         diff = (paired - b).to_numpy()
@@ -7694,6 +7700,32 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         est = _make_mlp(seed, model_params) if model_name == "MLP" else make_model(model_name, seed, prm)
         return _StandardisedTarget(est).fit(Xs, ys)
 
+    x_lo, x_hi = np.nanmin(X, axis=0), np.nanmax(X, axis=0)
+    x_lo, x_hi = x_lo - 0.5 * (x_hi - x_lo), x_hi + 0.5 * (x_hi - x_lo)     # moderate extrapolation allowed
+    share = n0 / max(n_last, 1)
+
+    def clip_x(Xa: np.ndarray) -> np.ndarray:
+        # inputs far outside the training range made linear models extrapolate without limit (Bayesian ridge reached
+        # 105 % SOH and CV errors of 10^9): keep every input within the training range widened by 50 % on each side
+        # (hard clipping froze legitimate extrapolation, e.g. a hot cell whose resistance outgrows the training cells)
+        return np.clip(Xa, x_lo, x_hi)
+
+    def predict_rows(mdl: Any, rows: pd.DataFrame, k: float) -> np.ndarray:
+        """Forecast-mode SOH for rows seen from origin k: exactly the logic used for the predicted battery."""
+        Xr = clip_x(rows[feats].fillna(med).to_numpy(float))
+        soh0 = rows["soh0"].to_numpy()
+        if target == "rate":
+            p = soh0 + np.minimum(mdl.predict(Xr), 0.0) * _traj_dah(rows)
+        else:
+            r0 = rows.iloc[[0]].copy()
+            r0["n"], r0["dn"], r0["ah_est"] = float(k), 0.0, float(rows["ah_est"].iloc[0] - rows["ah_cyc"].iloc[0])
+            p = soh0 + mdl.predict(Xr) - float(mdl.predict(clip_x(r0[feats].fillna(med).to_numpy(float)))[0])
+        return np.minimum(p, soh0 + 0.02)          # batteries do not regain capacity beyond small recoveries
+
+    def measured_pred(mdl: Any, rows: pd.DataFrame) -> np.ndarray:
+        p = mdl.predict(clip_x(rows[feats].fillna(med).to_numpy(float)))
+        return pd.Series(p).rolling(5, min_periods=1).median().to_numpy()
+
     rng = np.random.default_rng(seed)
     cells_u = np.unique(g)
     folds = np.array_split(rng.permutation(cells_u), min(cv_folds, len(cells_u))) if len(cells_u) >= 3 else []
@@ -7704,10 +7736,33 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         if te_m.all() or not te_m.any():
             continue
         mm = fit(X[~te_m], y[~te_m])
-        pr = mm.predict(X[te_m])
-        scale = _traj_dah(tab.loc[te_m]) if (mode == "forecast" and target == "rate") else 1.0
-        res.append((y[te_m] - pr) * scale)                    # errors in SOH units for the band
-        ahead.append(tab.loc[te_m, "dn"].to_numpy() if "dn" in tab else np.zeros(te_m.sum()))
+        pr = mm.predict(clip_x(X[te_m]))
+        # score each held-out battery on the SAME task as the predicted battery: cut at the same share of its life,
+        # forecast (or estimate) its later cycles with the same anchoring, compare with its actual SOH
+        for c, sh in ((c, sh) for c in fold for sh in (0.8 * share, share, 1.2 * share)):   # 3 cuts: less noise
+            gc = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]]
+            if len(gc) < 10:
+                continue
+            k_c = int(max(10, round(sh * gc["n"].max())))
+            if mode == "measured" and sh != share:
+                continue                                    # measured mode: one cut is the whole remaining life
+            try:
+                if mode == "forecast":
+                    rr = _traj_forecast_rows(ct, c, k_c, step=1)
+                    if rr is None or not len(rr):
+                        continue
+                    dcf = clean_capacity(ct[ct["Cell_ID"] == c])
+                    truth = np.interp(rr["n"], dcf["n"], dcf["SOH_clean"])
+                    res.append(predict_rows(mm, rr, k_c) - truth)
+                    ahead.append(rr["dn"].to_numpy(float))
+                else:
+                    rr = _traj_measured_rows(ct, imp, c, n_min=k_c)
+                    if rr is None or not len(rr):
+                        continue
+                    res.append(measured_pred(mm, rr) - rr["SOH"].to_numpy(float))
+                    ahead.append(np.zeros(len(rr)))
+            except Exception:
+                continue
         if not importance:
             continue
         base = np.sqrt(np.mean((y[te_m] - pr) ** 2))
@@ -7722,22 +7777,19 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
     R = np.concatenate(res) if res else np.array([0.02])
     A = np.concatenate(ahead) if ahead else np.zeros(len(R))
     cv_rmse = float(np.sqrt(np.mean(R ** 2)))
-    importance = pd.DataFrame({"key": feats, "Indicator": [({**TRAJ_FORECAST_FEATURES, **TRAJ_MEASURED_FEATURES})[f] for f in feats],
-                               "Importance (ΔRMSE)": imp_vals / max(n_imp, 1), "std": 0.0}).sort_values("Importance (ΔRMSE)", ascending=False)
+    if importance and n_imp:
+        imp_table = pd.DataFrame({"key": feats, "Indicator": [({**TRAJ_FORECAST_FEATURES, **TRAJ_MEASURED_FEATURES})[f] for f in feats],
+                                   "Importance (ΔRMSE)": imp_vals / max(n_imp, 1), "std": 0.0}).sort_values("Importance (ΔRMSE)", ascending=False)
+    else:
+        imp_table = pd.DataFrame()       # not computed: no zero-filled table that would look like "no effect"
     # predict the target's later cycles
     n_end = int(n_last * horizon_factor)
     if mode == "forecast":
         rows = _traj_forecast_rows(ct, cell_id, n0, until=n_end, step=1)
         if rows is None:
             raise ValueError("trajectory model: too few cycles before the origin")
-        Xt = rows[feats].fillna(med).to_numpy(float)
-        if target == "rate":
-            pred = rows["soh0"].to_numpy() + np.minimum(model.predict(Xt), 0.0) * _traj_dah(rows)
-        else:
-            # anchoring: subtract the model's own prediction for zero cycles ahead, so the forecast starts at today's SOH
-            r0 = rows.iloc[[0]].copy()
-            r0["n"], r0["dn"], r0["ah_est"] = float(n0), 0.0, float(rows["ah_est"].iloc[0] - rows["ah_cyc"].iloc[0])
-            pred = rows["soh0"].to_numpy() + model.predict(Xt) - float(model.predict(r0[feats].fillna(med).to_numpy(float))[0])
+        # anchored at today's SOH (smooth models subtract their own prediction for zero cycles ahead)
+        pred = predict_rows(model, rows, n0)
         bins = np.array([0, 20, 40, 80, 1e9])
         q = []
         for a_, b_ in zip(bins[:-1], bins[1:]):
@@ -7751,9 +7803,8 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
         rows = _traj_measured_rows(ct, imp, cell_id, n_min=n0)
         if rows.empty:
             raise ValueError("trajectory model: no test cycles after the origin")
-        pred = model.predict(rows[feats].fillna(med).to_numpy(float))
         # each cycle's measurements are noisy: a trailing 5-cycle median (current and past cycles only, causal)
-        pred = pd.Series(pred).rolling(5, min_periods=1).median().to_numpy()
+        pred = measured_pred(model, rows)
         half = np.full(len(pred), float(np.quantile(np.abs(R), level)))
         n_pred = rows["n"].to_numpy()
         inputs0 = {TRAJ_MEASURED_FEATURES[f]: float(rows[f].iloc[0]) for f in feats if f != "n" and np.isfinite(rows[f].iloc[0])}
@@ -7775,7 +7826,7 @@ def train_trajectory_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_i
                     f"({100 * min(origin_fracs):.0f}–{100 * max(origin_fracs):.0f}%): the models extrapolate.")
     prefix = "DL" if model_name == "MLP" else "ML"
     return TrajectoryForecast(f"{prefix} · {model_name}" + (" (measured)" if mode == "measured" else ""), mode, cell_id,
-                              n0, n_grid, soh, lo, hi, metrics, feats, inputs0, importance, sorted(set(g) - {cell_id}),
+                              n0, n_grid, soh, lo, hi, metrics, feats, inputs0, imp_table, sorted(set(g) - {cell_id}),
                               cv_rmse, time.time() - t0, note)
 
 
@@ -8531,3 +8582,50 @@ def ensemble_trajectories(members: Sequence["TrajectoryForecast"], ct: pd.DataFr
     return TrajectoryForecast(name, ms[0].mode, cell_id, n0, grid, mean, lo, hi, metrics, ["models of this level"],
                               {f"weight · {m.model}": float(x) for m, x in zip(ms, w)}, pd.DataFrame(),
                               ms[0].train_cells, cv, float(sum(m.fit_seconds for m in ms)))
+
+
+
+# =============================================================================
+# 41. ORIGINS WITH ENOUGH VALID HISTORY
+# =============================================================================
+MIN_VALID_BEFORE_ORIGIN = 10
+
+
+def safe_origin(ct: pd.DataFrame, cell: str, n0: int, min_valid: int = MIN_VALID_BEFORE_ORIGIN) -> Tuple[int, str]:
+    """An origin set as a share of the recorded life can leave too few VALID cycles before it when early cycles are
+    flagged (e.g. the erratic 4 C runs). Move it forward to the min_valid-th valid cycle and say so; unchanged when
+    there are enough."""
+    g = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]].sort_values("n")
+    have = int((g["n"] <= n0).sum())
+    if have >= min_valid:
+        return int(n0), ""
+    if len(g) < min_valid + 5:
+        return int(n0), (f"{cell} has only {len(g)} valid cycles in total: too few for a forecast with at least "
+                         f"{min_valid} known cycles.")
+    n_new = int(g["n"].iloc[min_valid - 1])
+    return n_new, (f"{cell}: only {have} valid cycles before cycle {n0}; the origin moves to cycle {n_new} (its "
+                   f"{min_valid}th valid cycle, {100 * n_new / max(int(g['n'].max()), 1):.0f}% of its recorded life).")
+
+
+# =============================================================================
+# 42. REFERENCE-CONDITION SOH (separate ageing from load and temperature effects)
+# =============================================================================
+def reference_condition_ct(ct: pd.DataFrame, i_tol: float = 0.25, t_tol: float = 5.0, n_ref: int = 10) -> pd.DataFrame:
+    """Capacity depends on the discharge current and temperature at the moment of measurement (a cell delivers more at
+    a lower current), so in campaigns whose load or ambient changes during the test, SOH mixes ageing with the
+    operating condition. Keep only each battery's cycles at its reference condition (median current and ambient of its
+    first n_ref valid cycles, within i_tol A and t_tol C); the others are flagged invalid ('off_reference')."""
+    out = ct.copy()
+    out["off_reference"] = False
+    for c, d in out.groupby("Cell_ID"):
+        v = d[~d["outlier"]].sort_values("n").head(n_ref)
+        if len(v) < 3:
+            continue
+        off = np.zeros(len(d), dtype=bool)
+        if "I_dis_A" in d and v["I_dis_A"].notna().any():
+            off |= (d["I_dis_A"] - float(v["I_dis_A"].median())).abs().to_numpy() > i_tol
+        if "Ambient_C" in d and v["Ambient_C"].notna().any():
+            off |= (d["Ambient_C"] - float(v["Ambient_C"].median())).abs().to_numpy() > t_tol
+        out.loc[d.index, "off_reference"] = off
+    out["outlier"] = out["outlier"] | out["off_reference"]
+    return out
