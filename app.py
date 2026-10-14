@@ -30,6 +30,7 @@ import os
 import re
 import traceback
 from dataclasses import asdict, dataclass, replace
+from datetime import date
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -46,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.11.0"
+REQUIRED_ENGINE = "5.12.1"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -594,9 +595,30 @@ def manifest_button(config: Dict[str, Any], key: str, data_key: str, extra: Opti
 
 PLOT_CONFIG = {
     "displaylogo": False,
+    "displayModeBar": True,                          # always visible: the camera saves the chart as a named PNG
     "modeBarButtonsToRemove": ["lasso2d", "select2d"],
-    "toImageButtonOptions": {"format": "svg", "scale": 1},
+    "toImageButtonOptions": {"format": "png", "scale": 2},
 }
+
+
+def image_name(fig: go.Figure, key: str) -> str:
+    """File name of a chart image: chart id, battery (or condition group for group-level charts), chart title, date,
+    engine version. Lets a saved image be identified without opening it, e.g.
+    acc_board__Reference__prediction-accuracy-assessment__2026-10-14__v5.12.1."""
+    def slug(x: Any, n: int = 60, lower: bool = True) -> str:
+        x = re.sub(r"<[^>]+>", " ", str(x or ""))
+        x = re.sub(r"[^A-Za-z0-9]+", "-", x).strip("-")
+        return (x.lower() if lower else x)[:n].strip("-")
+    title = getattr(getattr(fig.layout, "title", None), "text", "") if fig is not None else ""
+    ss = st.session_state
+    where = ss.get("acc_group") if key.startswith("acc") else ss.get("cell")
+    parts = [slug(key, 40), slug(where, 20, lower=False), slug(title), date.today().isoformat(), f"v{te.ENGINE_VERSION}"]
+    return "__".join(p for p in parts if p)
+
+
+def plot_config(fig: go.Figure, key: str, **extra: Any) -> Dict[str, Any]:
+    return dict(PLOT_CONFIG, toImageButtonOptions={**PLOT_CONFIG["toImageButtonOptions"],
+                                                   "filename": image_name(fig, key)}, **extra)
 
 
 EXPLAIN: Dict[str, str] = {
@@ -697,7 +719,7 @@ def explain(key: str) -> None:
 def show(fig: go.Figure, key: str, data: Optional[pd.DataFrame] = None, export: bool = True) -> None:
     """Render with Plotly styling intact (theme=None) across Streamlit versions, plus an
     export row: interactive HTML, SVG / PDF (when kaleido is installed) and the plotted data."""
-    base = dict(theme=None, config=PLOT_CONFIG)
+    base = dict(theme=None, config=plot_config(fig, key))
     attempts: List[Dict[str, Any]] = []
     if ST_VERSION >= (1, 50):
         attempts.append(dict(width="stretch", key=key))
@@ -715,7 +737,7 @@ def show(fig: go.Figure, key: str, data: Optional[pd.DataFrame] = None, export: 
 
 def show_selectable(fig: go.Figure, key: str) -> Optional[Any]:
     """Chart with point selection (Streamlit >= 1.35). Returns the selection event or None."""
-    cfg = dict(PLOT_CONFIG, modeBarButtonsToRemove=["lasso2d"])
+    cfg = plot_config(fig, key, modeBarButtonsToRemove=["lasso2d"])
     for extra in ([dict(width="stretch")] if ST_VERSION >= (1, 50) else []) + [dict(use_container_width=True)]:
         try:
             ev = st.plotly_chart(fig, theme=None, config=cfg, key=key, on_select="rerun",
@@ -732,20 +754,23 @@ def export_row(fig: go.Figure, key: str, data: Optional[pd.DataFrame]) -> None:
     holder = getattr(st, "popover", None)
     ctx = holder("⋯ Export", use_container_width=False) if holder else st.expander("⋯ Export")
     with ctx:
-        download("Interactive HTML", fig.to_html(include_plotlyjs="cdn", full_html=True), f"{key}.html",
+        name = image_name(fig, key)
+        download("Interactive HTML", fig.to_html(include_plotlyjs="cdn", full_html=True), f"{name}.html",
                  "text/html", key=f"dl_html_{key}")
         if HAS_KALEIDO:
             try:
-                download("SVG (vector)", fig.to_image(format="svg"), f"{key}.svg", "image/svg+xml",
+                download("PNG (image)", fig.to_image(format="png", scale=2), f"{name}.png", "image/png",
+                         key=f"dl_png_{key}")
+                download("SVG (vector)", fig.to_image(format="svg"), f"{name}.svg", "image/svg+xml",
                          key=f"dl_svg_{key}")
-                download("PDF (vector)", fig.to_image(format="pdf"), f"{key}.pdf", "application/pdf",
+                download("PDF (vector)", fig.to_image(format="pdf"), f"{name}.pdf", "application/pdf",
                          key=f"dl_pdf_{key}")
             except Exception as exc:                     # kaleido needs a browser runtime
                 st.caption(f"Static export unavailable: {exc}")
         else:
-            st.caption("Install `kaleido` for SVG / PDF export (the modebar camera saves SVG too).")
+            st.caption("Install `kaleido` for SVG / PDF export here; the camera icon on the chart always saves a PNG.")
         if data is not None and len(data):
-            download("Plotted data (CSV)", data.to_csv(index=False), f"{key}.csv", "text/csv",
+            download("Plotted data (CSV)", data.to_csv(index=False), f"{name}.csv", "text/csv",
                      key=f"dl_csv_{key}")
 
 
@@ -3648,6 +3673,8 @@ def sidebar_guide() -> None:
                   help="Off: explanations shrink to an ⓘ you can hover.")
         st.toggle("Export menus on charts", value=False, key="ui_export",
                   help="HTML / SVG / CSV export under each chart (off = faster, cleaner pages).")
+        st.caption(":material/photo_camera: The camera icon at the top right of every chart saves it as a PNG image, "
+                   "named after the chart, battery or group, title and date.")
         with st.expander("Glossary", icon=":material/menu_book:"):
             for k_, v in GLOSSARY.items():
                 st.markdown(f"**{k_}**: {v}")
@@ -4974,6 +5001,7 @@ def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
 
 
 
+ACC_SCOPES = ("Best 2 per level (chosen by CV in each fold)", "Models I choose")
 ASSESS_SECONDS = {"PINN": 8.0, "PINN-ablation": 4.0, "persistence": 0.3, "trend": 0.3, "shape": 1.0, "Bayesian Ridge": 1.5, "Decision Tree": 1.5,
                   "Random Forest": 3.0, "SVM": 2.0, "Gaussian Process": 12.0, "XGBoost": 3.0, "LightGBM": 2.0,
                   "MLP": 2.0, "GRU": 6.0, "Transformer": 4.0}
@@ -5012,10 +5040,30 @@ def assessment_section() -> None:
     av = te.available_models()
     options = (["persistence", "trend", "shape"] + [f"traj:{m}" for m in av] + [f"trajm:{m}" for m in av]
                + [f"dl:{k}" for k in te.DL_MODELS] + [f"dlm:{k}" for k in te.DL_MODELS] + [f"pinn:{k}" for k in te.PINN_MODELS])
-    keys = st.multiselect("Models (level 1 baselines, 2 machine learning, 3 deep learning, 4 physics-informed)", options,
-                          default=["trend", "shape"] + [f"traj:{m}" for m in ("Bayesian Ridge", "Random Forest", "SVM")
-                                                        if m in av] + ["dl:GRU"],
-                          key="acc_models", format_func=lambda k: te.PROTOCOL_MODELS[k][1])
+    scope = st.radio("What to score", ACC_SCOPES, key="acc_scope", horizontal=True,
+                     help="Best 2 per level: for every held-out battery the models of each level are ranked by their CV "
+                          "error on the other (training) batteries and the 2 lowest are scored, so the choice never "
+                          "sees the battery it is scored on. Picking the best 2 from a scoreboard afterwards would be "
+                          "optimistic.")
+    cv_mode = scope == ACC_SCOPES[0]
+    if cv_mode:
+        level_keys = {"Level 2 · ML forecast": [f"traj:{m}" for m in av], "Level 2 · ML measured": [f"trajm:{m}" for m in av],
+                      "Level 3 · DL forecast": [f"dl:{k}" for k in te.DL_MODELS],
+                      "Level 3 · DL measured": [f"dlm:{k}" for k in te.DL_MODELS],
+                      "Level 4 · PINN + ablation": [f"pinn:{k}" for k in te.PINN_MODELS]}
+        levels = st.multiselect("Levels (baselines are always included: the verdict needs them)", list(level_keys),
+                                default=list(level_keys), key="acc_levels")
+        keys = ["persistence", "trend", "shape"] + [k for lv in levels for k in level_keys[lv]]
+        st.caption("Every model of each chosen level is fitted for every held-out battery (its CV error is needed to "
+                   "choose), but the scoreboard shows only the 2 with the lowest CV error per level and mode, plus the "
+                   "baselines and Level 4 (only the PINN and its no-physics control, so there is nothing to choose). "
+                   "The models picked on each battery are listed below the verdict.")
+    else:
+        keys = st.multiselect("Models (level 1 baselines, 2 machine learning, 3 deep learning, 4 physics-informed)", options,
+                              default=["trend", "shape"] + [f"traj:{m}" for m in ("Bayesian Ridge", "Random Forest", "SVM")
+                                                            if m in av] + ["dl:GRU"],
+                              key="acc_models", format_func=lambda k: te.PROTOCOL_MODELS[k][1])
+    view = (lambda r: te.select_by_cv(r, 2)[0]) if cv_mode else (lambda r: r)
     cells_g = tuple(te.protocol_cells(ct, grp))
     tasks = [(c, o, k) for c in cells_g for o in sorted(origins) for k in keys]
     secs = sum(ASSESS_SECONDS.get(k.split(":", 1)[-1], 3.0) for _, _, k in tasks)
@@ -5037,7 +5085,7 @@ def assessment_section() -> None:
             parts.append(assess_task_cached(store, ct, imp, DATA_KEY, cells_g, k, float(o), c, float(eol_ah)))
             if i % 3 == 2 or i == len(tasks) - 1:
                 part = pd.concat(parts, ignore_index=True)
-                sbp = te.protocol_scoreboard(part)
+                sbp = te.protocol_scoreboard(view(part))
                 if len(sbp):
                     live.dataframe(sbp[["Batteries", "RMSE (SOH pts)", "95% CI ±", "EOL |error| (cycles)"]].round(2),
                                    use_container_width=True)
@@ -5053,6 +5101,10 @@ def assessment_section() -> None:
     if st.session_state.get("acc_key") != run_key:
         st.info("The results below were computed with different models or origins than currently selected; press Run to "
                 "update them (forecasts already computed are reused).")
+    res_all = res
+    picks = pd.DataFrame()
+    if cv_mode:
+        res, picks = te.select_by_cv(res_all, 2)
     sb = te.protocol_scoreboard(res)
     if sb.empty:
         st.warning("No forecast succeeded: " + "; ".join(sorted(set(res["status"].astype(str).str[:70]))[:3]))
@@ -5111,8 +5163,51 @@ def assessment_section() -> None:
     if len(bad):
         st.caption(f"{len(bad)} forecasts failed and are counted as failures: "
                    + "; ".join(sorted(set(bad["status"].str[:60]))[:3]))
-    download("Download the assessment (CSV)", res.to_csv(index=False).encode(), f"assessment_{grp}.csv", "text/csv",
-             key="acc_csv")
+    if cv_mode:
+        _cv_picks_block(picks, res_all, cells_g)
+    download("Download the assessment, every model (CSV)", res_all.to_csv(index=False).encode(), f"assessment_{grp}.csv",
+             "text/csv", key="acc_csv")
+    if cv_mode and len(picks):
+        download("Download the models picked by CV (CSV)", picks.to_csv(index=False).encode(), f"assessment_{grp}_cv_picks.csv",
+                 "text/csv", key="acc_picks_csv")
+
+
+def _cv_picks_block(picks: pd.DataFrame, res_all: pd.DataFrame, cells_g: Sequence[str]) -> None:
+    """Which models CV picked on each held-out battery, whether the star agreed with the test, and (for reference
+    only) every model's score."""
+    if picks is None or not len(picks):
+        st.info("No model of the chosen levels has a CV error yet, so nothing could be picked.")
+        return
+    agree = te.cv_pick_agreement(picks)
+    if len(agree):
+        show_table(agree.style.format({"Star also best on test": "{:.0%}", "Mean test rank of the star": "{:.1f}"}),
+                   note="Does the star agree with the test? For each level, how often the model with the lowest CV error "
+                        "(chosen from the training batteries) was also the best on the held-out battery, and its mean "
+                        "rank there (1 = best). Rank near 1: the star can be trusted; near the number of models: it "
+                        "cannot.")
+    short = picks.copy()
+    short["Battery · origin"] = short["Cell_ID"] + " · " + (100 * short["origin"]).round().astype(int).astype(str) + "%"
+    short["Pick"] = (short["Picked model"].str.replace(" (measured)", "", regex=False).str.split(" · ").str[-1]
+                     + " (test rank " + short["Test rank"].astype(str) + "/" + short["Candidates"].astype(str) + ")")
+    piv = short.pivot_table(index="Battery · origin", columns=["Level", "Choice"], values="Pick", aggfunc="first")
+    piv.columns = [f"{a} · {b}" for a, b in piv.columns]
+    show_table(piv, note="The models chosen by CV on each held-out battery: the choice can differ from battery to "
+                         "battery, which is part of what the scoreboard above measures.")
+    expected = {lv: int(res_all.loc[res_all["family"] == fam, "key"].nunique())
+                for fam, lv in te.CV_SELECT_FAMILIES.items() if (res_all["family"] == fam).any()}
+    short_c = picks.groupby("Level")["Candidates"].min()
+    low = [lv for lv, n in short_c.items() if n < expected.get(lv, n)]
+    if low:
+        st.warning("On some batteries, fewer models had a CV error than were run (" + ", ".join(low) + "): the choice "
+                   "was made among the models available there.")
+    with st.expander("Every model of the chosen levels (for reference, not for choosing)"):
+        st.caption("Picking the best 2 from this table and reporting their scores would be optimistic: with a few "
+                   "batteries some models win by luck, and the same batteries would confirm them. Report the scoreboard "
+                   "above.")
+        sb_all = te.protocol_scoreboard(res_all)
+        if len(sb_all):
+            show_table(sb_all.style.format({"RMSE (SOH pts)": "{:.2f}", "95% CI ±": "{:.2f}", "EOL |error| (cycles)": "{:.1f}",
+                                            "Coverage": "{:.0%}", "p (Wilcoxon)": "{:.3f}"}, na_rep="—"))
 
 
 def _level_results(res: Sequence[Any], show_t: str, level: int, key: str, ctx: Optional[Dict[str, Any]] = None) -> None:

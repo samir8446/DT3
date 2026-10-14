@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.11.0"
+ENGINE_VERSION = "5.12.1"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -7414,6 +7414,8 @@ def run_protocol(store: Any, ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell
                     cross = np.nonzero(fut_pred & (f.soh < soh_eol))[0]
                     eol_pred = int(f.n_grid[cross[0]]) if len(cross) else None
                     eol_err = (eol_pred - eol_true) if (eol_pred is not None and eol_true is not None and eol_true > n0) else np.nan
+                    cv_ = getattr(f, "cv_rmse", np.nan)      # baselines have none; learned models: training batteries only
+                    row["CV RMSE (SOH pts)"] = float(cv_) * 100 if cv_ is not None and np.isfinite(cv_) else np.nan
                     rows.append({**row, "status": "ok", "RMSE (SOH pts)": float(np.sqrt(np.mean(e ** 2))),
                                  "MAE (SOH pts)": float(np.mean(np.abs(e))), "bias (SOH pts)": float(np.mean(e)),
                                  "coverage": cov, "EOL pred": eol_pred, "EOL error (cycles)": eol_err,
@@ -8629,3 +8631,75 @@ def reference_condition_ct(ct: pd.DataFrame, i_tol: float = 0.25, t_tol: float =
         out.loc[d.index, "off_reference"] = off
     out["outlier"] = out["outlier"] | out["off_reference"]
     return out
+
+
+# =============================================================================
+# 43. BEST MODELS PER LEVEL, CHOSEN BY CV INSIDE EACH FOLD (honest shortlist for the accuracy assessment)
+# =============================================================================
+# Picking the "best 2" from the assessment scoreboard and then reporting their scores is optimistic: with 4 batteries
+# some models win by luck and the same batteries confirm them. Here the choice is part of the procedure: for each
+# held-out battery and origin, the models of a level are ranked by their CV error, which is computed on the OTHER
+# (training) batteries only, and the k lowest become "best by CV", "2nd by CV". Their scores on the held-out battery
+# are then an honest estimate of what the twin's recommended model (the star) achieves on a battery it has not seen.
+# Level 4 has only the PINN and its no-physics ablation (a control), so it is reported as it is, without a choice.
+CV_SELECT_FAMILIES: Dict[str, str] = {"Machine learning (forecast)": "Level 2 · ML forecast",
+                                      "Machine learning (measured)": "Level 2 · ML measured",
+                                      "Deep learning (forecast)": "Level 3 · DL forecast",
+                                      "Deep learning (measured)": "Level 3 · DL measured"}
+CV_RANK_NAMES = ("best by CV", "2nd by CV", "3rd by CV")
+
+
+def select_by_cv(res: pd.DataFrame, k: int = 2) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Replace the models of each selectable level by its k models with the lowest CV error, chosen separately for
+    every (held-out battery, origin) from the training batteries only. Rows of other families (baselines, PINN) are
+    kept unchanged. Returns (rows for the scoreboard, picks table). The picks table also shows how the pick ranked on
+    the held-out battery's test cycles: a diagnostic of the star, never used for the choice."""
+    cvc = "CV RMSE (SOH pts)"
+    if res is None or not len(res):
+        return res, pd.DataFrame()
+    k = int(np.clip(k, 1, len(CV_RANK_NAMES)))
+    is_sel = res["family"].isin(list(CV_SELECT_FAMILIES))
+    keep = res[~is_sel]
+    sel_rows, picks = [], []
+    for (c, o, fam), d in res[is_sel].groupby(["Cell_ID", "origin", "family"], sort=False):
+        ok = d[d["status"] == "ok"]
+        cand = ok[ok[cvc].notna()] if cvc in ok else ok.iloc[0:0]
+        cand = cand.sort_values([cvc, "model"])          # ties broken by name: deterministic
+        test_rank = ok["RMSE (SOH pts)"].rank(method="min")
+        best_test = str(ok.loc[ok["RMSE (SOH pts)"].idxmin(), "model"]) if len(ok) else None
+        lev = CV_SELECT_FAMILIES[fam]
+        for r in range(k):
+            lab = f"{lev} · {CV_RANK_NAMES[r]}"
+            if r < len(cand):
+                src = cand.iloc[r]
+                row = src.to_dict()
+                row.update({"model": lab, "key": f"cvsel:{fam}:{r + 1}", "picked": str(src["model"])})
+                sel_rows.append(row)
+                picks.append({"Cell_ID": c, "origin": o, "Level": lev, "Choice": CV_RANK_NAMES[r],
+                              "Picked model": str(src["model"]), "CV RMSE (SOH pts)": float(src[cvc]),
+                              "Test RMSE (SOH pts)": float(src["RMSE (SOH pts)"]),
+                              "Test rank": int(test_rank.loc[cand.index[r]]), "Candidates": int(len(cand)),
+                              "Best on test": best_test})
+            else:
+                first = d.iloc[0]
+                sel_rows.append({"Cell_ID": c, "origin": o, "n0": first.get("n0"), "model": lab,
+                                 "key": f"cvsel:{fam}:{r + 1}", "family": fam, "test cycles": first.get("test cycles"),
+                                 "EOL true": first.get("EOL true"),
+                                 "status": f"failed: only {len(cand)} model(s) of this level have a CV error"})
+    out = pd.concat([keep, pd.DataFrame(sel_rows)], ignore_index=True) if sel_rows else keep.reset_index(drop=True)
+    return out, pd.DataFrame(picks)
+
+
+def cv_pick_agreement(picks: pd.DataFrame) -> pd.DataFrame:
+    """Per level: how often the model chosen by CV ('best by CV') was also the best on the held-out battery's test
+    cycles, and its mean test rank. Answers 'does the star agree with the test results?'."""
+    if picks is None or not len(picks):
+        return pd.DataFrame()
+    b = picks[picks["Choice"] == CV_RANK_NAMES[0]]
+    if not len(b):
+        return pd.DataFrame()
+    g = b.groupby("Level")
+    return pd.DataFrame({"Folds": g.size(),
+                         "Star also best on test": g["Test rank"].apply(lambda r: float(np.mean(r == 1))),
+                         "Mean test rank of the star": g["Test rank"].mean(),
+                         "Models per level": g["Candidates"].max()})

@@ -1,9 +1,34 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.11.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.12.1)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Charts saved as named images (v5.12.1)
+
+1. The Plotly toolbar is always visible on every chart; its camera icon saves a PNG (2x resolution, in the browser, no
+   extra package needed) named `chart-id__battery-or-group__chart-title__date__version.png`, e.g.
+   `acc-board__Reference__prediction-accuracy-assessment-same-batteries-same-protocol__2026-10-14__v5.12.1.png`.
+   Battery for single-battery charts, condition group for the accuracy-assessment charts.
+2. The export menu (sidebar toggle "Export menus on charts") uses the same name for HTML, CSV, and for PNG / SVG / PDF
+   when `kaleido` works.
+3. Checked with AppTest: every chart in every view on the demo cohort carries a PNG camera with a safe file name.
+
+## Accuracy assessment: best 2 models per level, chosen by CV in each fold (v5.12.0)
+
+1. New default in "What to score": *Best 2 per level (chosen by CV in each fold)*. For every held-out battery and
+   origin, all models of a level are fitted; the 2 with the lowest CV error on the OTHER (training) batteries become
+   "best by CV" and "2nd by CV" and are scored on the held-out battery. Levels: Level 2 ML forecast / measured,
+   Level 3 DL forecast / measured; Level 4 (PINN + no-physics ablation) and the 3 baselines are always shown as they
+   are. Picking the best 2 from the full scoreboard afterwards would be optimistic (same batteries choose and confirm).
+2. Every assessment row now records the forecast's own CV error (`CV RMSE (SOH pts)`; NaN for baselines).
+3. `select_by_cv(res, k)` and `cv_pick_agreement(picks)` in the engine; in the app: a table "does the star agree with
+   the test?" (share of folds where the CV pick was also best on test, mean test rank), the model picked on each
+   battery with its test rank, every model's score in an expander (reference only), CSV of the picks.
+4. Run time is unchanged versus running all models (every model must be fitted to know its CV error).
+5. Tests: tests/test_cv_selection.py (choice follows CV, never the test error; failure rows when too few models have a
+   CV error; real protocol records CV). AppTest: both modes, two renders, all views on the demo cohort.
 
 ## Fixes from the first real results across condition groups (v5.11.0)
 
