@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.15.0"
+REQUIRED_ENGINE = "5.15.1"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -2353,6 +2353,19 @@ def frozen_context(c: str) -> Tuple[Optional[str], Optional[Tuple[str, str]], Li
     return grp_c, fz, train_c
 
 
+def frozen_unavailable_reason(c: str, grp_c: Optional[str], fz: Optional[Tuple[str, str]], train_c: List[str]) -> str:
+    """Why the frozen model cannot run for this battery, in plain words (empty string when it can)."""
+    if grp_c is None:
+        return f"{c} has no condition group (no valid cycle), so there is no frozen model for it."
+    if fz is None:
+        return (f"{c} belongs to the {grp_c} group, which was not part of the accuracy assessment, so it has no frozen "
+                f"model. Frozen models exist for: {', '.join(te.FROZEN_MODELS)}.")
+    if len(train_c) < 2:
+        return (f"{c} belongs to the {grp_c} group, whose frozen model needs at least two other batteries to retrain "
+                f"on; this dataset has {len(train_c)} other usable {grp_c} battery(ies) (25 cycles or more).")
+    return ""
+
+
 @st.cache_data(show_spinner=False, max_entries=4)
 def dp_cached(econ: Dict[str, Any], phys: Dict[str, Any], maint: Dict[str, Any], amb_mean: float, amb_amp: float,
               n_soh: int, n_phase: int) -> te.DPResult:
@@ -3401,38 +3414,45 @@ def view_replay() -> None:
                                  value=10, key="rp_cap",
                                  help="Between checks the twin sees only partial-window voltage and load-step "
                                       "resistance. Set 0 to watch pure operando tracking, including its drift.")
+    grp_c, fz, train_c = frozen_context(cell)
+    use_fz, refit, anchor = False, 10, "capacity"
+    why_not = frozen_unavailable_reason(cell, grp_c, fz, train_c)
+    with st.container(border=True):
+        st.markdown(f"**Frozen assessment model** · battery **{html.escape(cell)}** · group "
+                    f"**{html.escape(grp_c or 'none')}**")
+        if why_not:
+            st.info(why_not, icon=":material/info:")
+        else:
+            f1, f2, f3 = st.columns([1.3, 1.2, 2.0], vertical_alignment="center")
+            use_fz = f1.toggle(f"Frozen {grp_c} model", value=True, key="rp_fz",
+                               help=f"The assessment winner of the {grp_c} group: forecast "
+                                    f"{te.PROTOCOL_MODELS[fz[0]][1]}, SOH-now {te.PROTOCOL_MODELS[fz[1]][1]} "
+                                    f"({te.FROZEN_SOURCE}). It is retrained on the group's other batteries plus this "
+                                    "battery's history up to now, and its forecast is re-anchored every cycle to the "
+                                    "current SOH.")
+            refit = f2.select_slider("Retrain every (cycles)", [5, 10, 20, 50, 0], value=10, key="rp_fz_refit",
+                                     format_func=lambda v: "never" if v == 0 else str(v), disabled=not use_fz)
+            anchor = f3.radio("Re-anchor every cycle to", list(te.FROZEN_ANCHORS), key="rp_fz_anchor", horizontal=True,
+                              format_func=lambda k_: te.FROZEN_ANCHORS[k_].split(" (")[0], disabled=not use_fz,
+                              help="Measured capacity: lab, capacity measured on every discharge. SOH-now model: "
+                                   "field mode, no capacity measured after the start; the frozen SOH-now model "
+                                   "estimates it from the operando signals and retraining sees only those estimates. "
+                                   "None: the model's own forecast.")
+            st.caption(f"Forecast: {te.PROTOCOL_MODELS[fz[0]][1]} · SOH-now: {te.PROTOCOL_MODELS[fz[1]][1]} · "
+                       f"retrained on {len(train_c)} other {grp_c} batteries plus this one's history"
+                       + (" · switch on Reference-condition SOH in the control bar to replay this battery as it was "
+                          "assessed" if grp_c == "Mixed conditions" and not st.session_state.get("ref_soh") else ""))
     show_models = st.multiselect(
         "Live models", list(te.LIVE_MODELS),
         default=[m for m in ("twin", "mech", "pf", "trend", "frozen", "ens") if m in te.LIVE_MODELS], key="rp_models",
-        format_func=te.LIVE_MODELS.get,
+        format_func=lambda m: (te.LIVE_MODELS[m] if m != "frozen" else
+                               (f"Frozen {grp_c} model · {te.PROTOCOL_MODELS[fz[0]][1]}" if use_fz else
+                                "Frozen model · not running for this battery")),
         help="ECM twin: physics + operando voltage. Particle filter: power law with the fleet prior, robust to knees. "
              "Adaptive trend KF: level-slope-curvature filter that bends quickly when fade accelerates. Hierarchical "
              "Bayes: fleet-informed power law. Mechanistic PF: SEI, lithium-plating and LAM kinetics driven by each "
              "cycle's measured temperature and current, so the operating conditions decide which mechanism grows. "
              "Live ensemble: weights every model by its recent 5-cycle-ahead error.")
-    grp_c, fz, train_c = frozen_context(cell)
-    use_fz = False
-    if fz and len(train_c) >= 2:
-        f1, f2, f3 = st.columns([1.3, 1.2, 2.0], vertical_alignment="center")
-        use_fz = f1.toggle(f"Frozen {grp_c} model", value=True, key="rp_fz",
-                           help=f"The assessment winner of the {grp_c} group: forecast {te.PROTOCOL_MODELS[fz[0]][1]}, "
-                                f"SOH-now {te.PROTOCOL_MODELS[fz[1]][1]} ({te.FROZEN_SOURCE}). It is retrained on the "
-                                "group's other batteries plus this battery's history up to now, and its forecast is "
-                                "re-anchored every cycle to the current SOH.")
-        refit = f2.select_slider("Retrain every (cycles)", [5, 10, 20, 50, 0], value=10, key="rp_fz_refit",
-                                 format_func=lambda v: "never" if v == 0 else str(v), disabled=not use_fz)
-        anchor = f3.radio("Re-anchor every cycle to", list(te.FROZEN_ANCHORS), key="rp_fz_anchor", horizontal=True,
-                          format_func=lambda k_: te.FROZEN_ANCHORS[k_].split(" (")[0], disabled=not use_fz,
-                          help="Measured capacity: lab, capacity measured on every discharge. SOH-now model: field "
-                               "mode, no capacity measured after the start; the frozen SOH-now model estimates it "
-                               "from the operando signals and retraining sees only those estimates. None: the model's "
-                               "own forecast.")
-        if grp_c == "Mixed conditions" and not st.session_state.get("ref_soh"):
-            st.caption("The Mixed-conditions models were assessed at each battery's reference condition: switch on "
-                       "Reference-condition SOH in the control bar to replay this battery the same way.")
-    elif grp_c:
-        st.caption(f"No frozen model for this battery's group ({grp_c}): only groups covered by the accuracy "
-                   "assessment have one.")
     fz_frames = None
     if use_fz:
         with st.spinner(f"Streaming the frozen {grp_c} model (retrains as it goes; runs once)…"):
@@ -4604,8 +4624,9 @@ def frozen_update_section() -> None:
                 "SOH-now model (field: no capacity measured after the start). 'Never retrain, no anchor' is exactly the "
                 "assessment forecast. Scores are causal: each forecast is compared only with cycles measured after it.")
     grp_c, fz, train_c = frozen_context(cell)
-    if not fz or len(train_c) < 2:
-        st.info(f"No frozen model for this battery's group ({grp_c or 'none'}), or fewer than three batteries in it.")
+    why_not = frozen_unavailable_reason(cell, grp_c, fz, train_c)
+    if why_not:
+        st.info(why_not + " Select a battery of another group in the control bar.", icon=":material/info:")
         return
     st.caption(f"{grp_c} group · forecast: {te.PROTOCOL_MODELS[fz[0]][1]} · SOH-now: {te.PROTOCOL_MODELS[fz[1]][1]} · "
                f"default settings.")

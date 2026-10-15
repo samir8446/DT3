@@ -1,9 +1,18 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.15.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.15.1)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Frozen-model panel in the Live twin (v5.15.1)
+
+1. A framed panel "Frozen assessment model · battery · group" sits above the Live models list. It shows the toggle,
+   retraining interval and anchor when the frozen model can run, and otherwise the exact reason: no group, a group
+   without a frozen model (e.g. High current), or fewer than two other usable batteries in the group.
+2. Fixed: a group with a frozen model but too few batteries was reported as having no frozen model.
+3. In the Live models list the frozen entry reads "Frozen <group> model · <model>" when running, and "not running for
+   this battery" otherwise (it used to look available even when it was not).
 
 ## Frozen models in the self-updating twin (v5.15.0)
 

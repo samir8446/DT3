@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.15.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.15.1 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.15.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.15.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.15.1"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.15.1"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -161,7 +161,7 @@ near 1.4 Ah (use EOL 80 % of initial); B0029 low first cycle biased baselines/Le
 Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed measured, Pulsed forecast.
 
 ## 6. Next steps (in order)
-1. USER (v5.15.0, locally): Live twin view -> section "How often should the frozen model update?" -> "Whole <group>
+1. USER (v5.15.1, locally): Live twin view -> section "How often should the frozen model update?" -> "Whole <group>
    group", default settings (retrain 5/10/20/50/never x 3 anchors, next 20 cycles). One run per group: Reference
    (pick B0005), Hot, Cold, Mixed (Reference-condition toggle ON), Pulsed. Send each CSV.
 2. Compare the frozen model with the filters (EKF, mechanistic PF, power-law PF, trend KF, ensemble): Live model
