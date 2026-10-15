@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.14.1 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.15.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,10 +9,10 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.14.1"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.14.1"  (exact version guard + required-function check)
-- tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun at v5.12, file not in the Project) +
-  tests/test_cv_selection.py: 3 tests (v5.12), passing
+- twin_engine.py  ENGINE_VERSION = "5.15.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.15.0"  (exact version guard + required-function check)
+- tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
+  tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
 - battery-twin.zip: complete local package (INSTALL.bat one-click Windows installer -> %USERPROFILE%\battery-twin-app,
   Desktop shortcut "Battery Digital Twin"; setup/run scripts for Windows and Mac; .streamlit/config.toml upload 1 GB)
@@ -42,6 +42,11 @@ Live twin: replay with ECM dual EKF, mechanistic PF, power-law PF, adaptive tren
 update-frequency study; measurement ablation.
 
 ## 4. Decisions (do not reopen without new evidence)
+- Every assessment result uses each model's DEFAULT settings: the assessment never applies self-optimisation or
+  automatic parameter selection (Models-view tuning does not reach it). Frozen models = default settings, v5.14.1.
+- Frozen models (user decision): per group and mode, the learned model with the lowest mean test RMSE over all
+  batteries, baselines and PINN ablation excluded (mission2_frozen_models.csv). Report next to the CV-chosen
+  (honest) score from mission2_summary_by_group.csv, because choosing on the test batteries is optimistic.
 - Assessment groups: all usable groups; Pulsed and Mixed labelled exploratory; Mixed always at reference
   condition; Corrupted logging always excluded; membership from recorded conditions, never from toggles (v5.14).
 - CV holds out TRAINING batteries only; the predicted battery's own past always stays in the fit (v5.13).
@@ -109,8 +114,9 @@ near 1.4 Ah (use EOL 80 % of initial); B0029 low first cycle biased baselines/Le
   ablation claim needs several seeds.
 
 ## 5e. Cold with v5.13 (5 batteries: B0041, B0045-B0048; 4 C; origin 30 %; 25 models, CV picks)
-- B0041 (mixed 4 A / 1 A) was in Cold only because the Reference-condition toggle was on; from v5.14 the
-  assessment groups follow the recorded conditions, so Cold = B0045-B0048 and B0041 is in Mixed.
+- B0041 belongs to Cold: confirmed with v5.14.1 (data as recorded, membership from recorded conditions), so its
+  recorded discharges are at a single load level (the NASA README describes 4 A and 1 A across the B0041-B0044
+  set). The earlier guess that the Reference-condition toggle put it there was wrong.
 - Group is heterogeneous: B0045-48 have 4 different cut-off voltages (2.0/2.2/2.5/2.7 V); B0041 is another campaign
   with mixed 4 A / 1 A discharges. Biases alternate in sign across batteries (e.g. B0047 too high, B0048 too low).
 - Honest scoreboard: no CV-picked model beats fleet shape (3.20): ML forecast 2nd by CV 3.19, best by CV 3.75,
@@ -122,22 +128,47 @@ near 1.4 Ah (use EOL 80 % of initial); B0029 low first cycle biased baselines/Le
 - EOL crossed before the origin on every battery (cycles 2-44): no EOL scoring. Check which EOL setting was used.
 - Across groups so far: learned models beat fleet shape only in Hot (short 28-cycle horizon, homogeneous group).
 
-- Cold rerun (2026-10-14) identical to the first one to 1e-15 (still B0041, EOL at cycles 2-44): app version or
-  EOL setting not changed. v5.14.1 writes version and settings into the CSVs.
+- Cold rerun with v5.14.1 (stamped: data as recorded, EOL 1.40 Ah): identical to the v5.13 run, so the Cold SOH
+  results in 5e are confirmed. EOL not scored for Cold: with the NASA 1.40 Ah threshold, cold cells cross EOL by
+  cycles 2-44, before the forecast origin. Decision (user): keep 1.40 Ah, no Cold EOL rerun; report it as a limit.
+
+## 5f. Mixed conditions with v5.14.1 (exploratory; reference condition; B0038-B0040, B0042-B0044; 30 %)
+- Two campaigns: B0038-40 (horizon 15 cycles, almost no fade at reference condition: persistence 0.2-0.9, so
+  differences there are at noise level) and B0042-44 (4 C; horizon 29 cycles, 4-7 pts fade: the informative part).
+  EOL never reached. DL GRU / Transformer forecast failed on all 6 (too few windows): DL forecast = MLP only.
+- Best baseline = linear trend (0.79); fleet shape fails (3.08, worse than trend on all 6): the group is not a fleet.
+- PINN best: 0.44 (better than trend on 5/6, not significant); ablation 1.62 (PINN better on 5/6; large ablation
+  errors on B0042/B0043). Seed caveat from Hot applies. Contrast: PINN failed in Cold (B0045-48, also 4 C).
+- B0042-44 only: PINN 0.70, ML Bayesian Ridge 0.77, DL GRU measured 0.80, trend 1.18, fleet shape 4.83.
+- Star fails: ML forecast mean rank 6.33/7 (CV picked the worst). CV errors 3-10x the test errors and nearly equal
+  across models (fold fits use only 2-3 batteries, often from the other campaign), so CV cannot rank here.
+
+## 5g. Pulsed load with v5.14.1 (exploratory; as recorded; B0025-B0028; origin 30 %, not 40-50 %)
+- Short records: ~28 cycles per battery, forecast from cycle 10-11, horizon 17-18 cycles, little fade (persistence
+  1.85); EOL never reached. DL GRU / Transformer forecast failed on all 4 (too few windows): DL forecast = MLP only.
+- Nothing beats fleet shape (0.98): ML measured best by CV 0.94 and ML forecast best by CV 1.03 (3/4 each, no clear
+  difference); PINN 1.11 vs ablation 1.15 (no physics effect). Every model within ~0.3 pts: noise level.
+- Star: ML measured 3/4 best on test (rank 2.25/7), ML forecast 2/4 (3.5/7). DL forecast 1/1 is trivial (one model).
+
+## 5h. Frozen models (best mean test RMSE, all batteries scored)
+| Group | Forecast | Measured (SOH now) |
+|---|---|---|
+| Reference | DL MLP 4.47 (GP 4.99) | DL GRU 2.04 (DL MLP 3.16) |
+| Hot | ML Decision Tree 0.95 (PINN 0.97) | ML Bayesian Ridge 0.87 (ML GP 0.88) |
+| Cold | ML Gaussian Process 2.77 (DT 3.17) | DL Transformer 3.86 (DL GRU 4.06) |
+| Mixed* | PINN 0.44 (ML BR 0.92) | DL Transformer 0.79 (DL GRU 0.80) |
+| Pulsed* | ML Gaussian Process 0.95 (XGBoost 0.99) | ML GP 0.94 (DL Transformer 1.00) |
+Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed measured, Pulsed forecast.
 
 ## 6. Next steps (in order)
-1. USER (v5.14.1; check the version in the CSV columns; 'Best 2 per level', locally, to completion, without touching the page): rerun Cold (now
-   B0045-B0048, EOL 80 % of initial); run Pulsed load (40-50 %) and Mixed conditions (30 %; reference condition is
-   applied automatically), both exploratory. Reference and Hot v5.13 results stand. Send both CSVs per group.
-2. Star agreement so far (v5.13): good in Hot (ML measured 1.5/7), poor in Cold (ML forecast 4.8/7); decide per
-   group whether the CV star can be trusted.
-3. Freeze the best model per group (model card: model, settings, scores).
-4. Self-updating twin: add the frozen model to the Live twin (measured mode re-estimates SOH each cycle, forecast
-   restarts from it); compare with EKF/PF; update-frequency study (last open M2 question).
-5. M3: end-of-life prediction with band -> Operations (maintenance timing, what-if conditions).
-6. Report: tables/figures per group, informative variables, mechanisms, limitations.
-Later: alkaline water electrolyser version of the platform (prompt written; skills battery-digital-twin,
-degradation-forecasting, streamlit-science-app packaged as .skill files).
+1. USER (v5.15.0, locally): Live twin view -> section "How often should the frozen model update?" -> "Whole <group>
+   group", default settings (retrain 5/10/20/50/never x 3 anchors, next 20 cycles). One run per group: Reference
+   (pick B0005), Hot, Cold, Mixed (Reference-condition toggle ON), Pulsed. Send each CSV.
+2. Compare the frozen model with the filters (EKF, mechanistic PF, power-law PF, trend KF, ensemble): Live model
+   scoreboard per battery (camera image or table), lab mode, retrain every 10.
+3. Answer the last M2 question (how often must the model update) per group; add to the summary table.
+4. M3: end-of-life prediction with band -> Operations (maintenance timing, what-if conditions). Cold: 1.40 Ah limit.
+5. Optional: PINN vs ablation with several seeds; run the 80-test suite locally.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

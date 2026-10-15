@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.14.1"
+REQUIRED_ENGINE = "5.15.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -604,7 +604,7 @@ PLOT_CONFIG = {
 def image_name(fig: go.Figure, key: str) -> str:
     """File name of a chart image: chart id, battery (or condition group for group-level charts), chart title, date,
     engine version. Lets a saved image be identified without opening it, e.g.
-    acc_board__Reference__prediction-accuracy-assessment__2026-10-14__v5.14.1."""
+    acc_board__Reference__prediction-accuracy-assessment__2026-10-14__v5.15.0."""
     def slug(x: Any, n: int = 60, lower: bool = True) -> str:
         x = re.sub(r"<[^>]+>", " ", str(x or ""))
         x = re.sub(r"[^A-Za-z0-9]+", "-", x).strip("-")
@@ -1744,9 +1744,9 @@ def build_report_html(title: str, sections: List[Tuple[str, Any]]) -> str:
 
 
 LIVE_COLORS = {"twin": "#0072B2", "mech": "#882255", "pf": "#CC79A7", "trend": "#332288",
-               "hb": "#CC79A7", "ens": None}
+               "hb": "#CC79A7", "ens": None, "frozen": "#D55E00"}
 LIVE_DASH = {"twin": "dash", "mech": "solid", "pf": "dot", "trend": "dashdot", "hb": "longdash",
-             "ens": "solid"}
+             "ens": "solid", "frozen": "solid"}
 MECH_COLORS = {"SEI": "#0072B2", "plating": "#56B4E9", "LAM": "#AA4499"}
 
 
@@ -2323,8 +2323,34 @@ def replay_cached(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.D
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def live_cached(_ekf: te.EKFResult, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str,
-                soh_eol: float, level: float, cap_every: int, models: Tuple[str, ...]) -> Tuple[Dict[int, Any], pd.DataFrame]:
-    return te.live_multi_model(_ct, cell, _ekf, soh_eol, level, models, imp=_imp)
+                soh_eol: float, level: float, cap_every: int, models: Tuple[str, ...],
+                frozen_cfg: Optional[Tuple[Any, ...]] = None, _extra: Optional[Dict[str, Any]] = None
+                ) -> Tuple[Dict[int, Any], pd.DataFrame]:
+    return te.live_multi_model(_ct, cell, _ekf, soh_eol, level, models, imp=_imp, extra=_extra)
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def frozen_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str, train: Tuple[str, ...],
+                  fkey: str, mkey: str, soh_eol: float, refit: int, anchor: str, eol_ah: float
+                  ) -> Tuple[Dict[int, Any], pd.DataFrame]:
+    return te.frozen_stream(_ct, _imp, cell, list(train), fkey, mkey, soh_eol, refit, anchor, eol_ah=eol_ah)
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def frozen_study_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str, train: Tuple[str, ...],
+                        group: str, soh_eol: float, intervals: Tuple[int, ...], anchors: Tuple[str, ...], horizon: int,
+                        eol_ah: float) -> pd.DataFrame:
+    """One battery's frozen-model update study, cached as soon as it finishes (a group run resumes where it stopped)."""
+    return te.frozen_update_study(_ct, _imp, cell, list(train), group, soh_eol, intervals, anchors, horizon, eol_ah)
+
+
+def frozen_context(c: str) -> Tuple[Optional[str], Optional[Tuple[str, str]], List[str]]:
+    """Group of a battery (recorded conditions), its frozen models, and the group's other batteries."""
+    groups = te.condition_groups(CT_RAW)
+    grp_c = str(groups.loc[c, "Group"]) if c in groups.index else None
+    fz = te.frozen_models_for(grp_c)
+    train_c = [x for x in te.protocol_cells(CT_RAW, grp_c) if x != c] if fz else []
+    return grp_c, fz, train_c
 
 
 @st.cache_data(show_spinner=False, max_entries=4)
@@ -3377,19 +3403,53 @@ def view_replay() -> None:
                                       "resistance. Set 0 to watch pure operando tracking, including its drift.")
     show_models = st.multiselect(
         "Live models", list(te.LIVE_MODELS),
-        default=[m for m in ("twin", "mech", "pf", "trend", "ens") if m in te.LIVE_MODELS], key="rp_models",
+        default=[m for m in ("twin", "mech", "pf", "trend", "frozen", "ens") if m in te.LIVE_MODELS], key="rp_models",
         format_func=te.LIVE_MODELS.get,
         help="ECM twin: physics + operando voltage. Particle filter: power law with the fleet prior, robust to knees. "
              "Adaptive trend KF: level-slope-curvature filter that bends quickly when fade accelerates. Hierarchical "
              "Bayes: fleet-informed power law. Mechanistic PF: SEI, lithium-plating and LAM kinetics driven by each "
              "cycle's measured temperature and current, so the operating conditions decide which mechanism grows. "
              "Live ensemble: weights every model by its recent 5-cycle-ahead error.")
+    grp_c, fz, train_c = frozen_context(cell)
+    use_fz = False
+    if fz and len(train_c) >= 2:
+        f1, f2, f3 = st.columns([1.3, 1.2, 2.0], vertical_alignment="center")
+        use_fz = f1.toggle(f"Frozen {grp_c} model", value=True, key="rp_fz",
+                           help=f"The assessment winner of the {grp_c} group: forecast {te.PROTOCOL_MODELS[fz[0]][1]}, "
+                                f"SOH-now {te.PROTOCOL_MODELS[fz[1]][1]} ({te.FROZEN_SOURCE}). It is retrained on the "
+                                "group's other batteries plus this battery's history up to now, and its forecast is "
+                                "re-anchored every cycle to the current SOH.")
+        refit = f2.select_slider("Retrain every (cycles)", [5, 10, 20, 50, 0], value=10, key="rp_fz_refit",
+                                 format_func=lambda v: "never" if v == 0 else str(v), disabled=not use_fz)
+        anchor = f3.radio("Re-anchor every cycle to", list(te.FROZEN_ANCHORS), key="rp_fz_anchor", horizontal=True,
+                          format_func=lambda k_: te.FROZEN_ANCHORS[k_].split(" (")[0], disabled=not use_fz,
+                          help="Measured capacity: lab, capacity measured on every discharge. SOH-now model: field "
+                               "mode, no capacity measured after the start; the frozen SOH-now model estimates it "
+                               "from the operando signals and retraining sees only those estimates. None: the model's "
+                               "own forecast.")
+        if grp_c == "Mixed conditions" and not st.session_state.get("ref_soh"):
+            st.caption("The Mixed-conditions models were assessed at each battery's reference condition: switch on "
+                       "Reference-condition SOH in the control bar to replay this battery the same way.")
+    elif grp_c:
+        st.caption(f"No frozen model for this battery's group ({grp_c}): only groups covered by the accuracy "
+                   "assessment have one.")
+    fz_frames = None
+    if use_fz:
+        with st.spinner(f"Streaming the frozen {grp_c} model (retrains as it goes; runs once)…"):
+            try:
+                fz_frames, _fz_track = frozen_cached(ct, imp, DATA_KEY, cell, tuple(train_c), fz[0], fz[1],
+                                                     float(soh_eol), int(refit), anchor, float(eol_ah))
+            except Exception as exc:
+                report_error("Frozen model stream failed", exc, debug)
+                use_fz = False
     with st.spinner("Streaming the battery through all models (runs once, then animates)…"):
         res, _track_old = replay_cached(cell_frame(store, DATA_KEY, cell), ct, imp, DATA_KEY, cell, float(soh_eol),
                                         level, int(cap_every))
         st.session_state["ekf"] = {"key": (DATA_KEY, cell, "live"), "res": res}     # feeds Operations initialisation
         run_models = ("twin", "mech", "pf", "trend", "hb")
-        frames, track = live_cached(res, ct, imp, DATA_KEY, cell, float(soh_eol), level, int(cap_every), run_models)
+        frames, track = live_cached(res, ct, imp, DATA_KEY, cell, float(soh_eol), level, int(cap_every), run_models,
+                                    frozen_cfg=(fz[0], fz[1], int(refit), anchor) if use_fz else None,
+                                    _extra={"frozen": fz_frames} if use_fz and fz_frames else None)
     pc = res.per_cycle
     ns = pc["n"].astype(int).tolist()
     if len(ns) < 6:
@@ -3508,6 +3568,7 @@ def view_replay() -> None:
     methods_panel()
     ablation_section()
     update_frequency_section()
+    frozen_update_section()
     st.caption("Harsh operation (cold plating, knees, high temperature) breaks any single physics law. The live "
                "ensemble moves its weight, cycle by cycle, to the models that are currently predicting well: watch "
                "the weight panel shift when the fade accelerates. "
@@ -4513,6 +4574,121 @@ def update_frequency_section() -> None:
                                       "Information gain per update rises as updates get sparser (each measurement "
                                       "corrects more drift), but total information per 100 cycles falls."])
         manifest_button(cfg, "update_frequency", DATA_KEY)
+
+
+FZ_ANCHOR_COLORS = {"none": "#999999", "capacity": "#0072B2", "estimate": "#D55E00"}
+
+
+def fig_frozen_update(summ: pd.DataFrame, P: Palette, title: str) -> go.Figure:
+    """Forecast error against update cost: one line per anchor, one point per retraining interval."""
+    fig = go.Figure()
+    for a_key, d in summ.groupby("anchor_key", sort=False):
+        d = d.sort_values("Refits per 100 cycles")
+        fig.add_trace(go.Scatter(
+            x=d["Refits per 100 cycles"], y=d["Forecast RMSE (SOH pts)"], mode="lines+markers+text",
+            name=te.FROZEN_ANCHORS[a_key].split(" (")[0], text=[f"{v}" for v in d["Retrain every"]],
+            textposition="top center", line=dict(color=FZ_ANCHOR_COLORS.get(a_key, P.text), width=2.4),
+            marker=dict(size=9), hovertemplate="retrain every %{text}: %{y:.2f} SOH pts at %{x:.1f} refits / 100 "
+                                                "cycles<extra>" + html.escape(te.FROZEN_ANCHORS[a_key]) + "</extra>"))
+    fig.update_xaxes(title_text="Retrainings per 100 cycles (cost)")
+    fig.update_yaxes(title_text="Forecast RMSE, next cycles (SOH pts)", rangemode="tozero")
+    return style_fig(fig, P, 440, title)
+
+
+def frozen_update_section() -> None:
+    section("Mission 2 · How often should the frozen model update?")
+    st.markdown("The frozen assessment winner of the battery's group runs live from 30 % of life (the assessment's "
+                "origin). Two kinds of update are compared: **retraining** every N cycles (on the group's other "
+                "batteries plus this battery's history up to now) and **re-anchoring** every cycle, which shifts the "
+                "forecast to the current SOH, taken from the measured capacity (lab) or estimated by the frozen "
+                "SOH-now model (field: no capacity measured after the start). 'Never retrain, no anchor' is exactly the "
+                "assessment forecast. Scores are causal: each forecast is compared only with cycles measured after it.")
+    grp_c, fz, train_c = frozen_context(cell)
+    if not fz or len(train_c) < 2:
+        st.info(f"No frozen model for this battery's group ({grp_c or 'none'}), or fewer than three batteries in it.")
+        return
+    st.caption(f"{grp_c} group · forecast: {te.PROTOCOL_MODELS[fz[0]][1]} · SOH-now: {te.PROTOCOL_MODELS[fz[1]][1]} · "
+               f"default settings.")
+    c1, c2, c3, c4 = st.columns([1.4, 1.6, 0.8, 1.3])
+    ivals = c1.multiselect("Retrain every (cycles)", [5, 10, 20, 50, 0], default=[5, 10, 20, 50, 0], key="fzu_ivals",
+                           format_func=lambda v: "never" if v == 0 else str(v))
+    anchors = c2.multiselect("Re-anchor to", list(te.FROZEN_ANCHORS), default=list(te.FROZEN_ANCHORS), key="fzu_anch",
+                             format_func=lambda k_: te.FROZEN_ANCHORS[k_].split(" (")[0])
+    horizon = c3.selectbox("Score the next", [10, 20, 40], index=1, key="fzu_h", format_func=lambda v: f"{v} cycles")
+    scope = c4.radio("Batteries", [f"This battery ({cell})", f"Whole {grp_c} group"], key="fzu_scope")
+    cells_run = [cell] if scope.startswith("This") else [cell] + train_c
+    cfg = (DATA_KEY, grp_c, tuple(sorted(cells_run)), tuple(sorted(ivals)), tuple(anchors), int(horizon), float(eol_ah))
+    n_fast = min([v for v in ivals if v] or [50])
+    st.caption(f"{len(cells_run)} battery(ies) × {len(ivals) * len(anchors)} settings. Fits are shared between "
+               f"settings, so the cost is set by retraining every {n_fast} cycles (the forecast model is refitted about "
+               f"{max(1, round(70 / n_fast))} times per 100 cycles, twice when field mode is included). Finished "
+               "batteries are kept: an interrupted run continues where it stopped.")
+    if st.button("Run the frozen-model update study", key="fzu_go", type="primary", icon=":material/update:",
+                 disabled=not ivals or not anchors):
+        prog = st.progress(0.0)
+        parts = []
+        groups = te.condition_groups(CT_RAW)
+        for i, c in enumerate(cells_run):
+            prog.progress(i / len(cells_run), text=f"{c} ({i + 1}/{len(cells_run)}) · retraining as it streams…")
+            g_ = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]]
+            if g_.empty or c not in groups.index:
+                continue
+            soh_eol_c = te.soh_eol_for(float(g_["C_bol_Ah"].iloc[0]), eol_ah)
+            tr_c = tuple(x for x in [cell] + train_c if x != c)
+            try:
+                parts.append(frozen_study_cached(ct, imp, DATA_KEY, c, tr_c, grp_c, float(soh_eol_c),
+                                                 tuple(sorted(ivals)), tuple(anchors), int(horizon), float(eol_ah)))
+            except Exception as exc:
+                report_error(f"Frozen-model study failed on {c}", exc, debug)
+            st.session_state["fzu"] = {"cfg": cfg, "tab": pd.concat(parts, ignore_index=True) if parts else None}
+        prog.empty()
+    saved = st.session_state.get("fzu")
+    if not saved or saved.get("tab") is None or saved["cfg"][1] != grp_c:
+        placeholder("Press 'Run the frozen-model update study': the error-versus-cost chart and the table appear here.")
+        return
+    if saved["cfg"] != cfg:
+        st.warning("Settings changed since the last run; the results below use the previous settings.")
+    tab = saved["tab"]
+    ok = tab[tab["status"] == "ok"]
+    if ok.empty:
+        st.error("Every setting failed: " + "; ".join(tab["status"].astype(str).unique()[:3]))
+        return
+    nb = ok["Cell_ID"].nunique()
+    summ = (ok.groupby(["anchor_key", "Anchor", "Retrain every"], sort=False)
+              .agg(**{"Forecast RMSE (SOH pts)": ("Forecast RMSE (SOH pts)", "mean"),
+                      "SOH-now RMSE (SOH pts)": ("SOH-now RMSE (SOH pts)", "mean"),
+                      "EOL |error| (cycles)": ("EOL |error| (cycles)", "mean"),
+                      "Refits per 100 cycles": ("Refits per 100 cycles", "mean"),
+                      "Batteries": ("Cell_ID", "nunique")}).reset_index())
+    show(fig_frozen_update(summ, P, f"Frozen {grp_c} model: forecast error versus update cost"
+                                    + (f" (mean of {nb} batteries)" if nb > 1 else f" ({cell})")),
+         key="fzu_fig", data=summ)
+    show_table(summ.drop(columns=["anchor_key"]).set_index(["Anchor", "Retrain every"]).style.format(
+        {"Forecast RMSE (SOH pts)": "{:.2f}", "SOH-now RMSE (SOH pts)": "{:.2f}", "EOL |error| (cycles)": "{:.1f}",
+         "Refits per 100 cycles": "{:.1f}"}, na_rep="—"),
+        note=f"Forecast RMSE: error of each forecast over the next {horizon} measured cycles, averaged over every cycle "
+             "from 30 % of life on" + (", then over batteries" if nb > 1 else "") + ". SOH-now RMSE: field mode only, "
+             "the estimated against the measured SOH. EOL error: only where end of life is reached after the start.")
+    fails = tab[tab["status"] != "ok"]
+    if len(fails):
+        st.warning(f"{len(fails)} battery-setting combination(s) failed: "
+                   + "; ".join(sorted(fails["status"].astype(str).str[:70].unique())[:3]))
+    best = summ.loc[summ["Forecast RMSE (SOH pts)"].idxmin()]
+    never = summ[(summ["Retrain every"] == "never") & (summ["anchor_key"] == "none")]
+    lines = [f"Lowest forecast error: retrain every {best['Retrain every']} with "
+             f"{te.FROZEN_ANCHORS[best['anchor_key']].split(' (')[0].lower()}: {best['Forecast RMSE (SOH pts)']:.2f} SOH "
+             f"pts at {best['Refits per 100 cycles']:.1f} retrainings per 100 cycles."]
+    if len(never):
+        lines.append(f"Frozen once and never updated (the assessment forecast): "
+                     f"{float(never['Forecast RMSE (SOH pts)'].iloc[0]):.2f} SOH pts.")
+    if nb < 3:
+        lines.append("Run the whole group before drawing a conclusion: one battery is an anecdote.")
+    card("Mission 2 · update frequency of the frozen model", lines)
+    stamp = {"app version": te.ENGINE_VERSION, "group": grp_c, "forecast model": fz[0], "SOH-now model": fz[1],
+             "horizon (cycles)": int(saved["cfg"][5]),
+             "EOL setting": f"{eol_ah:.2f} Ah" if eol_ah > 1 else f"{100 * eol_ah:.0f} % of initial capacity"}
+    download("Download the update study (CSV)", tab.assign(**stamp).to_csv(index=False).encode(),
+             f"frozen_update_{grp_c.replace(' ', '-')}__v{te.ENGINE_VERSION}.csv", "text/csv", key="fzu_csv")
 
 
 def early_life_section() -> None:

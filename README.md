@@ -1,9 +1,27 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.14.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.15.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Frozen models in the self-updating twin (v5.15.0)
+
+1. `FROZEN_MODELS`: the assessment winner per group (forecast, SOH-now), default settings (STATUS 5h).
+2. `frozen_stream`: from 30 % of life the frozen forecaster runs live on one battery: retrained every N cycles
+   (0 = never) on the group's other batteries plus this battery's history up to now, and re-anchored every cycle to
+   the current SOH: measured capacity (lab), the frozen SOH-now model's estimate (field: no capacity after the start,
+   retraining also sees only estimates) or none. "Never, none" reproduces the assessment forecast exactly.
+3. Live twin: toggle "Frozen <group> model" (retraining interval, anchor). It joins the live chart, the causal
+   5-step-ahead scoreboard and the ensemble weights like the filters. Forecast grids end at the last recorded cycle;
+   beyond it the forecast is extended with its final slope (never rising).
+4. New section "Mission 2 · How often should the frozen model update?": retraining 5/10/20/50/never x anchor;
+   forecast RMSE over the next 10/20/40 measured cycles, SOH-now RMSE (field), EOL error, retrainings per 100
+   cycles; this battery or the whole group (cached per battery, resumes); chart error vs cost; stamped CSV.
+5. Tests (tests/test_frozen_live.py, 10): forecasts at cycle m unchanged when the battery's data after m are
+   corrupted (ML, DL, PINN); SOH-now estimates causal (ML, DL); field mode unchanged when every capacity value
+   after the start is corrupted; never/none = assessment; anchored curve passes through the measured SOH; the live
+   twin scores and weights the frozen model; study table. AppTest: lab and field replay, study, all views.
 
 ## Self-describing assessment CSVs (v5.14.1)
 

@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.14.1"
+ENGINE_VERSION = "5.15.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -5555,7 +5555,9 @@ def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], s
                      n_particles: int = 2000, h_eval: int = 5, forget: float = 0.85, hb_stride: int = 2,
                      seed: int = 0, progress: ProgressFn = None, imp: Optional[pd.DataFrame] = None,
                      pinn_every: int = 25, pinn_epochs: int = 600,
-                     mech_prior: Optional[MechPrior] = None) -> Tuple[Dict[int, LiveFrame], pd.DataFrame]:
+                     mech_prior: Optional[MechPrior] = None,
+                     extra: Optional[Dict[str, Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]]] = None
+                     ) -> Tuple[Dict[int, LiveFrame], pd.DataFrame]:
     """Stream one battery's life through several models at once. At every discharge n each model
     assimilates only data up to n and forecasts the rest of life; each model is then scored on how
     well it predicted cycle n from cycle n - h_eval (exponentially forgotten squared error), and the
@@ -5660,6 +5662,14 @@ def live_multi_model(ct: pd.DataFrame, cell_id: str, ekf: Optional[EKFResult], s
                 th[:, 2] = np.clip(th[:, 2], 0.3, 3.0)
                 paths = _pl_soh(th, np.maximum(ah_f, 1e-6)) + 0.5 * sig_obs * rng.standard_normal((400, 1))
                 fc["hb"], rul["hb"] = _q_summary(paths, level, soh_eol)
+        # ---- extra live models streamed elsewhere (the frozen assessment winner): forecast made at this cycle
+        for name, fr_x in (extra or {}).items():
+            if int(n) in fr_x:
+                gx, mx, lx, hx = fr_x[int(n)]
+                fc[name] = tuple(_extend_linear(np.asarray(gx, float), np.asarray(v, float), fut.astype(float))
+                                 for v in (mx, lx, hx))
+                cr = np.nonzero(fc[name][0] < soh_eol)[0]
+                rul[name] = (float(fut[cr[0]] - n) if len(cr) else float("nan"), float("nan"), float("nan"))
         # ---- online skill: how well did each model predict this cycle from n - h_eval?
         prev = frames.get(int(ns[i - h_eval])) if i >= h_eval else None
         errs = {}
@@ -8736,3 +8746,192 @@ def cv_pick_agreement(picks: pd.DataFrame) -> pd.DataFrame:
                          "Star also best on test": g["Test rank"].apply(lambda r: float(np.mean(r == 1))),
                          "Mean test rank of the star": g["Test rank"].mean(),
                          "Models per level": g["Candidates"].max()})
+
+
+# =============================================================================
+# 44. FROZEN MODELS IN THE SELF-UPDATING TWIN (Mission 2: does updating help, and how often?)
+# =============================================================================
+# The accuracy assessment froze one forecasting and one SOH-now model per condition group (default settings; the
+# lowest mean test RMSE over the group's batteries). Here the frozen forecaster runs live on one battery:
+#   - retraining every N cycles on the group's other batteries plus this battery's history up to now,
+#   - re-anchoring every cycle in between: the forecast curve is shifted to pass through the current SOH, which comes
+#     from the measured capacity (lab), from the frozen SOH-now model (field: no capacity measured after the start,
+#     so retraining also sees only estimated SOH), or not at all.
+# Nothing after the current cycle is used (tested). The study starts at 30 % of life, like the assessment, so
+# "never retrain, no anchor" reproduces the assessment forecast.
+FROZEN_MODELS: Dict[str, Tuple[str, str]] = {
+    "Reference": ("dl:MLP", "dlm:GRU"),
+    "Hot": ("traj:Decision Tree", "trajm:Bayesian Ridge"),
+    "Cold": ("traj:Gaussian Process", "dlm:Transformer"),
+    "Mixed conditions": ("pinn:PINN", "dlm:Transformer"),
+    "Pulsed load": ("traj:Gaussian Process", "trajm:Gaussian Process"),
+}
+FROZEN_SOURCE = ("accuracy assessment (v5.12-v5.14.1), origin 30 %, default settings; per group and mode the learned "
+                 "model with the lowest mean test RMSE")
+FROZEN_ANCHORS: Dict[str, str] = {"capacity": "Measured capacity (lab: every discharge)",
+                                  "estimate": "SOH-now model (field: no capacity after the start)",
+                                  "none": "No re-anchoring"}
+LIVE_MODELS["frozen"] = "Frozen model · assessment winner"
+
+
+def frozen_models_for(group: Optional[str]) -> Optional[Tuple[str, str]]:
+    return FROZEN_MODELS.get(group) if group else None
+
+
+def _extend_linear(grid: np.ndarray, v: np.ndarray, to: np.ndarray, k: int = 10) -> np.ndarray:
+    """Values on `to`: interpolated inside the forecast grid, extended beyond its end with the slope of its last k
+    points (never rising), so a forecast that stops at the last recorded cycle can still reach end of life."""
+    out = np.interp(to, grid, v)
+    beyond = to > grid[-1]
+    if beyond.any():
+        kk = min(k, len(grid) - 1)
+        slope = min(0.0, float((v[-1] - v[-1 - kk]) / max(grid[-1] - grid[-1 - kk], 1))) if kk > 0 else 0.0
+        out[beyond] = v[-1] + slope * (to[beyond] - grid[-1])
+    return out
+
+
+def frozen_stream(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, train: Sequence[str], fkey: str,
+                  mkey: Optional[str], soh_eol: float, refit_every: int = 10, anchor: str = "capacity",
+                  n_start: Optional[int] = None, n_max: Optional[int] = None, eol_ah: float = DEFAULT_EOL_AH,
+                  store: Any = None, fit_cache: Optional[Dict[Any, Any]] = None, progress: ProgressFn = None
+                  ) -> Tuple[Dict[int, Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]], pd.DataFrame]:
+    """Stream one battery through its group's frozen forecaster (see section 44).
+    refit_every: retrain every N cycles (0 = trained once, at the start). anchor: 'capacity', 'estimate' or 'none'.
+    Returns ({n: (future cycles, median, lo, hi)}, per-cycle track with SOH, estimate, anchor, refit flag, predicted
+    EOL). fit_cache (dict) shares fits between calls, e.g. across the update-frequency study's settings."""
+    if anchor not in FROZEN_ANCHORS:
+        raise ValueError(f"anchor must be one of {list(FROZEN_ANCHORS)}")
+    if anchor == "estimate" and not mkey:
+        raise ValueError("field mode needs the group's frozen SOH-now model")
+    cache = fit_cache if fit_cache is not None else {}
+    train = tuple(sorted(train))
+    good = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]].sort_values("n")
+    ns = good["n"].astype(int).to_numpy()
+    y = good["SOH"].to_numpy(float)
+    if len(ns) < 8:
+        raise ValueError("too few cycles for a live replay")
+    n_last = int(ns.max())
+    if n_start is None:
+        n_start, _ = safe_origin(ct, cell, int(max(10, round(0.3 * n_last))))
+    n_start = int(n_start)
+    n_max = int(n_max or round(n_last * 1.4))
+    c_bol = float(good["C_bol_Ah"].iloc[0]) if "C_bol_Ah" in good else np.nan
+
+    def fit(key: str, m: int, data: pd.DataFrame, tag: str) -> Any:
+        ck = (key, cell, int(m), train, float(eol_ah), tag)
+        if ck not in cache:
+            try:
+                cache[ck] = _protocol_forecast(key, store, data, imp, cell, int(m), list(train), eol_ah)
+            except Exception as exc:                      # kept as a failure, never silently skipped
+                cache[ck] = exc
+        return cache[ck]
+
+    est = np.full(len(ns), np.nan)
+    ct_field = ct
+    if anchor == "estimate":                              # field mode: SOH-now model fitted once, at the start
+        fm = fit(mkey, n_start, ct, "measured")
+        if isinstance(fm, Exception):
+            raise ValueError(f"SOH-now model failed: {fm}")
+        after = ns > n_start
+        est[after] = np.interp(ns[after], fm.n_grid, fm.soh)
+        est[ns == n_start] = y[ns == n_start]
+        ct_field = ct.copy()                              # retraining sees estimated SOH after the start, not capacity
+        tgt = (ct_field["Cell_ID"] == cell) & ct_field["n"].isin(ns[after])
+        mp = dict(zip(ns[after], est[after]))
+        ct_field.loc[tgt, "SOH"] = ct_field.loc[tgt, "n"].map(mp).to_numpy()
+        if "Q_dis_Ah" in ct_field and np.isfinite(c_bol):
+            ct_field.loc[tgt, "Q_dis_Ah"] = ct_field.loc[tgt, "SOH"] * c_bol
+    frames, rows = {}, []
+    f_cur, m_cur, n_refits = None, None, 0
+    run = [int(n) for n in ns if n >= n_start]
+    for j, n in enumerate(run):
+        _report(progress, j / max(len(run), 1), f"frozen model · cycle {n}")
+        i = int(np.nonzero(ns == n)[0][0])
+        due = m_cur is None or (refit_every > 0 and n - m_cur >= refit_every)
+        if due:
+            f_new = fit(fkey, n, ct_field if anchor == "estimate" else ct, anchor if anchor == "estimate" else "lab")
+            if not isinstance(f_new, Exception):
+                f_cur, m_cur = f_new, n
+                n_refits += 1
+            elif f_cur is None:
+                rows.append({"n": n, "soh": y[i], "status": f"failed: {f_new}"[:120]})
+                continue
+        g = np.asarray(f_cur.n_grid, float)
+        base_n = float(np.interp(n, g, f_cur.soh))
+        a_n = {"capacity": y[i], "estimate": est[i], "none": np.nan}[anchor]
+        shift = float(a_n - base_n) if np.isfinite(a_n) else 0.0
+        fut = np.arange(n + 1, n_max + 1, dtype=float)
+        med = _extend_linear(g, np.asarray(f_cur.soh, float), fut) + shift
+        lo = (_extend_linear(g, np.asarray(f_cur.lo, float), fut) + shift) if f_cur.lo is not None else med.copy()
+        hi = (_extend_linear(g, np.asarray(f_cur.hi, float), fut) + shift) if f_cur.hi is not None else med.copy()
+        frames[n] = (fut, med, lo, hi)
+        cross = np.nonzero(med < soh_eol)[0]
+        rows.append({"n": n, "soh": float(y[i]), "est": float(est[i]), "anchor": float(a_n) if np.isfinite(a_n) else np.nan,
+                     "shift": shift, "refit": bool(due and m_cur == n), "fitted_at": m_cur,
+                     "eol_pred": float(fut[cross[0]]) if len(cross) else np.nan,
+                     "beyond_grid_from": float(g[-1]), "status": "ok"})
+    _report(progress, 1.0, "frozen model done")
+    tr = pd.DataFrame(rows)
+    tr.attrs.update({"n_start": n_start, "refits": n_refits, "fkey": fkey, "mkey": mkey, "anchor": anchor,
+                     "refit_every": refit_every})
+    return frames, tr
+
+
+def frozen_scores(frames: Dict[int, Tuple[np.ndarray, ...]], track: pd.DataFrame, ct: pd.DataFrame, cell: str,
+                  soh_eol: float, horizon: int = 20, eol_k: int = 3) -> Dict[str, float]:
+    """Causal scores of one frozen-model stream: forecast RMSE over the next `horizon` measured cycles (averaged over
+    forecast cycles), SOH-now error (field mode), mean |EOL error| before the true EOL, refits per 100 cycles."""
+    good = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]].sort_values("n")
+    gn, gy = good["n"].to_numpy(float), good["SOH"].to_numpy(float)
+    eol_true, _ = eol_crossing(gn, gy, soh_eol, eol_k)
+    per_n = []
+    for n, (fut, med, _, _) in frames.items():
+        sel = (gn > n) & (gn <= n + horizon)
+        if sel.sum() >= 2:
+            e = np.interp(gn[sel], fut, med) - gy[sel]
+            per_n.append(float(np.sqrt(np.mean(e ** 2))))
+    ok = track[track.get("status", "ok") == "ok"] if len(track) else track
+    est_err = (ok["est"] - ok["soh"]).dropna() if "est" in ok else pd.Series(dtype=float)
+    est_err = est_err[ok.loc[est_err.index, "n"] > track.attrs.get("n_start", -1)] if len(est_err) else est_err
+    eol_err = np.nan
+    if eol_true is not None and "eol_pred" in ok:
+        d = ok[(ok["n"] < eol_true) & ok["eol_pred"].notna()]
+        eol_err = float(np.mean(np.abs(d["eol_pred"] - eol_true))) if len(d) else np.nan
+    span = max(float(gn.max()) - float(track.attrs.get("n_start", gn.min())), 1.0)
+    return {"Forecast RMSE (SOH pts)": 100 * float(np.mean(per_n)) if per_n else np.nan,
+            "Forecast cycles scored": len(per_n),
+            "SOH-now RMSE (SOH pts)": 100 * float(np.sqrt(np.mean(est_err ** 2))) if len(est_err) else np.nan,
+            "EOL |error| (cycles)": eol_err, "EOL true": eol_true,
+            "Refits per 100 cycles": 100 * track.attrs.get("refits", 0) / span,
+            "Failed cycles": int((track["status"] != "ok").sum()) if "status" in track else 0}
+
+
+def frozen_update_study(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, train: Sequence[str], group: str,
+                        soh_eol: float, intervals: Sequence[int] = (5, 10, 20, 50, 0),
+                        anchors: Sequence[str] = ("none", "capacity", "estimate"), horizon: int = 20,
+                        eol_ah: float = DEFAULT_EOL_AH, store: Any = None, fit_cache: Optional[Dict[Any, Any]] = None,
+                        progress: ProgressFn = None) -> pd.DataFrame:
+    """How often must the frozen model update, and does re-anchoring help? One battery, every combination of
+    retraining interval (0 = never) and anchor. Fits are shared through fit_cache, so the cost is set by the most
+    frequent retraining."""
+    fm = frozen_models_for(group)
+    if fm is None:
+        raise ValueError(f"no frozen model for the group '{group}'")
+    fkey, mkey = fm
+    cache = fit_cache if fit_cache is not None else {}
+    rows, combos = [], [(m, a) for a in anchors for m in sorted(intervals, key=lambda v: (v == 0, v))]
+    for k, (m, a) in enumerate(combos):
+        _report(progress, k / len(combos), f"{cell} · retrain {'never' if m == 0 else f'every {m}'} · {a}")
+        try:
+            fr, tr = frozen_stream(ct, imp, cell, train, fkey, mkey, soh_eol, m, a, eol_ah=eol_ah, store=store,
+                                   fit_cache=cache)
+            sc = frozen_scores(fr, tr, ct, cell, soh_eol, horizon)
+            rows.append({"Cell_ID": cell, "Retrain every": "never" if m == 0 else str(int(m)), "Anchor": FROZEN_ANCHORS[a],
+                         "anchor_key": a, "status": "ok", **sc})
+        except Exception as exc:
+            rows.append({"Cell_ID": cell, "Retrain every": "never" if m == 0 else str(int(m)), "Anchor": FROZEN_ANCHORS[a],
+                         "anchor_key": a, "status": f"failed: {type(exc).__name__}: {str(exc)[:80]}"})
+    _report(progress, 1.0, "update study done")
+    out = pd.DataFrame(rows)
+    out.attrs.update({"fkey": fkey, "mkey": mkey, "group": group, "horizon": horizon})
+    return out
