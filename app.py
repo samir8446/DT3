@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.14.0"
+REQUIRED_ENGINE = "5.14.1"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -604,7 +604,7 @@ PLOT_CONFIG = {
 def image_name(fig: go.Figure, key: str) -> str:
     """File name of a chart image: chart id, battery (or condition group for group-level charts), chart title, date,
     engine version. Lets a saved image be identified without opening it, e.g.
-    acc_board__Reference__prediction-accuracy-assessment__2026-10-14__v5.14.0."""
+    acc_board__Reference__prediction-accuracy-assessment__2026-10-14__v5.14.1."""
     def slug(x: Any, n: int = 60, lower: bool = True) -> str:
         x = re.sub(r"<[^>]+>", " ", str(x or ""))
         x = re.sub(r"[^A-Za-z0-9]+", "-", x).strip("-")
@@ -5195,11 +5195,16 @@ def assessment_section() -> None:
                    + "; ".join(sorted(set(bad["status"].str[:60]))[:3]))
     if cv_mode:
         _cv_picks_block(picks, res_all, cells_g)
-    download("Download the assessment, every model (CSV)", res_all.to_csv(index=False).encode(), f"assessment_{grp}.csv",
-             "text/csv", key="acc_csv")
+    stamp = {"app version": te.ENGINE_VERSION, "group": grp,
+             "EOL setting": f"{eol_ah:.2f} Ah" if eol_ah > 1 else f"{100 * eol_ah:.0f} % of initial capacity",
+             "data": "reference condition" if grp == "Mixed conditions" else "as recorded",
+             "group batteries": " ".join(cells_g)}
+    tag = f"{grp.replace(' ', '-')}__v{te.ENGINE_VERSION}"
+    download("Download the assessment, every model (CSV)", res_all.assign(**stamp).to_csv(index=False).encode(),
+             f"assessment_{tag}.csv", "text/csv", key="acc_csv")
     if cv_mode and len(picks):
-        download("Download the models picked by CV (CSV)", picks.to_csv(index=False).encode(), f"assessment_{grp}_cv_picks.csv",
-                 "text/csv", key="acc_picks_csv")
+        download("Download the models picked by CV (CSV)", picks.assign(**stamp).to_csv(index=False).encode(),
+                 f"assessment_{tag}_cv_picks.csv", "text/csv", key="acc_picks_csv")
 
 
 def _cv_picks_block(picks: pd.DataFrame, res_all: pd.DataFrame, cells_g: Sequence[str]) -> None:

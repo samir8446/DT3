@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.14.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.14.1 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.14.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.14.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.14.1"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.14.1"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun at v5.12, file not in the Project) +
   tests/test_cv_selection.py: 3 tests (v5.12), passing
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -122,8 +122,11 @@ near 1.4 Ah (use EOL 80 % of initial); B0029 low first cycle biased baselines/Le
 - EOL crossed before the origin on every battery (cycles 2-44): no EOL scoring. Check which EOL setting was used.
 - Across groups so far: learned models beat fleet shape only in Hot (short 28-cycle horizon, homogeneous group).
 
+- Cold rerun (2026-10-14) identical to the first one to 1e-15 (still B0041, EOL at cycles 2-44): app version or
+  EOL setting not changed. v5.14.1 writes version and settings into the CSVs.
+
 ## 6. Next steps (in order)
-1. USER (v5.14, 'Best 2 per level', locally, to completion, without touching the page): rerun Cold (now
+1. USER (v5.14.1; check the version in the CSV columns; 'Best 2 per level', locally, to completion, without touching the page): rerun Cold (now
    B0045-B0048, EOL 80 % of initial); run Pulsed load (40-50 %) and Mixed conditions (30 %; reference condition is
    applied automatically), both exploratory. Reference and Hot v5.13 results stand. Send both CSVs per group.
 2. Star agreement so far (v5.13): good in Hot (ML measured 1.5/7), poor in Cold (ML forecast 4.8/7); decide per

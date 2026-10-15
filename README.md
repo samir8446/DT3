@@ -1,9 +1,16 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.14.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.14.1)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Self-describing assessment CSVs (v5.14.1)
+
+1. Both assessment downloads now carry, on every row: app version, group, EOL setting ("1.40 Ah" or "80 % of
+   initial capacity"), data mode ("as recorded" / "reference condition") and the group's batteries. File names:
+   `assessment_<group>__v<version>.csv` and `..._cv_picks.csv`. Reason: a Cold rerun came back identical to the
+   previous run and the CSV could not show whether the new version or the new EOL setting had been used.
 
 ## Every usable group in the accuracy assessment (v5.14.0)
 
