@@ -1,9 +1,21 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.13.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.14.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Every usable group in the accuracy assessment (v5.14.0)
+
+1. Pulsed load and Mixed conditions are now offered as "(exploratory)" groups with a warning that explains the
+   caveat; only Corrupted logging (B0049-B0056) stays excluded. The Models-view training pools are unchanged.
+2. Mixed conditions are always scored at each battery's reference condition (Reference-condition SOH applied
+   automatically, own cache key), so SOH measures ageing, not load or temperature changes.
+3. Group membership in the assessment always follows the recorded test conditions. Before, switching on the
+   Reference-condition toggle could move mixed-load cells into other groups (B0041 appeared in Cold). Every other
+   group is assessed on the data as recorded, independent of that toggle.
+4. AppTest: Mixed and Pulsed offered, warned, run and rendered; Corrupted never offered; group list identical with
+   the toggle on and off; all views render twice.
 
 ## Level 2 CV no longer sees the test cycles (v5.13.0)
 

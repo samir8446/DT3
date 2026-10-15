@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.13.0"
+REQUIRED_ENGINE = "5.14.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -604,7 +604,7 @@ PLOT_CONFIG = {
 def image_name(fig: go.Figure, key: str) -> str:
     """File name of a chart image: chart id, battery (or condition group for group-level charts), chart title, date,
     engine version. Lets a saved image be identified without opening it, e.g.
-    acc_board__Reference__prediction-accuracy-assessment__2026-10-14__v5.13.0."""
+    acc_board__Reference__prediction-accuracy-assessment__2026-10-14__v5.14.0."""
     def slug(x: Any, n: int = 60, lower: bool = True) -> str:
         x = re.sub(r"<[^>]+>", " ", str(x or ""))
         x = re.sub(r"[^A-Za-z0-9]+", "-", x).strip("-")
@@ -2683,6 +2683,9 @@ def _cell_label(cid: str) -> str:
 @st.cache_data(show_spinner=False)
 def ref_ct_cached(_ct: pd.DataFrame, data_key: str) -> pd.DataFrame:
     return te.reference_condition_ct(_ct)
+
+
+CT_RAW, DATA_KEY_RAW = ct, DATA_KEY      # as recorded: the accuracy assessment's groups never depend on the toggle below
 
 
 with st.container(border=True):
@@ -5002,6 +5005,18 @@ def fig_scoreboard(sb: pd.DataFrame, P: Palette) -> go.Figure:
 
 
 ACC_SCOPES = ("Best 2 per level (chosen by CV in each fold)", "Models I choose")
+ACC_EXCLUDED_GROUPS = ("Corrupted logging",)          # NASA: logging failed, the measured SOH cannot be trusted
+ACC_EXPLORATORY = {
+    "Pulsed load": "Exploratory group. These batteries were discharged in pulses with rests, so the capacity of a cycle "
+                   "is measured differently from a continuous discharge: compare models within this group only, and "
+                   "report its results as exploratory.",
+    "Mixed conditions": "Exploratory group. The discharge current or ambient temperature of these batteries changes "
+                        "during their test, which makes measured capacity jump independently of ageing. Here every "
+                        "battery is therefore scored at its reference condition only (cycles at its initial current "
+                        "and ambient; the Reference-condition SOH is applied automatically). The batteries come from "
+                        "different campaigns, and cells of one campaign share a test schedule that models can learn: "
+                        "report these results as exploratory.",
+}
 ASSESS_SECONDS = {"PINN": 8.0, "PINN-ablation": 4.0, "persistence": 0.3, "trend": 0.3, "shape": 1.0, "Bayesian Ridge": 1.5, "Decision Tree": 1.5,
                   "Random Forest": 3.0, "SVM": 2.0, "Gaussian Process": 12.0, "XGBoost": 3.0, "LightGBM": 2.0,
                   "MLP": 2.0, "GRU": 6.0, "Transformer": 4.0}
@@ -5026,15 +5041,24 @@ def assessment_section() -> None:
                 "the models learn from the other batteries of the group plus the held-out battery's own cycles up to the "
                 "forecast origin, and are scored on all its later measured cycles. Each forecast is saved as soon as it "
                 "finishes, so the scoreboard fills in live and an interrupted run continues where it stopped.")
-    groups = te.condition_groups(ct)
-    usable = [g for g in te.GROUP_ORDER if g in set(groups["Group"]) and g not in te.V2_EXCLUDED_GROUPS]
+    groups = te.condition_groups(CT_RAW)       # membership from the recorded test conditions, whatever the toggles say
+    usable = [g for g in te.GROUP_ORDER if g in set(groups["Group"]) and g not in ACC_EXCLUDED_GROUPS]
     if not usable:
-        st.info("No usable condition group (mixed, corrupted and pulsed cells are excluded).")
+        st.info("No usable condition group (batteries with corrupted logging are always excluded).")
         return
     my = groups.loc[cell, "Group"] if cell in groups.index and groups.loc[cell, "Group"] in usable else usable[0]
     c1, c2 = st.columns(2)
     grp = c1.selectbox("Condition group", usable, index=usable.index(my), key="acc_group",
-                       format_func=lambda x: f"{x}, {len(te.protocol_cells(ct, x))} batteries")
+                       format_func=lambda x: f"{x}, {len(te.protocol_cells(CT_RAW, x))} batteries"
+                                         + (" (exploratory)" if x in ACC_EXPLORATORY else ""))
+    if grp in ACC_EXPLORATORY:
+        st.warning(ACC_EXPLORATORY[grp], icon=":material/science:")
+    # data the forecasts use: mixed conditions always at each battery's reference condition (SOH = ageing only);
+    # every other group as recorded, so its results do not depend on the Reference-condition toggle either
+    if grp == "Mixed conditions":
+        ct_run, dkey = ref_ct_cached(CT_RAW, DATA_KEY_RAW), DATA_KEY_RAW + "|reference-condition"
+    else:
+        ct_run, dkey = CT_RAW, DATA_KEY_RAW
     origins = c2.multiselect("Forecast origins (share of each battery's life)", [0.2, 0.3, 0.4, 0.5, 0.6, 0.7],
                              default=[0.3], key="acc_origins", format_func=lambda v: f"{100 * v:.0f}%")
     av = te.available_models()
@@ -5064,14 +5088,14 @@ def assessment_section() -> None:
                                                             if m in av] + ["dl:GRU"],
                               key="acc_models", format_func=lambda k: te.PROTOCOL_MODELS[k][1])
     view = (lambda r: te.select_by_cv(r, 2, keys)[0]) if cv_mode else (lambda r: r)
-    cells_g = tuple(te.protocol_cells(ct, grp))
+    cells_g = tuple(te.protocol_cells(CT_RAW, grp))
     tasks = [(c, o, k) for c in cells_g for o in sorted(origins) for k in keys]
     secs = sum(ASSESS_SECONDS.get(k.split(":", 1)[-1], 3.0) for _, _, k in tasks)
     if len(cells_g) < 3:
         st.warning(f"The {grp} group has fewer than three usable batteries: nothing to learn from when one is held out.")
     st.caption(f"{len(tasks)} forecasts, about {max(1, round(secs / 60))} min on a fresh run (the Gaussian Process is the "
                "slowest model). Forecasts already computed with the same settings are reused instantly.")
-    run_key = (DATA_KEY, grp, float(eol_ah), tuple(sorted(origins)), tuple(keys))
+    run_key = (dkey, grp, float(eol_ah), tuple(sorted(origins)), tuple(keys))
     if st.button(f"Run the assessment ({len(tasks)} forecasts)", key="acc_go", type="primary", icon=":material/fact_check:",
                  disabled=len(cells_g) < 3 or not keys or not origins):
         prog = st.progress(0.0)
@@ -5082,7 +5106,7 @@ def assessment_section() -> None:
             prog.progress(i / max(len(tasks), 1),
                           text=f"{i}/{len(tasks)} · {te.PROTOCOL_MODELS[k][1]} on {c} from {100 * o:.0f}% · "
                                f"{time.time() - t_start:.0f}s")
-            parts.append(assess_task_cached(store, ct, imp, DATA_KEY, cells_g, k, float(o), c, float(eol_ah)))
+            parts.append(assess_task_cached(store, ct_run, imp, dkey, cells_g, k, float(o), c, float(eol_ah)))
             if i % 3 == 2 or i == len(tasks) - 1:
                 part = pd.concat(parts, ignore_index=True)
                 sbp = te.protocol_scoreboard(view(part))
