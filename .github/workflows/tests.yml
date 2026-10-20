@@ -1,1 +1,22 @@
+# Runs the test suite on GitHub's servers: on every upload (push) and on demand (Actions tab -> tests -> Run workflow).
+# Results: the "Actions" tab of the repository. Nothing here affects the deployed Streamlit app.
+name: tests
 
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install the app's packages and pytest
+        run: pip install -r requirements.txt pytest
+      - name: Run the tests
+        run: python -m pytest tests/ -q
