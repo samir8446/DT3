@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.15.1 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.15.2 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.15.1"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.15.1"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.15.2"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.15.2"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -42,6 +42,13 @@ Live twin: replay with ECM dual EKF, mechanistic PF, power-law PF, adaptive tren
 update-frequency study; measurement ablation.
 
 ## 4. Decisions (do not reopen without new evidence)
+- No frozen-model update study for Mixed conditions (user decision, 2026-10-21): conditions change during the test,
+  so updating against measured capacity mixes ageing with load/temperature effects; at reference condition only
+  15-29 gapped cycles remain. Mixed stays an exploratory assessment group only.
+- FEATURE FREEZE from 2026-10-19 until Mission 2 is closed: no new app features, bug fixes only. v5.15.1 is the
+  version of record for all Mission 2 results (v5.15.2 = bug fix: update study applies the assessment's data rule). Extra studies run as standalone scripts (scripts/).
+- Small samples framed everywhere: "Results are from 4-6 batteries per condition group; differences under about
+  0.1-0.2 SOH points are within battery-to-battery variation, and no claim rests on a single battery."
 - Every assessment result uses each model's DEFAULT settings: the assessment never applies self-optimisation or
   automatic parameter selection (Models-view tuning does not reach it). Frozen models = default settings, v5.14.1.
 - Frozen models (user decision): per group and mode, the learned model with the lowest mean test RMSE over all
@@ -160,15 +167,75 @@ near 1.4 Ah (use EOL 80 % of initial); B0029 low first cycle biased baselines/Le
 | Pulsed* | ML Gaussian Process 0.95 (XGBoost 0.99) | ML GP 0.94 (DL Transformer 1.00) |
 Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed measured, Pulsed forecast.
 
-## 6. Next steps (in order)
-1. USER (v5.15.1, locally): Live twin view -> section "How often should the frozen model update?" -> "Whole <group>
-   group", default settings (retrain 5/10/20/50/never x 3 anchors, next 20 cycles). One run per group: Reference
-   (pick B0005), Hot, Cold, Mixed (Reference-condition toggle ON), Pulsed. Send each CSV.
-2. Compare the frozen model with the filters (EKF, mechanistic PF, power-law PF, trend KF, ensemble): Live model
-   scoreboard per battery (camera image or table), lab mode, retrain every 10.
-3. Answer the last M2 question (how often must the model update) per group; add to the summary table.
-4. M3: end-of-life prediction with band -> Operations (maintenance timing, what-if conditions). Cold: 1.40 Ah limit.
-5. Optional: PINN vs ablation with several seeds; run the 80-test suite locally.
+## 5i. Frozen-model update study, Hot (v5.15.1; DT forecast, BR SOH-now; 4 batteries; next 20 cycles; from cycle 12)
+- Forecast RMSE (mean of 4): no anchor 0.79-0.80 (retrain 5-20) vs 0.92 (never); measured-capacity anchor 0.84-0.89
+  (no better than none); field mode (SOH-now anchor) 0.93-1.06, SOH-now error 0.87. Spread across batteries
+  0.1-0.7, so differences of <0.15 pts are noise. Retraining helps mainly B0031 (1.96 -> 1.12, no anchor).
+- Short records (~40 cycles, ~27 forecast cycles): retrain every 50 = never (one fit). EOL never reached.
+- Anchor uses the single latest measured cycle, while SOH-now elsewhere is the median of the last 3 clean cycles
+  (v5.11 decision): a noisy cycle shifts the whole forecast. Candidate fix before the other groups.
+
+## 5j. Frozen-model update study, Reference COMPLETE (v5.15.1; MLP forecast, GRU SOH-now; next 20 cycles)
+- 5/5 batteries (B0005-B0007 group run, B0018 and B0036 run one at a time; no failures).
+- Mean of 5 (forecast RMSE SOH pts; EOL |error| cycles on B0005, B0006, B0018):
+  never updated 4.35 (EOL 20); retrain only every 5-10: 1.54-1.56 (12), better than never on 5/5; every 50: 2.02;
+  measured-capacity anchor, never retrained: 1.45 (9), better than retrain-only every 10 on 3/5; retraining on
+  top adds nothing (1.38-1.44); field mode (GRU anchor, SOH-now error 2.04): 2.35-2.50 (14-19), better than never
+  updated on 5/5.
+- B0036 (other campaign, slower fade): never updated 6.67, any update 1.0-1.5; GRU SOH-now error 0.98 there.
+- Answer for Reference: the twin must update; cheapest effective update = anchor to measured capacity, no
+  retraining; without anchor retrain every 10 cycles; field mode: train once, anchor to the GRU estimate.
+
+## 5k. Physics notes for the write-up (started 2026-10-19)
+- Level 4 PINN inputs per battery are constants: x_T (Arrhenius of median discharge cell temperature), x_C (degrees
+  below 15 C / 10), x_I (log DISCHARGE current). Cut-off voltage is not an input. Within one condition group all
+  batteries share x_T, x_C, x_I, so the condition sensitivities (b_T, b_C, a_I, a_L) are not identifiable from
+  the group: physics acts as a fixed-shape prior (SEI self-limiting, decelerating; plating with LAM coupling,
+  accelerating), scaled per battery by multipliers learned from its first 30 %.
+- Plating is driven by charge (NASA: CC 1.5 A at 4 C), but the PINN's current term uses discharge current.
+- Cold per battery (PINN / ablation RMSE, PINN bias): B0045 (2.0 V) 16.09 / 2.46, -13.65; B0046 (2.2 V) 3.55 / 5.99,
+  +1.32; B0047 (2.5 V) 9.02 / 3.68, -6.01; B0048 (2.7 V) 4.51 / 4.46, -1.25; B0041 (2.0 V, other campaign) 8.81 /
+  8.86. No monotonic trend with cut-off voltage; physics harms through too much fade (B0045, B0047); B0041's error
+  is not physics (ablation equal). Hypothesis to check: early low-capacity runs (NASA README) read as plating, then
+  extrapolated by the accelerating plating-LAM term. Check in the Models view: PINN mechanism shares for B0045.
+- Mixed B0042-44 are also 4 C (same campaign as B0041) yet the PINN wins there (reference condition, short horizon).
+
+## 5l. Frozen-model update study, Cold: B0045-B0048 (B0041 missing) (v5.15.1; GP forecast, Transformer SOH-now; next 20 cycles)
+- 72 cycles, forecasts from cycle ~22, 48 forecast cycles; EOL at cycle 2 (1.40 Ah): no EOL scoring; every 50 = never.
+- No anchor: never 1.33 (best), retraining 1.42-1.50 (slightly worse). Measured-capacity anchor 1.78-1.88 (worse
+  than no anchor). Field mode 3.93-4.52: Transformer SOH-now error 4.96 on B0045.
+- B0046 (47 forecast cycles; EOL at 17, before the start): no anchor never 2.97, retrain every 5: 2.62;
+  measured-capacity anchor 2.73-3.10 (no better than none); field 3.90-4.36 (SOH-now error 3.64).
+- B0047 (run with 10 and never only; 47 forecast cycles; EOL at 10): no anchor 3.53 never / 3.16 every 10;
+  measured-capacity anchor 3.22 / 2.59 (best); field 3.11 / 3.11 (SOH-now error 3.71; field retraining
+  changes almost nothing, the anchor dominates).
+- B0048 (10 and never; EOL at 16): no anchor 3.78 / 2.85; capacity 3.11 / 2.88; field 4.82 / 4.27 (SOH-now 3.35).
+- Mean of B0045-B0048 (settings 10, never): none 2.81 / 2.67; capacity 2.57 / 2.75; field 4.04 / 4.07.
+  Differences of 0.1-0.3 against a battery spread of ~1 pt: in Cold the update strategy barely matters; field
+  mode is clearly worse (Transformer SOH-now error 3.6-5.0).
+- Single-cycle capacity anchor hurts on a noisy battery (NASA README: low-capacity runs at 4 C): first direct
+  evidence for the 3-cycle-median anchor (open question; feature freeze).
+
+## 5m. Frozen-model update study, Pulsed load COMPLETE (v5.15.1; GP forecast, GP SOH-now; 10 and never)
+- 4/4 batteries (B0025-B0028), 16-17 forecast cycles each, EOL never reached, no failures.
+- Mean of 4 (every 10 / never): none 0.79 / 0.89; measured-capacity anchor 0.81 / 0.82; field 0.85 / 0.85
+  (GP SOH-now error 0.54-1.51). All within ~0.1 pts: update strategy irrelevant at this horizon.
+- Per battery the best anchor differs (capacity worse on B0026, field worse on B0028): no single best setting.
+
+## 5n. Frozen-model update study, Mixed conditions: not done (decision in section 4)
+- Two runs with the toggle off were invalid (scored capacity jumps, not ageing); v5.15.2 fixes the data rule, but
+  the study is dropped for Mixed by decision.
+
+## 6. Next steps (week of 2026-10-19; close Mission 2)
+1. USER: update study Cold B0041 (10 and never) -> update study then complete (Hot, Reference, Cold, Pulsed).
+2. USER: run the 80-test suite once (pytest tests/).
+3. USER: python scripts/pinn_seeds.py --master battery_master_data.parquet --imp impedance_ground_truth.parquet
+   (Hot, Cold, Mixed; seeds 0-4; resumes). Send pinn_seeds_runs.csv and pinn_seeds_summary.csv.
+4. USER: Live model scoreboard (frozen model, lab anchor, retrain never) for one battery per group: B0005, B0029,
+   B0045, B0025.
+5. Physics write-up "Why physics-informed learning helps at 43 C and fails at 4 C" (5k + seeds + papers).
+6. Framing check of slides and summary; weekly presentation: four groups of the update study, filters, physics.
+7. Then Mission 3: end-of-life prediction with uncertainty -> Operations.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to
