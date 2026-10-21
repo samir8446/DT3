@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.15.1"
+REQUIRED_ENGINE = "5.16.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -4638,7 +4638,15 @@ def frozen_update_section() -> None:
     horizon = c3.selectbox("Score the next", [10, 20, 40], index=1, key="fzu_h", format_func=lambda v: f"{v} cycles")
     scope = c4.radio("Batteries", [f"This battery ({cell})", f"Whole {grp_c} group"], key="fzu_scope")
     cells_run = [cell] if scope.startswith("This") else [cell] + train_c
-    cfg = (DATA_KEY, grp_c, tuple(sorted(cells_run)), tuple(sorted(ivals)), tuple(anchors), int(horizon), float(eol_ah))
+    # same data rule as the accuracy assessment, whatever the control-bar toggle says: Mixed conditions at each
+    # battery's reference condition (capacity jumps at load / temperature changes removed), every other group as recorded
+    if grp_c == "Mixed conditions":
+        ct_s, dkey_s = ref_ct_cached(CT_RAW, DATA_KEY_RAW), DATA_KEY_RAW + "|reference-condition"
+        st.caption("Mixed conditions: scored at each battery's reference condition, as in the accuracy assessment "
+                   "(applied automatically; the control-bar toggle does not change this study).")
+    else:
+        ct_s, dkey_s = CT_RAW, DATA_KEY_RAW
+    cfg = (dkey_s, grp_c, tuple(sorted(cells_run)), tuple(sorted(ivals)), tuple(anchors), int(horizon), float(eol_ah))
     n_fast = min([v for v in ivals if v] or [50])
     st.caption(f"{len(cells_run)} battery(ies) × {len(ivals) * len(anchors)} settings. Fits are shared between "
                f"settings, so the cost is set by retraining every {n_fast} cycles (the forecast model is refitted about "
@@ -4651,13 +4659,13 @@ def frozen_update_section() -> None:
         groups = te.condition_groups(CT_RAW)
         for i, c in enumerate(cells_run):
             prog.progress(i / len(cells_run), text=f"{c} ({i + 1}/{len(cells_run)}) · retraining as it streams…")
-            g_ = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]]
+            g_ = ct_s[(ct_s["Cell_ID"] == c) & ~ct_s["outlier"]]
             if g_.empty or c not in groups.index:
                 continue
             soh_eol_c = te.soh_eol_for(float(g_["C_bol_Ah"].iloc[0]), eol_ah)
             tr_c = tuple(x for x in [cell] + train_c if x != c)
             try:
-                parts.append(frozen_study_cached(ct, imp, DATA_KEY, c, tr_c, grp_c, float(soh_eol_c),
+                parts.append(frozen_study_cached(ct_s, imp, dkey_s, c, tr_c, grp_c, float(soh_eol_c),
                                                  tuple(sorted(ivals)), tuple(anchors), int(horizon), float(eol_ah)))
             except Exception as exc:
                 report_error(f"Frozen-model study failed on {c}", exc, debug)
@@ -4706,6 +4714,7 @@ def frozen_update_section() -> None:
         lines.append("Run the whole group before drawing a conclusion: one battery is an anecdote.")
     card("Mission 2 · update frequency of the frozen model", lines)
     stamp = {"app version": te.ENGINE_VERSION, "group": grp_c, "forecast model": fz[0], "SOH-now model": fz[1],
+             "data": "reference condition" if saved["cfg"][0].endswith("|reference-condition") else "as recorded",
              "horizon (cycles)": int(saved["cfg"][5]),
              "EOL setting": f"{eol_ah:.2f} Ah" if eol_ah > 1 else f"{100 * eol_ah:.0f} % of initial capacity"}
     download("Download the update study (CSV)", tab.assign(**stamp).to_csv(index=False).encode(),
@@ -5836,6 +5845,216 @@ def fig_mechanisms(f: Any, P: Palette, battery: str) -> go.Figure:
     return style_fig(fig, P, 400, f"Which mechanisms does the PINN attribute {battery}'s ageing to?")
 
 
+
+# ---- PINN v2 · degradation mechanisms (voltage-curve evidence, impedance, cross-group training) ----
+PV2_GROUPS = ("Reference", "High current", "Hot", "Cold", "Pulsed load")   # conditions constant within a battery
+PV2_EXPECT = {
+    "Hot": "At 43 °C, SEI growth is commonly reported as a major contributor (it accelerates with temperature), "
+           "together with loss of active material.",
+    "Cold": "At 4 °C, lithium plating during charging is commonly reported to matter; a deep discharge "
+            "(2.0–2.2 V cut-off) can add loss of active material.",
+    "Reference": "At room temperature and moderate current, gradual SEI growth and loss of active material are "
+                 "commonly reported.",
+    "High current": "High current is commonly reported to raise loss of active material (mechanical stress) and heating.",
+    "Pulsed load": "Pulsed discharge with rests: no single expected mechanism; compare with the other groups.",
+}
+MECH_KEYS = {"LLI by SEI growth": "SEI", "LLI by lithium plating": "plating", "Loss of active material": "LAM"}
+
+
+@st.cache_data(show_spinner=False, max_entries=64)
+def dqdv_cell_cached(_store: te.ParquetStore, key: str, cell: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    return te.dqdv_cell(_store, CT_RAW, cell)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def dqdv_all_cached(_store: te.ParquetStore, key: str, cells: Tuple[str, ...]) -> pd.DataFrame:
+    return te.dqdv_indicators(_store, CT_RAW, list(cells))
+
+
+@st.cache_data(show_spinner=False, max_entries=16)
+def explain_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str, train: Tuple[str, ...],
+                   version: int, seeds: Tuple[int, ...]) -> Dict[str, Any]:
+    return te.pinn_explain(_ct, _imp, cell, list(train), version=version, seeds=seeds)
+
+
+def fig_dqdv_curves(curves: Dict[str, Any], P: Palette, cell: str) -> go.Figure:
+    fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.08,
+                        subplot_titles=("Discharge (IR-corrected)", "Charge, constant-current part (IR-corrected)"))
+    for col, mode in enumerate(("discharge", "charge"), 1):
+        cs = sorted(curves.get(mode, []), key=lambda x: x[0])
+        if not cs:
+            continue
+        pick = cs[:: max(1, len(cs) // 10)]
+        cols = sample_colorscale("Viridis", [k / max(len(pick) - 1, 1) for k in range(len(pick))])
+        for k, (n, g, y) in enumerate(pick):
+            fig.add_trace(go.Scatter(x=g, y=y, mode="lines", line=dict(color=cols[k], width=1.6),
+                                     name=f"cycle {n}", legendgroup=f"c{n}", showlegend=(col == 1),
+                                     hovertemplate=f"cycle {n}: %{{y:.2f}} Ah/V at %{{x:.3f}} V<extra></extra>"), 1, col)
+        fig.update_xaxes(title_text="Voltage (V)", row=1, col=col)
+    fig.update_yaxes(title_text="dQ/dV (Ah/V)", row=1, col=1)
+    return style_fig(fig, P, 430, f"Incremental capacity over life · {cell}", hovermode="closest")
+
+
+def fig_dqdv_indicators(md: pd.DataFrame, P: Palette, cell: str) -> go.Figure:
+    fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.1,
+                        subplot_titles=("Curve shrinkage (LAM-like) and SOH", "Curve shift (LLI-like) and polarisation"))
+    fig.add_trace(go.Scatter(x=md["n"], y=md["dq_scale"], name="dQ/dV scale (LAM-like)",
+                             line=dict(color=MECH_COLORS["LAM"], width=2.2)), 1, 1)
+    fig.add_trace(go.Scatter(x=md["n"], y=md["SOH"], name="SOH (capacity)", line=dict(color=P.text, width=1.4, dash="dot")), 1, 1)
+    fig.add_trace(go.Scatter(x=md["n"], y=md["dq_lli_mV"], name="LLI-like shift (mV)",
+                             line=dict(color=MECH_COLORS["SEI"], width=2.2)), 1, 2)
+    fig.add_trace(go.Scatter(x=md["n"], y=md["dq_pol_mV"], name="Polarisation (mV)",
+                             line=dict(color="#882255", width=1.6, dash="dash")), 1, 2)
+    fig.update_xaxes(title_text="Discharge cycle n")
+    fig.update_yaxes(title_text="Scale / SOH", row=1, col=1)
+    fig.update_yaxes(title_text="mV", row=1, col=2)
+    return style_fig(fig, P, 400, f"Degradation-mode indicators from the voltage curves · {cell}")
+
+
+def fig_mechanisms(res: Dict[str, Any], P: Palette, title: str) -> go.Figure:
+    f = res["frames"]
+    m = f.groupby("n")[list(te.MECHANISMS) + ["SOH observed", "SOH (model)"]].mean().reset_index()
+    fig = go.Figure()
+    for mech in te.MECHANISMS:
+        fig.add_trace(go.Scatter(x=m["n"], y=100 * m[mech].clip(lower=0), name=mech, stackgroup="mech", mode="lines",
+                                 line=dict(width=0.6, color=MECH_COLORS[MECH_KEYS[mech]]),
+                                 hovertemplate="%{y:.2f} % of initial capacity<extra>" + mech + "</extra>"))
+    fig.add_trace(go.Scatter(x=m["n"], y=100 * (1 - m["SOH observed"]), name="Measured capacity loss",
+                             mode="markers", marker=dict(color=P.text, size=4)))
+    fig.add_trace(go.Scatter(x=m["n"], y=100 * (1 - m["SOH (model)"]), name="Model capacity loss",
+                             line=dict(color=P.text, width=1.4, dash="dot")))
+    fig.update_xaxes(title_text="Discharge cycle n")
+    fig.update_yaxes(title_text="Share of initial capacity (%)", rangemode="tozero")
+    return style_fig(fig, P, 440, title)
+
+
+def fig_evidence(res: Dict[str, Any], P: Palette) -> Optional[go.Figure]:
+    f = res["frames"]
+    pairs = [("dq_scale", "dQ/dV scale (LAM-like)"), ("dq_lli_mV", "dQ/dV shift (LLI-like, mV)"),
+             ("Re_rel", "EIS Re / Re,0 (SEI film)")]
+    pairs = [(k, t) for k, t in pairs if f"{k} observed" in f and f[f"{k} observed"].notna().any()]
+    if not pairs:
+        return None
+    fig = make_subplots(rows=1, cols=len(pairs), horizontal_spacing=0.08, subplot_titles=[t for _, t in pairs])
+    m = f.groupby("n").mean(numeric_only=True).reset_index()
+    for j, (k, _t) in enumerate(pairs, 1):
+        fig.add_trace(go.Scatter(x=m["n"], y=m[f"{k} observed"], mode="markers", name="Observed",
+                                 marker=dict(color=P.text, size=4), showlegend=(j == 1), legendgroup="o"), 1, j)
+        fig.add_trace(go.Scatter(x=m["n"], y=m[k], mode="lines", name="PINN v2 (mean of seeds)",
+                                 line=dict(color="#D55E00", width=2.2), showlegend=(j == 1), legendgroup="m"), 1, j)
+        fig.update_xaxes(title_text="Cycle n", row=1, col=j)
+    return style_fig(fig, P, 380, "Does the explanation agree with the independent evidence?")
+
+
+def attribution_table(res: Dict[str, Any]) -> pd.DataFrame:
+    at = res["attribution"].copy()
+    return pd.DataFrame({"Share of capacity loss": [f"{100 * a:.0f} % ± {100 * b:.0f}" for a, b in
+                                                     zip(at["share mean"], at["share SD"].fillna(0))],
+                         "Capacity lost (% of initial)": (100 * at["capacity fraction at the last cycle"]).round(2)},
+                        index=at.index)
+
+
+def pinn_v2_section() -> None:
+    section("Level 4 · PINN v2 · Which degradation mechanisms explain this battery's capacity loss?")
+    st.markdown(
+        "The capacity curve shows only the **sum** of the mechanisms; the **shape of the voltage curve** separates them. "
+        "Incremental-capacity analysis (dQ/dV) of every cycle gives three indicators: the curve **shrinks** when active "
+        "material is lost (LAM), charge and discharge curves **shift together** when lithium is lost (LLI: SEI growth, "
+        "plating), and **apart** when resistance grows (polarisation). **PINN v2** must reproduce these indicators, the "
+        "impedance Re (SEI film) and the resistance, not only the capacity. Its plating is driven by the cold and the "
+        "**charge** current, its LAM by the discharge current and the **depth of discharge**, its SEI by temperature "
+        "(activation energy kept in 20–80 kJ/mol), with signs fixed by electrochemistry, and it is trained on several "
+        "temperature groups so these effects can be learned. Its attribution is reported with the spread over seeds. "
+        "Without half-cell reference curves the dQ/dV indicators are indicators, not exact quantities.")
+    groups = te.condition_groups(CT_RAW)
+    grp_c = str(groups.loc[cell, "Group"]) if cell in groups.index else None
+    # ---- 1. the evidence for this battery
+    try:
+        with st.spinner(f"Incremental-capacity analysis of {cell} (runs once)…"):
+            f_c, curves = dqdv_cell_cached(store, DATA_KEY_RAW, cell)
+    except Exception as exc:
+        report_error("dQ/dV analysis failed", exc, debug)
+        return
+    if f_c.empty:
+        st.info(f"No constant-current curves usable for dQ/dV on {cell}.")
+        return
+    md = te.dqdv_modes(f_c).sort_values("n")
+    show(fig_dqdv_curves(curves, P, cell), key="pv2_curves")
+    show(fig_dqdv_indicators(md, P, cell), key="pv2_ind", data=md)
+    # ---- 2. the explanation
+    if grp_c not in PV2_GROUPS:
+        st.info(f"{cell} belongs to the {grp_c or 'no'} group: its test conditions change during life (or its logging "
+                "failed), so a mechanism attribution would mix ageing with condition changes. Select a battery of "
+                + ", ".join(PV2_GROUPS) + ".")
+        return
+    c1, c2, c3 = st.columns([1.6, 1.0, 1.2])
+    scope = c1.radio("Train on", ["All groups (temperature and current vary)", f"{grp_c} group only"], key="pv2_scope",
+                     help="All groups: the batteries of " + ", ".join(PV2_GROUPS) + " with at least 25 cycles. Only with "
+                          "several temperatures and currents can the model learn how they change each mechanism.")
+    n_seeds = c2.select_slider("Seeds", [1, 3, 5], value=3, key="pv2_seeds",
+                               help="The attribution is repeated with different random seeds; a share that changes with "
+                                    "the seed is not physical.")
+    with_v1 = c3.toggle("Also run PINN v1 (capacity only)", value=True, key="pv2_v1")
+    if scope.startswith("All"):
+        train = sorted({c for g in PV2_GROUPS for c in te.protocol_cells(CT_RAW, g)} - {cell})
+    else:
+        train = [c for c in te.protocol_cells(CT_RAW, grp_c) if c != cell]
+    seeds = tuple(range(int(n_seeds)))
+    st.caption(f"{len(train)} training batteries + {cell} · {n_seeds} seed(s) · dQ/dV is computed once for every "
+               "battery used (a few minutes the first time), each PINN fit takes about a minute per seed.")
+    cfg = (DATA_KEY_RAW, cell, tuple(train), seeds, bool(with_v1))
+    if st.button("Explain this battery's degradation", key="pv2_go", type="primary", icon=":material/biotech:",
+                 disabled=len(train) < 2):
+        try:
+            with st.spinner("Incremental-capacity analysis of the training batteries (runs once)…"):
+                ind = dqdv_all_cached(store, DATA_KEY_RAW, tuple(sorted(set(train) | {cell})))
+            ct2 = te.attach_dqdv(CT_RAW, ind)
+            with st.spinner("Fitting PINN v2 for each seed…"):
+                res2 = explain_cached(ct2, imp, DATA_KEY_RAW + "|dqdv", cell, tuple(train), 2, seeds)
+            res1 = None
+            if with_v1:
+                with st.spinner("Fitting PINN v1 for each seed…"):
+                    res1 = explain_cached(CT_RAW, imp, DATA_KEY_RAW, cell, tuple(train), 1, seeds)
+            st.session_state["pv2"] = {"cfg": cfg, "res2": res2, "res1": res1}
+        except Exception as exc:
+            report_error("PINN v2 explanation failed", exc, debug)
+    saved = st.session_state.get("pv2")
+    if not saved or saved["cfg"][1] != cell:
+        placeholder("Press 'Explain this battery's degradation': the mechanism breakdown, the evidence check and the "
+                    "learned physics appear here.")
+        return
+    if saved["cfg"] != cfg:
+        st.warning("Settings changed since the last run; the results below use the previous settings.")
+    res2, res1 = saved["res2"], saved["res1"]
+    show(fig_mechanisms(res2, P, f"PINN v2: capacity loss of {cell} split into mechanisms (mean of "
+                                 f"{len(res2['seeds'])} seed(s))"), key="pv2_mech", data=res2["frames"])
+    lines = [f"Dominant mechanism: {res2['dominant']} (in {res2['dominant_agreement']} seeds)."]
+    if grp_c in PV2_EXPECT:
+        lines.append("Electrochemical expectation for this group: " + PV2_EXPECT[grp_c])
+    card(f"PINN v2 · {cell}", lines)
+    tabs = {"PINN v2": attribution_table(res2)}
+    if res1 is not None:
+        tabs["PINN v1 (capacity only)"] = attribution_table(res1)
+    cmp_ = pd.concat(tabs, axis=1)
+    show_table(cmp_, note="Share of the capacity lost at the battery's last cycle, mean ± SD over seeds. A large SD "
+                          "means the data cannot tell that mechanism apart from the others.")
+    ev = fig_evidence(res2, P)
+    if ev is not None:
+        show(ev, key="pv2_evidence", data=res2["frames"])
+    pr = res2["params"].drop(columns=["seed"])
+    show_table(pd.DataFrame({"mean": pr.mean(), "SD over seeds": pr.std(ddof=1) if len(pr) > 1 else 0.0}).style.format(
+        "{:.3g}"), note="Learned physics. The activation energy is bounded to 20–80 kJ/mol; the sensitivities are "
+                        "non-negative by construction. A parameter that does not move from its starting value "
+                        "(about 30 kJ/mol, sensitivities ~0.3–1) was not informed by the data.")
+    stamp = {"app version": te.ENGINE_VERSION, "cell": cell, "group": grp_c, "training batteries": " ".join(res2["train_cells"]),
+             "seeds": " ".join(map(str, res2["seeds"]))}
+    out = res2["frames"].assign(model="PINN v2")
+    if res1 is not None:
+        out = pd.concat([out, res1["frames"].assign(model="PINN v1")], ignore_index=True)
+    download("Download the mechanism breakdown (CSV)", out.assign(**stamp).to_csv(index=False).encode(),
+             f"mechanisms_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="pv2_csv")
+
+
 def pinn_section() -> None:
     model_level_section(
         4, "Level 4 · Physics-informed neural network: does knowing the physics improve the prediction?",
@@ -5877,6 +6096,7 @@ def view_models() -> None:
     trajectory_section()
     deep_section()
     pinn_section()
+    pinn_v2_section()
     ladder_leaderboard()
     assessment_section()
 

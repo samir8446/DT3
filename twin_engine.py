@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.15.1"
+ENGINE_VERSION = "5.16.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -8935,3 +8935,425 @@ def frozen_update_study(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str
     out = pd.DataFrame(rows)
     out.attrs.update({"fkey": fkey, "mkey": mkey, "group": group, "horizon": horizon})
     return out
+
+
+# =============================================================================
+# 45. dQ/dV DEGRADATION-MODE INDICATORS (incremental-capacity analysis of every clean cycle)
+# =============================================================================
+# A capacity curve shows only the SUM of the mechanisms; the shape of the voltage curve separates them. For every
+# clean cycle (discharge, and the constant-current part of the charge): Q(V) from the current, voltage corrected for
+# the ohmic drop (V +- I*R_dc), smoothed, dQ/dV on a 5 mV grid; the main peaks; and a fit Q_n(V) = a * Q_ref(V - d)
+# against the median of the battery's first 3 clean cycles. Then, per cycle:
+#   scale a (discharge)             LAM-like: the curve shrinks when active material is lost
+#   (shift_charge + shift_dis) / 2  LLI-like: lost lithium moves charge and discharge curves the same way
+#   (shift_charge - shift_dis) / 2  polarisation: resistance moves them in opposite directions
+# Limit: without half-cell reference curves of both electrodes these are indicators, not exact LLI / LAM_PE / LAM_NE.
+DQ_DV = 0.005
+DQ_SHIFTS = np.arange(-0.15, 0.1501, 0.002)
+_trapz = getattr(np, "trapezoid", None) or getattr(np, "trapz")
+
+
+def _dq_qv(t: np.ndarray, v: np.ndarray, i: np.ndarray, r: float, charge: bool):
+    if len(t) < 20:
+        return None
+    from scipy.signal import savgol_filter
+    q = np.cumsum(np.abs(i) * np.diff(t, prepend=t[0])) / 3600.0
+    rr = r if np.isfinite(r) else 0.0
+    vc = v - np.abs(i) * rr if charge else v + np.abs(i) * rr
+    o = np.argsort(vc)
+    vs, qs = vc[o], q[o]
+    if not charge:
+        qs = qs.max() - qs
+    qs = np.maximum.accumulate(qs)
+    lo, hi = np.ceil(vs.min() / DQ_DV) * DQ_DV, np.floor(vs.max() / DQ_DV) * DQ_DV
+    if hi - lo < 0.3:
+        return None
+    grid = np.round(np.arange(lo, hi + DQ_DV / 2, DQ_DV), 4)
+    vu, idx = np.unique(vs, return_index=True)
+    qg = np.interp(grid, vu, qs[idx])
+    win = min(len(grid) - (1 - len(grid) % 2), 21)
+    if win < 7:
+        return None
+    qsm = savgol_filter(qg, win, 3)
+    return grid, qsm, np.clip(np.gradient(qsm, DQ_DV), 0, None)
+
+
+def _dq_peaks(grid: np.ndarray, y: np.ndarray, k: int = 2) -> Dict[str, float]:
+    from scipy.signal import find_peaks
+    out: Dict[str, float] = {}
+    if y.max() <= 0:
+        return out
+    pk, _ = find_peaks(y, prominence=0.05 * y.max(), distance=int(0.05 / DQ_DV))
+    pk = pk[np.argsort(-y[pk])][:k]
+    for j, p_ in enumerate(sorted(pk, key=lambda x: grid[x]), 1):
+        w = (grid >= grid[p_] - 0.05) & (grid <= grid[p_] + 0.05)
+        out.update({f"peak{j}_V": float(grid[p_]), f"peak{j}_height": float(y[p_]),
+                    f"peak{j}_area_Ah": float(_trapz(y[w], grid[w]))})
+    return out
+
+
+def _dq_shift_scale(grid: np.ndarray, q: np.ndarray, g_ref: np.ndarray, q_ref: np.ndarray) -> Dict[str, float]:
+    best = (np.inf, np.nan, np.nan)
+    for dsh in DQ_SHIFTS:
+        x = grid - dsh
+        ok = (x >= g_ref[0]) & (x <= g_ref[-1])
+        if ok.sum() < 30:
+            continue
+        qr = np.interp(x[ok], g_ref, q_ref)
+        qq = q[ok]
+        qr0, qq0 = qr - qr.mean(), qq - qq.mean()
+        den = float(qr0 @ qr0)
+        if den <= 0:
+            continue
+        a = float(qr0 @ qq0) / den
+        rm = float(np.sqrt(np.mean((qq0 - a * qr0) ** 2)))
+        if rm < best[0]:
+            best = (rm, a, dsh)
+    return {"scale_a": best[1], "shift_mV": 1000 * best[2], "fit_rmse_Ah": best[0]}
+
+
+def dqdv_cell(store: Any, ct: pd.DataFrame, cell: str) -> Tuple[pd.DataFrame, Dict[str, List[Tuple[int, np.ndarray, np.ndarray]]]]:
+    """dQ/dV features of every clean cycle of one battery (both modes) and the curves themselves."""
+    raw = store.cell_frame(cell)
+    tab = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]].set_index("Cycle_Index")
+    dis_idx = tab.index
+    rows: List[Tuple[Dict[str, Any], np.ndarray, np.ndarray]] = []
+    curves: Dict[str, List[Tuple[int, np.ndarray, np.ndarray]]] = {}
+    for mode in ("discharge", "charge"):
+        seg = raw[raw["Cycle_Type"] == mode]
+        ref: List[Tuple[np.ndarray, np.ndarray]] = []
+        mrows = []
+        for ci, d in seg.groupby("Cycle_Index", sort=True):
+            if mode == "discharge":
+                key = ci
+            else:                                           # a charge belongs to the discharge that follows it
+                later = dis_idx[dis_idx > ci]
+                key = int(later.min()) if len(later) else None
+            if key is None or key not in tab.index:
+                continue
+            info = tab.loc[key]
+            d = d.sort_values("Time_s")
+            i = d["Current_A"].to_numpy(float)
+            big = np.abs(i) > 0.05
+            if not big.any():
+                continue
+            iset = float(np.nanmedian(np.abs(i[big])))
+            cc = np.abs(i) > 0.9 * iset
+            if mode == "charge":
+                cc &= i > 0
+            r = _dq_qv(d["Time_s"].to_numpy(float)[cc], d["Voltage_V"].to_numpy(float)[cc], i[cc],
+                       float(info.get("R_dc_ohm", np.nan)), mode == "charge")
+            if r is None:
+                continue
+            grid, q, y = r
+            curves.setdefault(mode, []).append((int(info["n"]), grid, y))
+            row = {"Cell_ID": cell, "mode": mode, "n": int(info["n"]), "Cycle_Index": int(key),
+                   "SOH": float(info["SOH"]), "I_A": iset, **_dq_peaks(grid, y)}
+            if len(ref) < 3:
+                ref.append((grid, q))
+            mrows.append((row, grid, q))
+        if ref:
+            g0 = ref[0][0]
+            q_ref = np.median([np.interp(g0, g, qq) for g, qq in ref], axis=0)
+            for row, grid, q in mrows:
+                row.update(_dq_shift_scale(grid, q, g0, q_ref))
+        rows.extend(mrows)
+    return pd.DataFrame([r_ for r_, _, _ in rows]), curves
+
+
+def dqdv_modes(f: pd.DataFrame) -> pd.DataFrame:
+    """Per battery and cycle: LAM-like scale (discharge), LLI-like shift and polarisation (charge and discharge)."""
+    if f is None or f.empty:
+        return pd.DataFrame(columns=["Cell_ID", "n", "SOH", "dq_scale", "dq_lli_mV", "dq_pol_mV"])
+    p = f.pivot_table(index=["Cell_ID", "n"], columns="mode", values=["shift_mV", "scale_a", "SOH"])
+    out = pd.DataFrame(index=p.index)
+    out["SOH"] = p[("SOH", "discharge")] if ("SOH", "discharge") in p else np.nan
+    out["dq_scale"] = p[("scale_a", "discharge")] if ("scale_a", "discharge") in p else np.nan
+    both = ("shift_mV", "charge") in p and ("shift_mV", "discharge") in p
+    out["dq_lli_mV"] = (p[("shift_mV", "charge")] + p[("shift_mV", "discharge")]) / 2 if both else np.nan
+    out["dq_pol_mV"] = (p[("shift_mV", "charge")] - p[("shift_mV", "discharge")]) / 2 if both else np.nan
+    return out.reset_index()
+
+
+def dqdv_indicators(store: Any, ct: pd.DataFrame, cells: Sequence[str], progress: ProgressFn = None) -> pd.DataFrame:
+    """dqdv_modes for several batteries (a battery whose curves fail is skipped, never stops the others)."""
+    parts = []
+    for k, c in enumerate(cells):
+        _report(progress, k / max(len(cells), 1), f"dQ/dV · {c}")
+        try:
+            f, _ = dqdv_cell(store, ct, c)
+            parts.append(dqdv_modes(f))
+        except Exception:
+            continue
+    _report(progress, 1.0, "dQ/dV done")
+    return pd.concat(parts, ignore_index=True) if parts else dqdv_modes(None)
+
+
+def attach_dqdv(ct: pd.DataFrame, ind: pd.DataFrame) -> pd.DataFrame:
+    """The cycle table with the dQ/dV indicators as columns dq_scale, dq_lli_mV, dq_pol_mV (NaN where missing)."""
+    cols = ["dq_scale", "dq_lli_mV", "dq_pol_mV"]
+    base = ct.drop(columns=[c for c in cols if c in ct.columns])
+    if ind is None or ind.empty:
+        return base.assign(**{c: np.nan for c in cols})
+    return base.merge(ind[["Cell_ID", "n"] + cols], on=["Cell_ID", "n"], how="left")
+
+
+# =============================================================================
+# 46. PINN v2: MECHANISM ATTRIBUTION CONSTRAINED BY THE VOLTAGE CURVES AND IMPEDANCE
+# =============================================================================
+# Version 1 (section 39) sees capacity, resistance and one constant per condition; within one group its condition
+# sensitivities cannot be learned and plating and LAM trade off freely between seeds. Version 2 keeps the network and
+# changes what constrains it:
+#   inputs      throughput, Arrhenius temperature, cold term, discharge current, CHARGE current, depth of discharge
+#               (cut-off voltage) and a battery code
+#   physics     SEI   k_sei * m * exp(b_T x_T) / (LLI_SEI + d0)                 b_T from Ea in [20, 80] kJ/mol
+#               plating k_pl * m * exp(b_C x_cold + a_c x_Icharge) (1 + c LAM)    b_C, a_c >= 0 (colder/faster = more)
+#               LAM   k_lam * m * exp(a_I x_Idis + a_V x_depth)                   a_I, a_V >= 0
+#   observed    SOH = (1 - LLI_SEI - LLI_pl)(1 - LAM)            capacity
+#               R_dc / R_dc,0 = 1 + g * LLI_SEI                  resistance (as in version 1)
+#               dQ/dV scale = 1 - LAM                            voltage-curve shrinkage
+#               dQ/dV LLI shift = kappa * (LLI_SEI + LLI_pl)     voltage-curve shift
+#               Re / Re,0 = 1 + g_e * LLI_SEI                    impedance (SEI film)
+# Used to EXPLAIN a battery's recorded life (all its cycles), trained on several groups at once so temperature and
+# current vary. The attribution is reported with its spread over seeds.
+PINN2_EA_RANGE = (20.0, 80.0)
+PINN2_TERMS = {"Ea": "Activation energy, SEI (kJ/mol)", "b_C": "Plating: cold sensitivity",
+               "a_c": "Plating: charge-current sensitivity", "a_I": "LAM: discharge-current sensitivity",
+               "a_V": "LAM: depth-of-discharge sensitivity", "c": "Plating: coupling to LAM",
+               "g": "Resistance growth per unit SEI LLI", "g_e": "Re growth per unit SEI LLI",
+               "kappa": "dQ/dV shift per unit LLI (mV)", "k_sei": "SEI growth rate", "k_pl": "Plating rate",
+               "k_lam": "LAM rate"}
+MECHANISMS = ("LLI by SEI growth", "LLI by lithium plating", "Loss of active material")
+
+
+def _re_relative(imp: Optional[pd.DataFrame], ct: pd.DataFrame, cell: str, n_max: Optional[int] = None):
+    """EIS electrolyte/film resistance Re relative to its first values, placed at the discharge cycle that follows
+    each impedance test. Returns (n, Re/Re0) or None."""
+    if imp is None or imp.empty or "Re_ohm" not in imp:
+        return None
+    e = imp[(imp["Cell_ID"] == cell) & imp["Re_ohm"].notna() & (imp["Re_ohm"] > 0)].sort_values("Cycle_Index")
+    tab = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]].sort_values("Cycle_Index")
+    if len(e) < 3 or tab.empty:
+        return None
+    ci, nn = tab["Cycle_Index"].to_numpy(), tab["n"].to_numpy(float)
+    pos = np.searchsorted(ci, e["Cycle_Index"].to_numpy())
+    ok = pos < len(ci)
+    n = nn[pos[ok]]
+    re = e["Re_ohm"].to_numpy(float)[ok]
+    if len(re) < 3:
+        return None
+    rel = re / float(np.median(re[:3]))
+    if n_max is not None:
+        keep = n <= n_max
+        n, rel = n[keep], rel[keep]
+    return (n, rel) if len(n) >= 3 else None
+
+
+def _pinn2_battery(ct: pd.DataFrame, imp: Optional[pd.DataFrame], c: str, n_max: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    b = _pinn_battery(ct, c, n_max)
+    if b is None:
+        return None
+    d = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
+    if n_max is not None:
+        d = d[d["n"] <= n_max]
+    ic = float(d["I_ch_A"].median()) if "I_ch_A" in d and d["I_ch_A"].notna().any() else 1.5
+    vcut = float(d["V_min_V"].median()) if "V_min_V" in d and d["V_min_V"].notna().any() else 2.7
+    b["xIc"] = math.log(max(ic, 0.1) / 1.5)
+    b["xV"] = max(0.0, 2.7 - vcut) / 0.7
+    n = b["n"]
+
+    def on_n(col: str, win: int = 5) -> Optional[np.ndarray]:
+        if col not in d or d[col].notna().sum() < 5:
+            return None
+        s = d[["n", col]].dropna()
+        v = s[col].rolling(win, center=True, min_periods=1).median().to_numpy(float)
+        out = np.interp(n, s["n"].to_numpy(float), v, left=np.nan, right=np.nan)
+        return out
+    b["dqs"] = on_n("dq_scale")
+    b["dql"] = on_n("dq_lli_mV")
+    rr = _re_relative(imp, ct, c, n_max)
+    b["re"] = np.interp(n, rr[0], rr[1], left=np.nan, right=np.nan) if rr is not None else None
+    return b
+
+
+def _pinn2_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> Dict[str, Any]:
+    """PINN version 2 on a list of batteries (see the section header)."""
+    rng = np.random.default_rng(seed)
+    nb = len(bats)
+    step = int(np.clip(round(nb / 6), 1, 4))
+    n_col = int(np.clip(1600 // max(nb, 1), 20, 50))
+    keys = ("a", "xT", "xC", "xI", "xIc", "xV")
+    Xd, Bd, Yd = [], [], []
+    obs = {k: ([], []) for k in ("r", "re", "dqs", "dql")}
+    for i, b in enumerate(bats):
+        for j in range(0, len(b["a"]), step):
+            Xd.append([b["a"][j]] + [b[k] for k in keys[1:]]); Bd.append(i); Yd.append(b["soh"][j])
+            for k in obs:
+                arr = b.get(k)
+                v = arr[j] if arr is not None and j < len(arr) else np.nan
+                obs[k][0].append(0.0 if not np.isfinite(v) else v)
+                obs[k][1].append(0.0 if not np.isfinite(v) else 1.0)
+    Xd, Bd, Yd = np.array(Xd), np.array(Bd), np.array(Yd)
+    O = {k: (np.array(v[0])[:, None], np.array(v[1])[:, None]) for k, v in obs.items()}
+    Xc, Bc = [], []
+    for i, b in enumerate(bats):
+        for a in np.linspace(0.0, max(b["a_end"], 0.05), n_col):
+            Xc.append([a] + [b[k] for k in keys[1:]]); Bc.append(i)
+    Xc, Bc = np.array(Xc), np.array(Bc)
+    OHd, OHc = np.eye(nb)[Bd], np.eye(nb)[Bc]
+    H = int(p["hidden"])
+    g_ = lambda *s_: Tensor(rng.normal(0, 1 / math.sqrt(s_[0]), size=s_))
+    W1, Wz, b1 = g_(6, H), g_(2, H), Tensor(np.zeros((1, H)))
+    W2, b2 = g_(H, H), Tensor(np.zeros((1, H)))
+    W3, b3 = Tensor(rng.normal(0, 0.01, size=(H, 3))), Tensor(np.full((1, 3), -2.0))
+    Z = Tensor(rng.normal(0, 0.05, size=(nb, 2)))
+    Wm = Tensor(rng.normal(0, 0.05, size=(2, 3)))
+    lo_ea, hi_ea = PINN2_EA_RANGE
+    raw = {"k_sei": math.log(0.004), "k_pl": math.log(0.01), "k_lam": math.log(0.05),
+           "ea": math.log((30.0 - lo_ea) / (hi_ea - 30.0)),      # sigmoid -> Ea = 30 kJ/mol at the start
+           "b_C": math.log(math.e - 1), "a_c": math.log(math.e ** 0.3 - 1), "a_I": math.log(math.e ** 0.3 - 1),
+           "a_V": math.log(math.e ** 0.3 - 1), "c": math.log(2.0), "g": 0.0, "g_e": 0.0, "kappa": math.log(0.2)}
+    phys = {k: Tensor([[v]]) for k, v in raw.items()}
+    params = [W1, Wz, b1, W2, b2, W3, b3, Z, Wm] + list(phys.values())
+    sel = [Tensor(np.eye(3)[:, [j]]) for j in range(3)]
+
+    def pos(t: Tensor) -> Tensor:                           # >= 0 (softplus)
+        return t.softplus()
+
+    def ea_kj() -> Tensor:
+        return (1.0 / (1.0 + (-phys["ea"]).exp())) * (hi_ea - lo_ea) + lo_ea
+
+    def states(X, OH):
+        zr = Tensor(OH) @ Z
+        h = (Tensor(X) @ W1 + zr @ Wz + b1).tanh()
+        h = (h @ W2 + b2).tanh()
+        st_ = (h @ W3 + b3).softplus() * 0.25 * Tensor(X[:, [0]])
+        return [st_ @ sel[j] for j in range(3)], zr
+
+    w_dq, w_re = float(p.get("dq_weight", 1.0)), float(p.get("re_weight", 1.0))
+
+    def loss_obs(S):
+        lsei, lpl, lam = S
+        soh_p = (1.0 - lsei - lpl) * (1.0 - lam)
+        L = ((soh_p - Tensor(Yd[:, None])).square()).mean() * (1 / 0.01 ** 2)
+        r_p = 1.0 + lsei * phys["g"].exp() * 10.0
+        L = L + (((r_p - Tensor(O["r"][0])) * Tensor(O["r"][1])).square()).mean() * (0.3 / 0.02 ** 2)
+        re_p = 1.0 + lsei * phys["g_e"].exp() * 10.0
+        L = L + (((re_p - Tensor(O["re"][0])) * Tensor(O["re"][1])).square()).mean() * (w_re / 0.03 ** 2)
+        dqs_p = 1.0 - lam
+        L = L + (((dqs_p - Tensor(O["dqs"][0])) * Tensor(O["dqs"][1])).square()).mean() * (w_dq / 0.01 ** 2)
+        dql_p = (lsei + lpl) * phys["kappa"].exp() * 1000.0
+        L = L + (((dql_p - Tensor(O["dql"][0])) * Tensor(O["dql"][1])).square()).mean() * (w_dq / 5.0 ** 2)
+        return L
+
+    hstep = 0.01
+    Xc2 = Xc.copy()
+    Xc2[:, 0] += hstep
+    xT, xC, xI, xIc, xV = (Tensor(Xc[:, [k]]) for k in (1, 2, 3, 4, 5))
+    opt = Adam(params, lr=float(p["learning_rate"]))
+    hist: List[float] = []
+    for it in range(int(p["iterations"])):
+        S, _ = states(Xd, OHd)
+        loss = loss_obs(S)
+        S1, zr = states(Xc, OHc)
+        S2, _ = states(Xc2, OHc)
+        m = (zr @ Wm).exp()
+        dsei, dpl, dlam = ((S2[j] - S1[j]) * (1 / hstep) for j in range(3))
+        b_T = ea_kj() * (1.0 / R_GAS)
+        f_sei = phys["k_sei"].exp() * (m @ sel[0]) * (b_T * xT).exp() / (S1[0] + 0.005)
+        f_pl = phys["k_pl"].exp() * (m @ sel[1]) * (pos(phys["b_C"]) * xC + pos(phys["a_c"]) * xIc).exp() \
+            * (1.0 + phys["c"].exp() * S1[2] * 20.0)
+        f_lam = phys["k_lam"].exp() * (m @ sel[2]) * (pos(phys["a_I"]) * xI + pos(phys["a_V"]) * xV).exp()
+        res = ((dsei - f_sei).square() + (dpl - f_pl).square() + (dlam - f_lam).square()).mean() * (1 / 0.05 ** 2)
+        loss = loss + res * float(p["physics_weight"]) + (Z.square()).mean() * 1e-2
+        for q in params:
+            q.grad = np.zeros_like(q.data)
+        loss.backward()
+        opt.step()
+        hist.append(float(loss.data))
+        if p.get("early_stop", True) and it >= 600 and it % 100 == 0:
+            now, before = float(np.mean(hist[-50:])), float(np.mean(hist[-350:-300]))
+            if before > 0 and (before - now) / before < 0.002:
+                break
+
+    def sp(x: float) -> float:
+        return float(np.log1p(np.exp(x)))
+
+    ph = {k: float(v.data[0, 0]) for k, v in phys.items()}
+    learned = {PINN2_TERMS["Ea"]: float(ea_kj().data[0, 0]), PINN2_TERMS["b_C"]: sp(ph["b_C"]),
+               PINN2_TERMS["a_c"]: sp(ph["a_c"]), PINN2_TERMS["a_I"]: sp(ph["a_I"]), PINN2_TERMS["a_V"]: sp(ph["a_V"]),
+               PINN2_TERMS["c"]: math.exp(ph["c"]), PINN2_TERMS["g"]: math.exp(ph["g"]) * 10,
+               PINN2_TERMS["g_e"]: math.exp(ph["g_e"]) * 10, PINN2_TERMS["kappa"]: math.exp(ph["kappa"]) * 1000,
+               PINN2_TERMS["k_sei"]: math.exp(ph["k_sei"]), PINN2_TERMS["k_pl"]: math.exp(ph["k_pl"]),
+               PINN2_TERMS["k_lam"]: math.exp(ph["k_lam"])}
+
+    def predict(i: int, a: np.ndarray) -> Dict[str, np.ndarray]:
+        b = bats[i]
+        X = np.column_stack([a] + [np.full(len(a), b[k]) for k in keys[1:]])
+        S, _ = states(X, np.eye(nb)[np.full(len(a), i)])
+        lsei, lpl, lam = (s_.data[:, 0] for s_ in S)
+        return {"SOH": (1 - lsei - lpl) * (1 - lam), "LLI by SEI growth": lsei, "LLI by lithium plating": lpl,
+                "Loss of active material": lam, "R_rel": 1 + lsei * math.exp(ph["g"]) * 10,
+                "Re_rel": 1 + lsei * math.exp(ph["g_e"]) * 10, "dq_scale": 1 - lam,
+                "dq_lli_mV": (lsei + lpl) * math.exp(ph["kappa"]) * 1000}
+
+    return {"predict": predict, "learned": learned}
+
+
+def _pinn1_predict_full(fit: Dict[str, Any], i: int, a: np.ndarray) -> Dict[str, np.ndarray]:
+    soh, S = fit["predict"](i, a)
+    return {"SOH": soh, **{k: S[j] for j, k in enumerate(MECHANISMS)}}
+
+
+def pinn_explain(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, train_cells: Sequence[str],
+                 version: int = 2, seeds: Sequence[int] = (0, 1, 2), model_params: Optional[Dict[str, Any]] = None,
+                 progress: ProgressFn = None) -> Dict[str, Any]:
+    """Explain a battery's recorded life with the PINN: fitted on the training batteries and this battery's whole
+    history, then read out per cycle (mechanism states and the observables they predict), for several seeds.
+    For version 2 the cycle table must carry the dQ/dV columns (attach_dqdv); missing evidence is simply not used."""
+    p = {"hidden": 32, "iterations": 1500, "learning_rate": 5e-3, "physics_weight": 1.0, **(model_params or {})}
+    pool = [c for c in train_cells if c != cell]
+    build = (lambda c: _pinn2_battery(ct, imp, c)) if version == 2 else (lambda c: _pinn_battery(ct, c))
+    bats = [b for b in (build(c) for c in pool) if b is not None]
+    tgt = build(cell)
+    if tgt is None or len(bats) < 2:
+        raise ValueError("PINN explanation: needs this battery and at least 2 training batteries with 8 valid cycles")
+    for b in bats + [tgt]:
+        b["a_end"] = float(b["a"].max())
+    bl = bats + [tgt]
+    i_t = len(bl) - 1
+    frames, params = [], []
+    for k, s in enumerate(seeds):
+        _report(progress, k / max(len(seeds), 1), f"PINN v{version} · seed {s}")
+        if version == 2:
+            fit = _pinn2_fit(bl, p, int(s))
+            pr = fit["predict"](i_t, tgt["a"])
+            learned = fit["learned"]
+        else:
+            fit = _pinn_fit(bl, p, int(s))
+            pr = _pinn1_predict_full(fit, i_t, tgt["a"])
+            ph = fit["phys"]
+            learned = {"Activation energy, SEI (kJ/mol)": ph["b_T"] * R_GAS, PINN_TERMS["b_C"]: ph["b_C"],
+                       PINN_TERMS["a_I"]: ph["a_I"], PINN_TERMS["a_L"]: ph["a_L"]}
+        fr = pd.DataFrame({"n": tgt["n"], "SOH observed": tgt["soh"], **{f"{k} (model)" if k in ("SOH",) else k: v
+                                                                          for k, v in pr.items()}})
+        fr["seed"] = int(s)
+        if version == 2:
+            for k_obs, col in (("dqs", "dq_scale observed"), ("dql", "dq_lli_mV observed"), ("re", "Re_rel observed"),
+                               ("r", "R_rel observed")):
+                arr = tgt.get(k_obs)
+                fr[col] = arr if arr is not None else np.nan
+        frames.append(fr)
+        params.append({"seed": int(s), **learned})
+    _report(progress, 1.0, "PINN explanation done")
+    allf = pd.concat(frames, ignore_index=True)
+    last = allf.sort_values("n").groupby("seed").tail(1).set_index("seed")
+    tot = last[list(MECHANISMS)].clip(lower=0).sum(axis=1).replace(0, np.nan)
+    shares = last[list(MECHANISMS)].clip(lower=0).div(tot, axis=0)
+    dom = shares.idxmax(axis=1)
+    summ = pd.DataFrame({"share mean": shares.mean(), "share SD": shares.std(ddof=1) if len(shares) > 1 else 0.0,
+                         "capacity fraction at the last cycle": last[list(MECHANISMS)].mean()})
+    return {"frames": allf, "params": pd.DataFrame(params), "attribution": summ,
+            "dominant": dom.mode().iloc[0] if len(dom) else None,
+            "dominant_agreement": f"{int((dom == dom.mode().iloc[0]).sum())}/{len(dom)}" if len(dom) else "",
+            "version": version, "cell": cell, "train_cells": pool, "seeds": list(seeds)}

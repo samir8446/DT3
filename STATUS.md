@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.15.2 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.16.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.15.2"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.15.2"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.16.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.16.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -42,6 +42,15 @@ Live twin: replay with ECM dual EKF, mechanistic PF, power-law PF, adaptive tren
 update-frequency study; measurement ablation.
 
 ## 4. Decisions (do not reopen without new evidence)
+- MISSION 2 CLOSED (2026-10-21): update study complete for Hot, Reference, Cold (B0045-B0048), Pulsed; Cold B0041
+  and the frozen-model vs filters scoreboards dropped by user decision.
+- NEXT PHASE "full-signal physics": (1) dQ/dV degradation-mode indicators, (2) PINN v2 (all relevant NASA signals as
+  inputs and targets, cross-group training, plating by charge, LAM by cut-off/DoD, priors), (3) all levels get
+  dQ/dV + EIS inputs, (4) assessment capacity-based vs full-signal; synthetic benchmark with known mechanisms.
+- Role of the PINN (2026-10-21): the twin's EXPLANATORY model (mechanism attribution: SEI, plating, LAM); ML/DL are
+  its accuracy benchmark. No tuning of the test to make it win. Next focus after Mission 2: can the attribution be
+  trusted? (identifiability, seed stability, validation against EIS Re/Rct, physics fixes: plating driven by charge
+  current/temperature, cut-off voltage as input, low-capacity outliers).
 - No frozen-model update study for Mixed conditions (user decision, 2026-10-21): conditions change during the test,
   so updating against measured capacity mixes ageing with load/temperature effects; at reference condition only
   15-29 gapped cycles remain. Mixed stays an exploratory assessment group only.
@@ -226,16 +235,45 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - Two runs with the toggle off were invalid (scored capacity jumps, not ageing); v5.15.2 fixes the data rule, but
   the study is dropped for Mixed by decision.
 
-## 6. Next steps (week of 2026-10-19; close Mission 2)
-1. USER: update study Cold B0041 (10 and never) -> update study then complete (Hot, Reference, Cold, Pulsed).
-2. USER: run the 80-test suite once (pytest tests/).
-3. USER: python scripts/pinn_seeds.py --master battery_master_data.parquet --imp impedance_ground_truth.parquet
-   (Hot, Cold, Mixed; seeds 0-4; resumes). Send pinn_seeds_runs.csv and pinn_seeds_summary.csv.
-4. USER: Live model scoreboard (frozen model, lab anchor, retrain never) for one battery per group: B0005, B0029,
-   B0045, B0025.
-5. Physics write-up "Why physics-informed learning helps at 43 C and fails at 4 C" (5k + seeds + papers).
-6. Framing check of slides and summary; weekly presentation: four groups of the update study, filters, physics.
-7. Then Mission 3: end-of-life prediction with uncertainty -> Operations.
+## 5o. Attribution check on synthetic data (scripts/pinn_seeds.py, 2 seeds, demo Reference)
+- Synthetic fade is a lumped linear throughput law (no mechanisms), yet the PINN attributes ~77 % to LAM, stable
+  across seeds (SD 0-10 %): the attribution follows the curve shape. Stable is not correct: EIS validation needed.
+
+## 5p. PINN seeds study (scripts/pinn_seeds.py, v5.15.1, seeds 0-4, Hot/Cold/Mixed; two runs identical)
+- Accuracy (mean over seeds, PINN vs ablation): Hot 0.95 vs 1.43, PINN better on 4/4 batteries (16/20 runs) and
+  far more stable (seed SD 0.01-0.06 vs 0.26-0.86): the Hot physics benefit is now REAL. Mixed 0.43 vs 1.56 (5/6;
+  B0042-44 large gains). Cold 7.92 vs 4.94: physics harms B0045 (15.84 vs 2.31) and B0047 (8.61 vs 3.61).
+- Attribution (share at last cycle, mean +- SD over seeds): plating and LAM trade off between seeds (e.g. B0029
+  plating 26+-39 / LAM 70+-39; B0042-44 plating ~80+-40): plating vs LAM NOT identifiable. Stable cases are LAM-
+  dominated (B0031 86 %, B0045 91 %, B0047 83 %) - the shape LAM gets on synthetic linear fade too. SEI share small
+  (Hot 4-8 %) though 43 C should favour SEI; Cold cells mostly LAM (plating 2-4 %) though 4 C should favour plating.
+- Parameters: SEI activation energy 22.6-22.7 kJ/mol with SD ~0.1 in Hot and Mixed, cold sensitivity 1.000 +- 0
+  in Hot and Mixed: they stay at their starting values (inputs constant within a group -> not learnable);
+  LAM current sensitivity in Cold -0.53 +- 0.59 (sign undetermined).
+- Conclusion: the PINN is a good, stable forecaster in Hot and Mixed, but its mechanism attribution cannot be
+  trusted yet. Next (physics chapter): train across groups so temperature/current vary; add independent signals
+  (EIS Re/Rct, incremental-capacity dQ/dV peak shifts = LLI vs peak area loss = LAM); plating driven by charge.
+
+## 5q. dQ/dV method (scripts/dqdv_features.py, 2026-10-21)
+- Per clean cycle, discharge and CC charge: Q(V) from current integration, IR-corrected (V +- I*R_dc), smoothed,
+  dQ/dV on a 5 mV grid; main peaks (position, height, area); fit Q_n(V) = a * Q_ref(V - delta) vs first 3 cycles.
+- LLI-like shift = (charge + discharge shift)/2, polarisation = (charge - discharge shift)/2 (polarisation moves the
+  curves in opposite directions, lithium loss in the same direction).
+- Synthetic check (pure capacity scaling + resistance growth): discharge a = SOH within 0.01, LLI-like shift 0-9 mV,
+  polarisation 54-101 mV. tests/test_dqdv.py. Limit: no half-cell references -> indicators, not exact LLI/LAM_PE/NE.
+
+## 5r. PINN v2 in the app (v5.16.0)
+- Section "Level 4 · PINN v2 · Which degradation mechanisms explain this battery's capacity loss?" (Models view).
+- Synthetic check (pure capacity scaling): v2 LAM 94-95 % +- 0.4 (v1 75 % +- 6, plating 16 % +- 5); reproduces the
+  dQ/dV scale (0.858 vs 0.854); SEI Ea learned 25.6-26.0 kJ/mol across seeds (v1: stuck at its start).
+
+## 6. Next steps (full-signal physics phase)
+1. USER: upload v5.16.0 (twin_engine.py, app.py, scripts/dqdv_features.py, tests/test_dqdv.py) to GitHub; CI green.
+2. USER: in the app, Models & forecasting -> PINN v2 section, "All groups", 3 seeds, v1 comparison ON, for B0005,
+   B0029, B0045, B0047, B0025. Send the mechanism CSVs and camera images (mechanism chart, evidence check, table).
+3. Interpret against electrochemistry (43 C SEI, 4 C plating, 2.0 V cut-off LAM); check evidence agreement.
+4. Then: synthetic benchmark with known mechanisms (e.g. PyBaMM); dQ/dV + EIS inputs for all levels; assessment
+   capacity-based vs full-signal.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

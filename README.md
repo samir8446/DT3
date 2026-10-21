@@ -1,9 +1,39 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.15.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.16.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## PINN v2: degradation mechanisms explained with voltage-curve and impedance evidence (v5.16.0)
+
+1. Engine section 45, dQ/dV degradation-mode indicators for every clean cycle: Q(V) from the current, IR-corrected,
+   smoothed, dQ/dV on a 5 mV grid, main peaks, fit Q_n(V) = a * Q_ref(V - delta). Per cycle: scale a (LAM-like),
+   LLI-like shift = (charge + discharge shift) / 2, polarisation = (charge - discharge shift) / 2.
+   dqdv_cell, dqdv_modes, dqdv_indicators, attach_dqdv. scripts/dqdv_features.py now uses these.
+2. Engine section 46, PINN v2 (_pinn2_fit, pinn_explain): inputs add charge current and depth of discharge; plating
+   driven by cold and charge current, LAM by discharge current and depth of discharge, SEI Arrhenius with Ea bounded
+   to 20-80 kJ/mol; sensitivities non-negative; must reproduce SOH, R_dc, EIS Re (SEI film), dQ/dV scale (= 1 - LAM)
+   and dQ/dV shift (= kappa * LLI). Trained on several groups; attribution with its spread over seeds.
+   PINN v1 is untouched (output identical before and after: checked with a fingerprint).
+3. App, Models & forecasting: new section "Level 4 · PINN v2 · Which degradation mechanisms explain this battery's
+   capacity loss?": dQ/dV curves and indicators of the selected battery; explanation run (train on all constant-
+   condition groups or this group; 1/3/5 seeds; optional PINN v1 comparison): mechanisms stacked over life against
+   the measured loss, v2 vs v1 attribution table (mean +- SD), evidence check (dQ/dV scale, shift, Re: observed vs
+   model), learned physics, electrochemical expectation of the group, stamped CSV. Mixed and corrupted batteries get
+   the dQ/dV analysis only.
+4. Tests: tests/test_dqdv.py (3): pure-scaling synthetic recovered; dQ/dV columns attached; PINN v2 reproduces the
+   evidence and keeps its bounds. 18 tests pass; AppTest: new section renders and runs; all views.
+
+## Update study uses the assessment's data rule (v5.15.2, bug fix)
+
+1. The frozen-model update study now uses the same data as the accuracy assessment, whatever the control-bar
+   toggle says: Mixed conditions at each battery's reference condition, every other group as recorded. Before, it
+   followed the Reference-condition toggle, and two Mixed runs with the toggle off scored capacity jumps at load and
+   temperature changes instead of ageing (never/no-anchor 8.6-23.0 vs ~0.7 in the assessment).
+2. A caption says so for Mixed batteries; the study CSV records the data mode ("data" column).
+3. Checked: AppTest with demo batteries relabelled as Mixed and the toggle off (reference data used, no errors);
+   15 tests; all views.
 
 ## Frozen-model panel in the Live twin (v5.15.1)
 
