@@ -1,9 +1,22 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.17.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.18.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Shared physics on the real NASA batteries (v5.18.0)
+
+1. Engine section 48: nasa_physics_fit, nasa_physics_table, nasa_physics_trajectory. The model that passed the
+   recovery test (one shared parameter set, SEI / plating / LAM from exact rate-law solutions) fitted to every
+   battery of Reference, High current, Hot, Cold and Pulsed load at once, from many starts. Real data: cleaned
+   capacity, relative load-step resistance, missing values skipped; Re optionally held OUT and used as a check
+   (rank correlation of the SEI state with the measured Re).
+2. App, Models & forecasting, after the recovery test: "Level 4 · Shared physics on the NASA batteries": checks first
+   (agreement between starts, fit error per battery, learned physics and bounds, held-out Re check), split of every
+   battery by group, group means against electrochemical expectations, per-battery table, trajectory of a chosen
+   battery, CSV.
+3. 21 tests pass; AppTest: section renders and runs; all views.
 
 ## Recovery test in the app: can a model find the TRUE mechanisms? (v5.17.0)
 

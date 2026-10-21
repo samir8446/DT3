@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.17.0"
+ENGINE_VERSION = "5.18.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -9552,3 +9552,136 @@ def recovery_pinn_table(ct: pd.DataFrame, imp: pd.DataFrame, ts: pd.DataFrame, t
                      "spread over seeds (points)": 100 * float(at["share SD"].fillna(0).max())})
     _report(progress, 1.0, "done")
     return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 48. SHARED-PHYSICS MECHANISM MODEL ON THE NASA BATTERIES
+# =============================================================================
+# The model that passed the recovery test (section 47): ONE set of physics parameters for all batteries, SEI /
+# plating / LAM from exact solutions of their rate laws in throughput, fitted to every battery of the constant-
+# condition groups at once from many starts. Differences between batteries can only come from their conditions
+# (temperature, charge and discharge current, depth of discharge), which is what makes the split identifiable.
+# Real data: cleaned capacity (regeneration transients dropped, 3-cycle median), relative load-step resistance,
+# missing values skipped, noise 1 SOH point / 3 % resistance. Re can be held OUT of the fit and used only as an
+# independent check of the SEI share (Spearman correlation of the model's SEI state with the measured Re).
+NASA_PHYSICS_GROUPS = ("Reference", "High current", "Hot", "Cold", "Pulsed load")
+
+
+def _nasa_conditions(ct: pd.DataFrame, cells: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    out = {}
+    for c in cells:
+        d = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
+        if len(d) < 10:
+            continue
+        k = clean_capacity(d)
+        if len(k) < 8:
+            continue
+        Tk = float(d["T_mean_C"].median()) + 273.15
+        ic = float(d["I_ch_A"].median()) if "I_ch_A" in d and d["I_ch_A"].notna().any() else 1.5
+        r = k["R_dc_ohm"].astype(float) if "R_dc_ohm" in k else pd.Series(np.nan, index=k.index)
+        r0 = float(r.head(5).median()) if r.notna().sum() >= 5 else np.nan
+        out[c] = {"x_t": 1 / 298.15 - 1 / Tk, "cold": max(0.0, T_COLD_C - (Tk - 273.15)) / 10,
+                  "x_ic": math.log(max(ic, 0.1) / 1.5), "x_i": math.log(max(float(d["I_dis_A"].median()), 0.1) / 2.0),
+                  "depth": max(0.0, 2.7 - float(d["V_min_V"].median())) / 0.7,
+                  "a": (k["cum_Ah"].to_numpy(float) - float(d["cum_Ah"].iloc[0])) / PINN_A_SCALE,
+                  "n": k["n"].to_numpy(float), "soh": k["SOH"].rolling(3, center=True, min_periods=1).median().to_numpy(float),
+                  "r": (r / r0).rolling(5, center=True, min_periods=1).median().to_numpy(float) if np.isfinite(r0)
+                  else np.full(len(k), np.nan),
+                  "T_C": Tk - 273.15, "I_dis": float(d["I_dis_A"].median()), "I_ch": ic, "V_cut": float(d["V_min_V"].median())}
+    return out
+
+
+def nasa_physics_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], restarts: int = 30,
+                     use_re: bool = False, seed: int = 0, progress: ProgressFn = None) -> Dict[str, Any]:
+    """Fit the shared physics to real batteries (see the section header). Returns the fits sorted by cost, the
+    per-battery data, and the measured Re (relative) per battery for the check."""
+    from scipy.optimize import least_squares
+    cds = _nasa_conditions(ct, cells)
+    if len(cds) < 3:
+        raise ValueError("shared physics: needs at least 3 batteries with 10 valid cycles")
+    re = {}
+    for c in cds:
+        rr = _re_relative(imp, ct, c)
+        if rr is not None:
+            re[c] = rr
+    names = RECOVERY_PNAMES
+
+    def full(x):
+        return {k: (math.exp(v) if k in RECOVERY_LOG else v) for k, v in zip(names, x)}
+
+    def resid(x):
+        p = full(x)
+        out = []
+        for c, cd in cds.items():
+            s, pl, m = recovery_mechanisms(p, cd)
+            soh = (1 - s - pl) * (1 - m)
+            e = (soh - cd["soh"]) / 0.01
+            out.append(e[np.isfinite(e)])
+            rm = (1 + p["g"] * s) / (1 + p["g"] * s[:5].mean()) - cd["r"]
+            out.append(rm[np.isfinite(rm)] / 0.03)
+            if use_re and c in re:
+                si = np.interp(re[c][0], cd["n"], s)
+                out.append(((1 + p["g_e"] * si) / (1 + p["g_e"] * si[:3].mean()) - re[c][1]) / 0.03)
+        return np.concatenate(out)
+
+    lo = [math.log(RECOVERY_BOUNDS[k][0]) if k in RECOVERY_LOG else RECOVERY_BOUNDS[k][0] for k in names]
+    hi = [math.log(RECOVERY_BOUNDS[k][1]) if k in RECOVERY_LOG else RECOVERY_BOUNDS[k][1] for k in names]
+    rng = np.random.default_rng(seed)
+    fits = []
+    for r_ in range(restarts):
+        _report(progress, r_ / max(restarts, 1), f"shared physics · start {r_ + 1}/{restarts}")
+        try:
+            sol = least_squares(resid, rng.uniform(lo, hi), bounds=(lo, hi), max_nfev=400)
+        except Exception:
+            continue
+        p = full(sol.x)
+        fits.append({"restart": r_, "cost": float(sol.cost), "params": p})
+    _report(progress, 1.0, "shared physics done")
+    if not fits:
+        raise ValueError("shared physics: no start converged")
+    fits.sort(key=lambda f: f["cost"])
+    return {"fits": fits, "data": cds, "re": re, "use_re": use_re}
+
+
+def nasa_physics_table(res: Dict[str, Any], groups: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Per battery: conditions, capacity lost, fit error, mechanism shares (best fit) and their spread over the
+    near-best starts, and the Re check. Plus a summary."""
+    from scipy.stats import spearmanr
+    fits, cds, re = res["fits"], res["data"], res["re"]
+    best = fits[0]
+    near = [f for f in fits if f["cost"] <= best["cost"] * 1.05 + 1.0]
+    rows = []
+    for c, cd in cds.items():
+        shares = []
+        for f in near:
+            s, pl, m = recovery_mechanisms(f["params"], cd)
+            v = np.array([s[-1], pl[-1], m[-1]])
+            shares.append(v / v.sum() if v.sum() > 0 else v)
+        s, pl, m = recovery_mechanisms(best["params"], cd)
+        soh_m = (1 - s - pl) * (1 - m)
+        ok = np.isfinite(cd["soh"])
+        row = {"battery": c, "group": str(groups.loc[c, "Group"]) if groups is not None and c in groups.index else "",
+               "cell temperature (°C)": cd["T_C"], "discharge (A)": cd["I_dis"], "charge (A)": cd["I_ch"],
+               "cut-off (V)": cd["V_cut"], "capacity lost (%)": 100 * (1 - float(cd["soh"][ok][-3:].mean())),
+               "fit error (SOH points)": 100 * float(np.sqrt(np.mean((soh_m[ok] - cd["soh"][ok]) ** 2))),
+               **{f"{k} (%)": 100 * float(shares[0][j]) for j, k in enumerate(MECHANISMS)},
+               "spread over near-best starts (points)": 100 * float(np.std(shares, axis=0).max()) if len(shares) > 1 else 0.0}
+        if c in re and len(re[c][0]) >= 4:
+            si = np.interp(re[c][0], cd["n"], s)
+            rho = spearmanr(si, re[c][1]).correlation
+            row["Re check: rank correlation SEI vs measured Re"] = float(rho) if np.isfinite(rho) else np.nan
+            row["Re growth (%)"] = 100 * (float(np.median(re[c][1][-3:])) - 1)
+        rows.append(row)
+    tab = pd.DataFrame(rows)
+    summ = {"starts": len(fits), "near-best starts": len(near), "learned": best["params"], "use_re": res["use_re"],
+            "mean fit error": float(tab["fit error (SOH points)"].mean()),
+            "max spread": float(tab["spread over near-best starts (points)"].max())}
+    return tab, summ
+
+
+def nasa_physics_trajectory(res: Dict[str, Any], cell: str) -> pd.DataFrame:
+    """Best fit for one battery over its cycles: measured and model SOH, and the three mechanisms."""
+    cd = res["data"][cell]
+    s, pl, m = recovery_mechanisms(res["fits"][0]["params"], cd)
+    return pd.DataFrame({"n": cd["n"], "SOH observed": cd["soh"], "SOH (model)": (1 - s - pl) * (1 - m),
+                         MECHANISMS[0]: s, MECHANISMS[1]: pl, MECHANISMS[2]: m})

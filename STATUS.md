@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.17.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.18.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.17.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.17.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.18.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.18.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -322,15 +322,18 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - DECISION/NEXT: redesign PINN v2 -> shared physics parameters, mechanisms from integrated rate laws (hard), small
   bounded network correction; rerun recovery test on the PINN; then PyBaMM step 2 (misspecified physics).
 
+## 5x. Shared physics on NASA in the app (v5.18.0, 2026-10-21)
+- Section "Level 4 · Shared physics on the NASA batteries" (Models view, after the recovery test); engine section 48.
+- Not yet run on NASA (demo only: pipeline works, starts agree, fit errors shown).
+
 ## 6. Next steps (full-signal physics phase)
-1. USER: upload v5.16.1 (twin_engine.py, app.py, tests/test_dqdv.py) to GitHub; CI green.
-2. PyBaMM benchmark (scripts/pybamm_benchmark.py, in progress, 5u): fix cold calibration, the 0.32 Ah cell, the
-   identifiability bug, add LAM of lithiated material; then the full design: LCO/graphite cells with known LLI, LAM_NE, LAM_PE (each 0-20 %, and
-   mixtures); each cell fully charged (CC-CV to 4.2 V) then discharged at NASA rates (1 A, 2 A, 4 A scaled) and
-   temperatures (4, 24, 43 C); compute the same dQ/dV features (main peak height/width/area/position, shoulder,
-   charge/discharge shift). Result: which features identify which mode at NASA rates.
-3. Only validated features go back into PINN v2 (dq_weight > 0 with the validated mapping); attribution with
-   honest uncertainty where unidentifiable (cold).
+1. USER: upload v5.18.0 (twin_engine.py, app.py, tests/test_recovery.py) to GitHub; CI green; app shows v5.18.0.
+2. USER: in the app, "Shared physics on the NASA batteries", Re held out, 30 starts: send the CSV and camera images
+   (card, split by battery, group means table).
+3. Interpret: uniqueness, fit error per battery, held-out Re check, group means vs electrochemistry (Hot SEI, Cold
+   plating, 2.0 V cut-off LAM). If a group fits badly, extend the physics there (not per-battery freedom).
+4. Score the shared physics as a forecaster in the accuracy assessment (from 30 % of life), next to Mission 2 models.
+5. Redesign PINN v2 = shared physics + small bounded network correction; recovery test; then PyBaMM step 2.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

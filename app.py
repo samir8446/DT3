@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.17.0"
+REQUIRED_ENGINE = "5.18.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -6183,6 +6183,107 @@ def recovery_section() -> None:
              f"recovery_test__v{te.ENGINE_VERSION}.csv", "text/csv", key="rec_csv")
 
 
+
+# ---- Shared physics on the real NASA batteries ----
+@st.cache_data(show_spinner=False, max_entries=8)
+def nasa_physics_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...],
+                        restarts: int, use_re: bool) -> Dict[str, Any]:
+    return te.nasa_physics_fit(_ct, _imp, list(cells), restarts=restarts, use_re=use_re)
+
+
+def fig_nasa_shares(tab: pd.DataFrame, P: Palette) -> go.Figure:
+    order = {"Hot": 0, "High current": 1, "Reference": 2, "Pulsed load": 3, "Cold": 4}
+    t = tab.assign(_o=tab["group"].map(order).fillna(9)).sort_values(["_o", "battery"])
+    fig = go.Figure()
+    for m in te.MECHANISMS:
+        fig.add_trace(go.Bar(x=[t["group"], t["battery"]], y=t[f"{m} (%)"], name=m,
+                             marker_color=MECH_COLORS[MECH_KEYS[m]],
+                             hovertemplate="%{y:.0f} % of the capacity loss<extra>" + m + "</extra>"))
+    fig.update_layout(barmode="stack")
+    fig.update_yaxes(title_text="Share of the capacity loss (%)", range=[0, 100])
+    return style_fig(fig, P, 460, "Shared physics: mechanism split of every NASA battery (last cycle)", hovermode="closest")
+
+
+def fig_nasa_traj(tr: pd.DataFrame, P: Palette, cell: str) -> go.Figure:
+    fig = go.Figure()
+    for m in te.MECHANISMS:
+        fig.add_trace(go.Scatter(x=tr["n"], y=100 * tr[m].clip(lower=0), name=m, stackgroup="mech", mode="lines",
+                                 line=dict(width=0.6, color=MECH_COLORS[MECH_KEYS[m]])))
+    fig.add_trace(go.Scatter(x=tr["n"], y=100 * (1 - tr["SOH observed"]), name="Measured capacity loss", mode="markers",
+                             marker=dict(color=P.text, size=4)))
+    fig.add_trace(go.Scatter(x=tr["n"], y=100 * (1 - tr["SOH (model)"]), name="Model capacity loss",
+                             line=dict(color=P.text, width=1.4, dash="dot")))
+    fig.update_xaxes(title_text="Discharge cycle n")
+    fig.update_yaxes(title_text="Share of initial capacity (%)", rangemode="tozero")
+    return style_fig(fig, P, 420, f"Shared physics fit of {cell}: capacity loss split over life")
+
+
+def nasa_physics_section() -> None:
+    section("Level 4 · Shared physics on the NASA batteries · Which mechanisms explain the real capacity loss?")
+    st.markdown(
+        "The model that **passed the recovery test**: one set of physics parameters for **all** batteries, with SEI "
+        "growth, lithium plating and loss of active material computed from their rate laws, so differences between "
+        "batteries can only come from their **conditions** (temperature, charge and discharge current, depth of "
+        "discharge). It is fitted to every battery of the constant-condition groups at once, from many random starts. "
+        "Check before reading the split: the **fit error** (a battery the model cannot reproduce gets an unreliable "
+        "split), the **agreement between starts** (is the answer unique?), and, if impedance is held out of the fit, "
+        "whether the SEI share follows the **measured Re** it never saw.")
+    groups = te.condition_groups(CT_RAW)
+    cells = tuple(sorted({c for g in te.NASA_PHYSICS_GROUPS for c in te.protocol_cells(CT_RAW, g)}))
+    c1, c2 = st.columns([1.6, 1.0])
+    use_re = c1.toggle("Use impedance Re in the fit", value=False, key="np_re",
+                       help="Off (recommended): Re is held out and only used to check the SEI share. On: Re helps fit the "
+                            "SEI share, and can no longer check it.")
+    restarts = c2.select_slider("Random starts", [10, 30], value=30, key="np_starts")
+    st.caption(f"{len(cells)} batteries: " + ", ".join(cells))
+    cfg = (DATA_KEY_RAW, cells, int(restarts), bool(use_re))
+    if st.button("Fit the shared physics to the NASA batteries", key="np_go", type="primary", icon=":material/science:",
+                 disabled=len(cells) < 3):
+        try:
+            with st.spinner("Fitting one physics to all batteries from many starts…"):
+                res = nasa_physics_cached(CT_RAW, imp, DATA_KEY_RAW, cells, int(restarts), bool(use_re))
+            st.session_state["np"] = {"cfg": cfg, "res": res}
+        except Exception as exc:
+            report_error("Shared physics fit failed", exc, debug)
+    saved = st.session_state.get("np")
+    if not saved:
+        placeholder("Press 'Fit the shared physics to the NASA batteries': the split of every battery, the fit quality and "
+                    "the checks appear here.")
+        return
+    if saved["cfg"] != cfg:
+        st.warning("Settings changed since the last run; the results below use the previous settings.")
+    res = saved["res"]
+    tab, s = te.nasa_physics_table(res, groups)
+    L = s["learned"]
+    lines = [f"{s['near-best starts']} of {s['starts']} starts reach the best fit; their splits differ by at most "
+             f"{s['max spread']:.1f} share points" + (" (unique answer)." if s["max spread"] < 2 else " (NOT unique)."),
+             f"Mean fit error {s['mean fit error']:.2f} SOH points over {len(tab)} batteries.",
+             f"Learned physics: SEI activation energy {L['Ea']:.1f} kJ/mol; plating cold sensitivity {L['b_C']:.2f}, "
+             f"charge-current sensitivity {L['a_c']:.2f}; LAM current sensitivity {L['a_I']:.2f}, depth sensitivity "
+             f"{L['a_V']:.2f}. Values at a bound (Ea 20 or 80; sensitivities 0 or 5) were not determined by the data."]
+    if "Re check: rank correlation SEI vs measured Re" in tab and not s["use_re"]:
+        rc = tab["Re check: rank correlation SEI vs measured Re"].dropna()
+        if len(rc):
+            lines.append(f"Re check (held out): the model's SEI state rises with the measured Re on {int((rc > 0.5).sum())} "
+                         f"of {len(rc)} batteries with impedance data (rank correlation > 0.5).")
+    card("Shared physics on NASA", lines)
+    show(fig_nasa_shares(tab, P), key="np_shares", data=tab)
+    gm = tab.groupby("group")[[f"{m} (%)" for m in te.MECHANISMS] + ["capacity lost (%)", "fit error (SOH points)"]].mean()
+    show_table(gm.style.format("{:.1f}"), note="Mean per group. Electrochemistry expects more SEI growth in Hot, more "
+                                               "plating in Cold (charging in the cold), more loss of active material with "
+                                               "deep discharge and high current.")
+    show_table(tab.set_index("battery").style.format(precision=2, na_rep="—"),
+               note="Fit error above ~2 SOH points: the model does not reproduce that battery well; read its split with "
+                    "caution.")
+    pick = st.selectbox("Battery to inspect", list(res["data"]), key="np_cell",
+                        index=list(res["data"]).index(cell) if cell in res["data"] else 0)
+    show(fig_nasa_traj(te.nasa_physics_trajectory(res, pick), P, pick), key="np_traj")
+    download("Download the shared-physics results (CSV)",
+             tab.assign(**{"app version": te.ENGINE_VERSION, "Re in fit": s["use_re"],
+                           **{f"learned {k}": v for k, v in L.items()}}).to_csv(index=False).encode(),
+             f"shared_physics_NASA__v{te.ENGINE_VERSION}.csv", "text/csv", key="np_csv")
+
+
 def pinn_section() -> None:
     model_level_section(
         4, "Level 4 · Physics-informed neural network: does knowing the physics improve the prediction?",
@@ -6226,6 +6327,7 @@ def view_models() -> None:
     pinn_section()
     pinn_v2_section()
     recovery_section()
+    nasa_physics_section()
     ladder_leaderboard()
     assessment_section()
 
