@@ -25,3 +25,15 @@ def test_nasa_physics_fit_runs_on_cycle_tables():
     assert 20 <= s["learned"]["Ea"] <= 80
     tr = te.nasa_physics_trajectory(res, cells[0])
     assert {"SOH observed", "SOH (model)"} <= set(tr.columns) and len(tr) > 10
+
+
+def test_nasa_physics_v2_no_plating_when_warm():
+    master, imp, _ = te.make_synthetic_master(n_cells=6, n_cycles=80, seed=7, ambients=(24, 43, 4, 24, 43, 4),
+                                              currents=(2, 2, 2, 4, 1, 1))
+    ct = te.build_cycle_table_with_report(te.ParquetStore.from_dataframe(master))[0]
+    cells = sorted(ct["Cell_ID"].unique())
+    res = te.nasa_physics_fit(ct, imp, cells, restarts=3, version=2, fit_with="Re")
+    tab, s = te.nasa_physics_table(res, te.condition_groups(ct))
+    warm = tab["cell temperature (°C)"] > te.T_COLD_C
+    assert warm.any() and (tab.loc[warm, "LLI by lithium plating (%)"] == 0).all()
+    assert s["version"] == 2 and not s["fit_r"] and isinstance(s["at_bound"], list)

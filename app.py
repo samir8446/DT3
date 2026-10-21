@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.18.0"
+REQUIRED_ENGINE = "5.19.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -6187,8 +6187,14 @@ def recovery_section() -> None:
 # ---- Shared physics on the real NASA batteries ----
 @st.cache_data(show_spinner=False, max_entries=8)
 def nasa_physics_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...],
-                        restarts: int, use_re: bool) -> Dict[str, Any]:
-    return te.nasa_physics_fit(_ct, _imp, list(cells), restarts=restarts, use_re=use_re)
+                        restarts: int, version: int, fit_with: str) -> Dict[str, Any]:
+    return te.nasa_physics_fit(_ct, _imp, list(cells), restarts=restarts, version=version, fit_with=fit_with)
+
+
+NP_VERSIONS = {"Version 2: plating only below 15 °C, knee term, no charge-current term (recommended)": 2,
+               "Version 1: first fit (plating at any temperature)": 1}
+NP_EVIDENCE = {"Impedance Re (SEI film); check with the load-step resistance": "Re",
+               "Load-step resistance; check with Re": "R_dc"}
 
 
 def fig_nasa_shares(tab: pd.DataFrame, P: Palette) -> go.Figure:
@@ -6230,18 +6236,22 @@ def nasa_physics_section() -> None:
         "whether the SEI share follows the **measured Re** it never saw.")
     groups = te.condition_groups(CT_RAW)
     cells = tuple(sorted({c for g in te.NASA_PHYSICS_GROUPS for c in te.protocol_cells(CT_RAW, g)}))
-    c1, c2 = st.columns([1.6, 1.0])
-    use_re = c1.toggle("Use impedance Re in the fit", value=False, key="np_re",
-                       help="Off (recommended): Re is held out and only used to check the SEI share. On: Re helps fit the "
-                            "SEI share, and can no longer check it.")
-    restarts = c2.select_slider("Random starts", [10, 30], value=30, key="np_starts")
+    c1, c2, c3 = st.columns([1.6, 1.4, 0.7])
+    ver = NP_VERSIONS[c1.radio("Model", list(NP_VERSIONS), key="np_ver",
+                               help="Version 1 let plating run at any temperature and used it as a catch-all for steady "
+                                    "fade at 30-40 °C. Version 2 follows electrochemistry: no plating above 15 °C cell "
+                                    "temperature; no charge-current term, because NASA charged every battery at 1.5 A; "
+                                    "a shared knee term for accelerating fade.")]
+    fit_with = NP_EVIDENCE[c2.radio("Fit the SEI to", list(NP_EVIDENCE), key="np_ev",
+                                    help="The other resistance measurement is held out and only used as a check.")]
+    restarts = c3.select_slider("Random starts", [10, 30], value=30, key="np_starts")
     st.caption(f"{len(cells)} batteries: " + ", ".join(cells))
-    cfg = (DATA_KEY_RAW, cells, int(restarts), bool(use_re))
+    cfg = (DATA_KEY_RAW, cells, int(restarts), ver, fit_with)
     if st.button("Fit the shared physics to the NASA batteries", key="np_go", type="primary", icon=":material/science:",
                  disabled=len(cells) < 3):
         try:
             with st.spinner("Fitting one physics to all batteries from many starts…"):
-                res = nasa_physics_cached(CT_RAW, imp, DATA_KEY_RAW, cells, int(restarts), bool(use_re))
+                res = nasa_physics_cached(CT_RAW, imp, DATA_KEY_RAW, cells, int(restarts), ver, fit_with)
             st.session_state["np"] = {"cfg": cfg, "res": res}
         except Exception as exc:
             report_error("Shared physics fit failed", exc, debug)
@@ -6258,14 +6268,20 @@ def nasa_physics_section() -> None:
     lines = [f"{s['near-best starts']} of {s['starts']} starts reach the best fit; their splits differ by at most "
              f"{s['max spread']:.1f} share points" + (" (unique answer)." if s["max spread"] < 2 else " (NOT unique)."),
              f"Mean fit error {s['mean fit error']:.2f} SOH points over {len(tab)} batteries.",
-             f"Learned physics: SEI activation energy {L['Ea']:.1f} kJ/mol; plating cold sensitivity {L['b_C']:.2f}, "
-             f"charge-current sensitivity {L['a_c']:.2f}; LAM current sensitivity {L['a_I']:.2f}, depth sensitivity "
-             f"{L['a_V']:.2f}. Values at a bound (Ea 20 or 80; sensitivities 0 or 5) were not determined by the data."]
-    if "Re check: rank correlation SEI vs measured Re" in tab and not s["use_re"]:
-        rc = tab["Re check: rank correlation SEI vs measured Re"].dropna()
-        if len(rc):
-            lines.append(f"Re check (held out): the model's SEI state rises with the measured Re on {int((rc > 0.5).sum())} "
-                         f"of {len(rc)} batteries with impedance data (rank correlation > 0.5).")
+             f"Learned physics (version {s['version']}): SEI activation energy {L['Ea']:.1f} kJ/mol; plating cold "
+             f"sensitivity {L['b_C']:.2f}; LAM current sensitivity {L['a_I']:.2f}, depth sensitivity {L['a_V']:.2f}"
+             + (f"; knee {L['beta0']:.2f} (depth {L['beta_V']:.2f})." if s["version"] == 2 else
+                f"; charge-current sensitivity {L['a_c']:.2f}."),
+             ("Parameters at a limit (NOT determined by the data): " + ", ".join(s["at_bound"]) + ".") if s["at_bound"]
+             else "No parameter at a limit: all determined by the data."]
+    for col, held, label in (("Re check: rank correlation SEI vs measured Re", not s["use_re"], "measured Re"),
+                             ("R check: rank correlation SEI vs load-step resistance", not s["fit_r"], "load-step resistance")):
+        if col in tab and held:
+            rc = tab[col].dropna()
+            if len(rc):
+                lines.append(f"Held-out check: the model's SEI rises with the {label} on {int((rc > 0.5).sum())} of {len(rc)} "
+                             "batteries (rank correlation > 0.5). Weak alone: any steadily rising quantity correlates; look "
+                             "also at batteries whose resistance does NOT rise.")
     card("Shared physics on NASA", lines)
     show(fig_nasa_shares(tab, P), key="np_shares", data=tab)
     gm = tab.groupby("group")[[f"{m} (%)" for m in te.MECHANISMS] + ["capacity lost (%)", "fit error (SOH points)"]].mean()
@@ -6279,7 +6295,8 @@ def nasa_physics_section() -> None:
                         index=list(res["data"]).index(cell) if cell in res["data"] else 0)
     show(fig_nasa_traj(te.nasa_physics_trajectory(res, pick), P, pick), key="np_traj")
     download("Download the shared-physics results (CSV)",
-             tab.assign(**{"app version": te.ENGINE_VERSION, "Re in fit": s["use_re"],
+             tab.assign(**{"app version": te.ENGINE_VERSION, "model version": s["version"], "Re in fit": s["use_re"],
+                           "R_dc in fit": s["fit_r"], "parameters at a limit": " ".join(s["at_bound"]),
                            **{f"learned {k}": v for k, v in L.items()}}).to_csv(index=False).encode(),
              f"shared_physics_NASA__v{te.ENGINE_VERSION}.csv", "text/csv", key="np_csv")
 

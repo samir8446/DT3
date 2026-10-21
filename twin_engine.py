@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.18.0"
+ENGINE_VERSION = "5.19.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -9565,6 +9565,34 @@ def recovery_pinn_table(ct: pd.DataFrame, imp: pd.DataFrame, ts: pd.DataFrame, t
 # missing values skipped, noise 1 SOH point / 3 % resistance. Re can be held OUT of the fit and used only as an
 # independent check of the SEI share (Spearman correlation of the model's SEI state with the measured Re).
 NASA_PHYSICS_GROUPS = ("Reference", "High current", "Hot", "Cold", "Pulsed load")
+# Version 2 (v5.19): plating only below T_COLD_C (zero when warm: version 1 used plating as a catch-all for steady fade
+# at 30-40 C); no charge-current term (NASA charged every battery at 1.5 A: not learnable); a shared knee term
+# (LAM accelerating with throughput, faster with deeper discharge); fit to Re or to the load-step resistance, the
+# other one kept as the independent check.
+NASA_V2_PNAMES = ("k_sei", "Ea", "k_pl", "b_C", "k_lam", "a_I", "a_V", "beta0", "beta_V", "g", "g_e")
+NASA_V2_LOG = {"k_sei", "k_pl", "k_lam", "beta0"}
+NASA_V2_BOUNDS = {"k_sei": (1e-5, 1e-1), "Ea": (20.0, 80.0), "k_pl": (1e-5, 1.0), "b_C": (0.0, 5.0),
+                  "k_lam": (1e-5, 1e-1), "a_I": (0.0, 5.0), "a_V": (0.0, 5.0), "beta0": (1e-3, 10.0),
+                  "beta_V": (0.0, 5.0), "g": (0.0, 20.0), "g_e": (0.0, 20.0)}
+
+
+def nasa_mechanisms_v2(p: dict, cd: dict):
+    """Exact solutions: SEI self-limiting Arrhenius; plating only in the cold; LAM with a knee
+    dm/da = f_lam * exp(beta a), beta = beta0 * exp(beta_V * depth)."""
+    a = cd["a"]
+    f_sei = p["k_sei"] * math.exp(p["Ea"] * 1e3 / R_GAS * cd["x_t"])
+    s = np.sqrt(0.005 ** 2 + 2 * f_sei * a) - 0.005
+    pl = p["k_pl"] * cd["cold"] * math.exp(p["b_C"] * cd["cold"]) * a
+    f_lam = p["k_lam"] * math.exp(p["a_I"] * cd["x_i"] + p["a_V"] * cd["depth"])
+    beta = p["beta0"] * math.exp(p["beta_V"] * cd["depth"])
+    m = f_lam * np.expm1(beta * a) / beta
+    return s, pl, m
+
+
+def _nasa_spec(version: int):
+    if version == 2:
+        return NASA_V2_PNAMES, NASA_V2_LOG, NASA_V2_BOUNDS, nasa_mechanisms_v2
+    return RECOVERY_PNAMES, RECOVERY_LOG, RECOVERY_BOUNDS, recovery_mechanisms
 
 
 def _nasa_conditions(ct: pd.DataFrame, cells: Sequence[str]) -> Dict[str, Dict[str, Any]]:
@@ -9592,7 +9620,8 @@ def _nasa_conditions(ct: pd.DataFrame, cells: Sequence[str]) -> Dict[str, Dict[s
 
 
 def nasa_physics_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], restarts: int = 30,
-                     use_re: bool = False, seed: int = 0, progress: ProgressFn = None) -> Dict[str, Any]:
+                     use_re: bool = False, seed: int = 0, progress: ProgressFn = None, version: int = 1,
+                     fit_with: Optional[str] = None) -> Dict[str, Any]:
     """Fit the shared physics to real batteries (see the section header). Returns the fits sorted by cost, the
     per-battery data, and the measured Re (relative) per battery for the check."""
     from scipy.optimize import least_squares
@@ -9604,28 +9633,32 @@ def nasa_physics_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Seque
         rr = _re_relative(imp, ct, c)
         if rr is not None:
             re[c] = rr
-    names = RECOVERY_PNAMES
+    names, logs, bounds, mech = _nasa_spec(version)
+    if fit_with is None:                                     # version 1 behaviour: resistance always, Re optional
+        fit_with = "both" if use_re else "R_dc"
+    fit_r, fit_re = fit_with in ("R_dc", "both"), fit_with in ("Re", "both")
 
     def full(x):
-        return {k: (math.exp(v) if k in RECOVERY_LOG else v) for k, v in zip(names, x)}
+        return {k: (math.exp(v) if k in logs else v) for k, v in zip(names, x)}
 
     def resid(x):
         p = full(x)
         out = []
         for c, cd in cds.items():
-            s, pl, m = recovery_mechanisms(p, cd)
+            s, pl, m = mech(p, cd)
             soh = (1 - s - pl) * (1 - m)
             e = (soh - cd["soh"]) / 0.01
             out.append(e[np.isfinite(e)])
-            rm = (1 + p["g"] * s) / (1 + p["g"] * s[:5].mean()) - cd["r"]
-            out.append(rm[np.isfinite(rm)] / 0.03)
-            if use_re and c in re:
+            if fit_r:
+                rm = (1 + p["g"] * s) / (1 + p["g"] * s[:5].mean()) - cd["r"]
+                out.append(rm[np.isfinite(rm)] / 0.03)
+            if fit_re and c in re:
                 si = np.interp(re[c][0], cd["n"], s)
                 out.append(((1 + p["g_e"] * si) / (1 + p["g_e"] * si[:3].mean()) - re[c][1]) / 0.03)
         return np.concatenate(out)
 
-    lo = [math.log(RECOVERY_BOUNDS[k][0]) if k in RECOVERY_LOG else RECOVERY_BOUNDS[k][0] for k in names]
-    hi = [math.log(RECOVERY_BOUNDS[k][1]) if k in RECOVERY_LOG else RECOVERY_BOUNDS[k][1] for k in names]
+    lo = [math.log(bounds[k][0]) if k in logs else bounds[k][0] for k in names]
+    hi = [math.log(bounds[k][1]) if k in logs else bounds[k][1] for k in names]
     rng = np.random.default_rng(seed)
     fits = []
     for r_ in range(restarts):
@@ -9640,7 +9673,8 @@ def nasa_physics_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Seque
     if not fits:
         raise ValueError("shared physics: no start converged")
     fits.sort(key=lambda f: f["cost"])
-    return {"fits": fits, "data": cds, "re": re, "use_re": use_re}
+    return {"fits": fits, "data": cds, "re": re, "use_re": fit_re, "fit_r": fit_r, "version": version,
+            "fit_with": fit_with}
 
 
 def nasa_physics_table(res: Dict[str, Any], groups: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -9648,16 +9682,17 @@ def nasa_physics_table(res: Dict[str, Any], groups: Optional[pd.DataFrame] = Non
     near-best starts, and the Re check. Plus a summary."""
     from scipy.stats import spearmanr
     fits, cds, re = res["fits"], res["data"], res["re"]
+    names, logs, bounds, mech = _nasa_spec(res.get("version", 1))
     best = fits[0]
     near = [f for f in fits if f["cost"] <= best["cost"] * 1.05 + 1.0]
     rows = []
     for c, cd in cds.items():
         shares = []
         for f in near:
-            s, pl, m = recovery_mechanisms(f["params"], cd)
+            s, pl, m = mech(f["params"], cd)
             v = np.array([s[-1], pl[-1], m[-1]])
             shares.append(v / v.sum() if v.sum() > 0 else v)
-        s, pl, m = recovery_mechanisms(best["params"], cd)
+        s, pl, m = mech(best["params"], cd)
         soh_m = (1 - s - pl) * (1 - m)
         ok = np.isfinite(cd["soh"])
         row = {"battery": c, "group": str(groups.loc[c, "Group"]) if groups is not None and c in groups.index else "",
@@ -9671,9 +9706,18 @@ def nasa_physics_table(res: Dict[str, Any], groups: Optional[pd.DataFrame] = Non
             rho = spearmanr(si, re[c][1]).correlation
             row["Re check: rank correlation SEI vs measured Re"] = float(rho) if np.isfinite(rho) else np.nan
             row["Re growth (%)"] = 100 * (float(np.median(re[c][1][-3:])) - 1)
+        okr = np.isfinite(cd["r"])
+        if okr.sum() >= 8:
+            rho = spearmanr(s[okr], cd["r"][okr]).correlation
+            row["R check: rank correlation SEI vs load-step resistance"] = float(rho) if np.isfinite(rho) else np.nan
+            row["resistance growth (%)"] = 100 * (float(np.nanmedian(cd["r"][okr][-5:])) - 1)
         rows.append(row)
     tab = pd.DataFrame(rows)
+    at_bound = [k for k in names if k in bounds and (
+        abs((math.log(best["params"][k]) if k in logs else best["params"][k]) - (math.log(bounds[k][0]) if k in logs else bounds[k][0])) < 1e-3
+        or abs((math.log(best["params"][k]) if k in logs else best["params"][k]) - (math.log(bounds[k][1]) if k in logs else bounds[k][1])) < 1e-3)]
     summ = {"starts": len(fits), "near-best starts": len(near), "learned": best["params"], "use_re": res["use_re"],
+            "fit_r": res.get("fit_r", True), "version": res.get("version", 1), "at_bound": at_bound,
             "mean fit error": float(tab["fit error (SOH points)"].mean()),
             "max spread": float(tab["spread over near-best starts (points)"].max())}
     return tab, summ
@@ -9682,6 +9726,6 @@ def nasa_physics_table(res: Dict[str, Any], groups: Optional[pd.DataFrame] = Non
 def nasa_physics_trajectory(res: Dict[str, Any], cell: str) -> pd.DataFrame:
     """Best fit for one battery over its cycles: measured and model SOH, and the three mechanisms."""
     cd = res["data"][cell]
-    s, pl, m = recovery_mechanisms(res["fits"][0]["params"], cd)
+    s, pl, m = _nasa_spec(res.get("version", 1))[3](res["fits"][0]["params"], cd)
     return pd.DataFrame({"n": cd["n"], "SOH observed": cd["soh"], "SOH (model)": (1 - s - pl) * (1 - m),
                          MECHANISMS[0]: s, MECHANISMS[1]: pl, MECHANISMS[2]: m})

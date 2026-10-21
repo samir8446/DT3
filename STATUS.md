@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.18.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.19.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.18.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.18.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.19.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.19.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -322,17 +322,22 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - DECISION/NEXT: redesign PINN v2 -> shared physics parameters, mechanisms from integrated rate laws (hard), small
   bounded network correction; rerun recovery test on the PINN; then PyBaMM step 2 (misspecified physics).
 
-## 5x. Shared physics on NASA in the app (v5.18.0, 2026-10-21)
-- Section "Level 4 · Shared physics on the NASA batteries" (Models view, after the recovery test); engine section 48.
-- Not yet run on NASA (demo only: pipeline works, starts agree, fit errors shown).
+## 5x. Shared physics on NASA (v5.18.0; Re held out; 30 starts; 20 batteries)
+- Unique (spread 0.01 pts). Group means SEI/plating/LAM (fit error): Hot 55/39/6 (1.6), Pulsed 52/42/6 (2.7),
+  Reference 34/60/7 (6.8), High current 34/56/10 (7.2), Cold 13/85/2 (7.6). Ordering right (SEI hot, plating cold).
+- NOT credible yet: plating dominates at 30-40 C (catch-all for steady fade); charge current is 1.5 A on EVERY NASA
+  battery -> charge-current sensitivity unlearnable (ended at bound 5.0); Ea at 20 (bound), a_I 0, c 0; fit errors
+  9.5-13 pts on B0045, B0041, B0006, B0036, B0033 (knees, regeneration not modelled); held-out Re: Hot Re flat
+  (-1.8 to +2.1 %) while SEI 55 % (contradiction); positive rank correlations elsewhere are weak evidence.
+- Shared physics v2 built (v5.19.0): plating zero above 15 C, no charge-current term, shared knee term, fit SEI to
+  Re (check: load-step resistance) or the reverse; card lists parameters at a limit. To be run on NASA.
 
 ## 6. Next steps (full-signal physics phase)
-1. USER: upload v5.18.0 (twin_engine.py, app.py, tests/test_recovery.py) to GitHub; CI green; app shows v5.18.0.
-2. USER: in the app, "Shared physics on the NASA batteries", Re held out, 30 starts: send the CSV and camera images
-   (card, split by battery, group means table).
-3. Interpret: uniqueness, fit error per battery, held-out Re check, group means vs electrochemistry (Hot SEI, Cold
-   plating, 2.0 V cut-off LAM). If a group fits badly, extend the physics there (not per-battery freedom).
-4. Score the shared physics as a forecaster in the accuracy assessment (from 30 % of life), next to Mission 2 models.
+1. USER: upload v5.19.0 (twin_engine.py, app.py, tests/test_recovery.py); CI green; app shows v5.19.0.
+2. USER: "Shared physics on the NASA batteries" with Version 2, fit SEI to Re, 30 starts. Send CSV + images.
+3. Judge: plating only in Cold; Reference/High current split between SEI and LAM; fit errors (knee batteries);
+   parameters at a limit; held-out load-step resistance check; Hot Re flat vs SEI share.
+4. Score the shared physics as a forecaster in the accuracy assessment (from 30 % of life).
 5. Redesign PINN v2 = shared physics + small bounded network correction; recovery test; then PyBaMM step 2.
 
 ## 7. Open data checks

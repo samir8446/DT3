@@ -1,9 +1,21 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.18.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.19.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Shared physics on NASA, version 2 (v5.19.0)
+
+1. First NASA run (v5.18.0) was unique but not credible: plating dominated at 30-40 C (a catch-all for steady
+   fade), the charge-current sensitivity cannot be learned (every NASA battery charged at 1.5 A), several
+   parameters at their limits, fit errors 9.5-13 SOH points on knee batteries.
+2. Version 2 (nasa_mechanisms_v2): plating only below T_COLD_C = 15 C cell temperature; no charge-current term; a
+   shared knee term (LAM accelerating with throughput, faster with deeper discharge); fit the SEI to Re or to the
+   load-step resistance, the other one held out as a check. Version 1 kept, unchanged.
+3. App: choice of model version and of the evidence; the card lists every parameter that ends at a limit
+   (= not determined by the data) and both held-out checks; CSV records version, evidence and parameters at a limit.
+4. Tests: plating is exactly zero on warm batteries with version 2; 22 tests pass; AppTest; all views.
 
 ## Shared physics on the real NASA batteries (v5.18.0)
 
