@@ -288,9 +288,21 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   LLI and graphite LAM give the same capacity loss (0.936/0.937) and nearly the same main peak -> not separable
   at 1C from the main peak. LiCoO2 LAM gave capacity 1.044: artefact of not re-balancing the electrodes.
 
+## 5u. PyBaMM benchmark, work in progress (scripts/pybamm_benchmark.py, 2026-10-21)
+- Ramadass2004 (LiCoO2/graphite), SPMe, NASA protocol (rest, CC 0.75C to 4.2 V, CV to C/100, rest, discharge at
+  0.5/1/2C to 2.7 V), cells balanced by PyBaMM at 0 % SOC after imposing modes on electrode size (LAM, lithium kept)
+  and cyclable lithium (LLI); Arrhenius factors added (Ramadass has none). ~1 s per cell.
+- Limits found: LLI only up to ~6 % (LiCoO2 OCP table); 4 C far too pessimistic (fresh 1C 0.12 Ah) -> calibrate
+  activation energies to the fresh NASA cold-cell capacity fraction; one mixed cell ended at 0.32 Ah (check);
+  24 C missing from the quick identifiability table (bug); LAM of lithiated material not yet modelled.
+- Preliminary single cells at 1C, 24 C (fresh 1.797 Ah): LLI 4 % -> capacity -5.5 %, main peak height -7 %,
+  +15 mV, LLI-like shift +5 mV; graphite LAM 10 % -> capacity -3 %, peak unchanged (nearly invisible); LiCoO2 LAM
+  10 % -> capacity -11 %, peak height -7 %, -5 mV, LLI-like shift +11 mV. NOT yet results.
+
 ## 6. Next steps (full-signal physics phase)
 1. USER: upload v5.16.1 (twin_engine.py, app.py, tests/test_dqdv.py) to GitHub; CI green.
-2. PyBaMM benchmark (standalone script): LCO/graphite cells with known LLI, LAM_NE, LAM_PE (each 0-20 %, and
+2. PyBaMM benchmark (scripts/pybamm_benchmark.py, in progress, 5u): fix cold calibration, the 0.32 Ah cell, the
+   identifiability bug, add LAM of lithiated material; then the full design: LCO/graphite cells with known LLI, LAM_NE, LAM_PE (each 0-20 %, and
    mixtures); each cell fully charged (CC-CV to 4.2 V) then discharged at NASA rates (1 A, 2 A, 4 A scaled) and
    temperatures (4, 24, 43 C); compute the same dQ/dV features (main peak height/width/area/position, shoulder,
    charge/discharge shift). Result: which features identify which mode at NASA rates.
