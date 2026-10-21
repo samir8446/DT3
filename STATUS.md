@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.16.1 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.17.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.16.1"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.16.1"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.17.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.17.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -298,6 +298,29 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - Preliminary single cells at 1C, 24 C (fresh 1.797 Ah): LLI 4 % -> capacity -5.5 %, main peak height -7 %,
   +15 mV, LLI-like shift +5 mV; graphite LAM 10 % -> capacity -3 %, peak unchanged (nearly invisible); LiCoO2 LAM
   10 % -> capacity -11 %, peak height -7 %, -5 mV, LLI-like shift +11 mV. NOT yet results.
+
+## 5v. Mechanism-recovery test, step 1 (scripts/pinn_recovery.py, quick: H1, C1; 2 seeds; 2026-10-21)
+- Simulated batteries with KNOWN split, generated with PINN v2's own equation forms (well-specified case), 11 cells
+  at 4/24/43 C, 1-4 A, charge 0.75-1.5 A, cut-off 2.0-2.7 V; true splits diverse (cold: plating 47-83 %, hot: SEI
+  82-94 %, deep discharge: LAM up to 52 %); losses 10-20 %. PINN sees capacity, R_dc, Re and conditions only.
+- Result: H1 truth SEI/pl/LAM 89/6/6 -> v1 41/4/55, v2 21/5/73; C1 truth 15/83/2 -> v1 11/10/80, v2 6/29/65.
+  Mean share error v1 42, v2 45 points; dominant mechanism wrong in all cases; seed SD small (stable but wrong).
+- PINN (v1 and v2) cannot recover the mechanism split even in the favourable case. Next: diagnostic, training
+  loss of the TRUE split vs the found split -> optimisation failure (fixable) or non-identifiability from capacity,
+  resistance and Re (a data limit). Decide before PyBaMM step 2.
+
+## 5w. Diagnostic: pure physics fit recovers the mechanisms (pinn_recovery.py --physics, 2026-10-21)
+- Same simulated batteries; ONE shared parameter set (11 params), rate laws solved exactly in throughput, fitted to
+  capacity, R_dc and Re of all 11 batteries from 30 random starts (least squares).
+- Result: mean share error 1.1 pts, dominant mechanism correct 11/11, all 30 starts identical (spread 0.0),
+  Ea 47.9 kJ/mol (truth 50), g 2.98 (3.0), g_e 4.54 (5.0). With links fixed: 0.5 pts. Cost at the true
+  parameters 2079 vs best fit 1904 (noise-level difference).
+- Conclusion: mechanisms ARE identifiable from capacity + resistance + Re across conditions, with shared physics.
+  PINN v1/v2 failure (42-45 pts) is a design problem: network-drawn states and per-battery multipliers let each
+  battery choose its split and ignore the condition patterns. Fixable.
+- In the app since v5.17.0: Models & forecasting -> "Recovery test" section (engine section 47).
+- DECISION/NEXT: redesign PINN v2 -> shared physics parameters, mechanisms from integrated rate laws (hard), small
+  bounded network correction; rerun recovery test on the PINN; then PyBaMM step 2 (misspecified physics).
 
 ## 6. Next steps (full-signal physics phase)
 1. USER: upload v5.16.1 (twin_engine.py, app.py, tests/test_dqdv.py) to GitHub; CI green.

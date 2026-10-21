@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.16.1"
+ENGINE_VERSION = "5.17.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -9360,3 +9360,195 @@ def pinn_explain(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, train
             "dominant": dom.mode().iloc[0] if len(dom) else None,
             "dominant_agreement": f"{int((dom == dom.mode().iloc[0]).sum())}/{len(dom)}" if len(dom) else "",
             "version": version, "cell": cell, "train_cells": pool, "seeds": list(seeds)}
+
+
+# =============================================================================
+# 47. MECHANISM-RECOVERY TEST: simulated batteries with a KNOWN split of SEI, plating and LAM
+# =============================================================================
+# On NASA data nobody knows the true split, so an explanation cannot be checked there. These batteries are simulated
+# with known mechanisms (rate laws of the same forms as PINN v2, the well-specified case) at 4/24/43 C, 1-4 A,
+# charge 0.75-1.5 A and cut-off 2.0-2.7 V, so that each mechanism dominates somewhere. A model sees only capacity,
+# resistance, Re and the conditions; its split at the last cycle is compared with the truth.
+# Result (2026-10-21): PINN v1 and v2 fail (42-45 share points, dominant wrong); the pure physics model with ONE
+# shared parameter set recovers the split (1.1 points, 11/11, unique over 30 starts): identifiable, PINN design issue.
+RECOVERY_TRUTH = {"k_sei": 4.0e-3, "Ea": 50.0, "k_pl": 0.011, "b_C": 3.0, "a_c": 1.5, "c": 1.0,
+         "k_lam": 0.012, "a_I": 0.6, "a_V": 2.0, "g": 3.0, "g_e": 5.0}
+# battery: (ambient C, discharge A, charge A, cut-off V, cycles)
+RECOVERY_CELLS = {"H1": (43, 2, 1.5, 2.7, 120), "H2": (43, 1, 0.75, 2.7, 120), "H3": (43, 4, 1.5, 2.5, 100),
+         "R1": (24, 2, 1.5, 2.7, 150), "R2": (24, 4, 1.5, 2.0, 120), "R3": (24, 1, 0.75, 2.2, 150),
+         "R4": (24, 2, 0.75, 2.0, 140),
+         "C1": (4, 1, 1.5, 2.7, 100), "C2": (4, 2, 1.5, 2.2, 90), "C3": (4, 1, 0.75, 2.5, 110),
+         "C4": (4, 2, 0.75, 2.0, 100)}
+def recovery_cohort(seed: int = 0) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Cycle tables (the columns the PINN reads), impedance tests and the true mechanism states per cycle."""
+    rng = np.random.default_rng(seed)
+    rows, imp, truth = [], [], []
+    for cid, (T, I, Ic, Vc, N) in RECOVERY_CELLS.items():
+        Tk = T + 273.15 + 0.5 * I                         # a little self-heating
+        x_t = 1.0 / 298.15 - 1.0 / Tk
+        cold = max(0.0, T_COLD_C - (Tk - 273.15)) / 10
+        x_ic, x_i, depth = math.log(Ic / 1.5), math.log(I / 2.0), max(0.0, 2.7 - Vc) / 0.7
+        f_sei = RECOVERY_TRUTH["k_sei"] * math.exp(RECOVERY_TRUTH["Ea"] * 1e3 / R_GAS * x_t)
+        f_pl = RECOVERY_TRUTH["k_pl"] * math.exp(RECOVERY_TRUTH["b_C"] * cold + RECOVERY_TRUTH["a_c"] * x_ic)
+        f_lam = RECOVERY_TRUTH["k_lam"] * math.exp(RECOVERY_TRUTH["a_I"] * x_i + RECOVERY_TRUTH["a_V"] * depth)
+        s, p, m, cum = 0.0, 0.0, 0.0, 0.0
+        c_bol, r0, re0 = 2.0, 0.08, 0.05
+        for n in range(1, N + 1):
+            soh = (1 - s - p) * (1 - m)
+            dq = c_bol * soh                                  # Ah through the cell this cycle
+            da, k = dq / PINN_A_SCALE, 20
+            for _ in range(k):                                # integrate over this cycle's throughput
+                h = da / k
+                s += h * f_sei / (s + 0.005)
+                p += h * f_pl * (1 + RECOVERY_TRUTH["c"] * 20 * m)
+                m += h * f_lam
+            cum += dq
+            soh = (1 - s - p) * (1 - m)
+            rows.append({"Cell_ID": cid, "n": n, "Cycle_Index": 2 * n, "outlier": False,
+                         "SOH": soh + rng.normal(0, 0.003), "Capacity_Ah": c_bol * soh, "C_bol_Ah": c_bol,
+                         "cum_Ah": cum, "R_dc_ohm": r0 * (1 + RECOVERY_TRUTH["g"] * s) * (1 + rng.normal(0, 0.01)),
+                         "T_mean_C": Tk - 273.15, "I_dis_A": float(I), "I_ch_A": float(Ic), "V_min_V": float(Vc)})
+            truth.append({"Cell_ID": cid, "n": n, "LLI by SEI growth": s, "LLI by lithium plating": p,
+                          "Loss of active material": m, "SOH true": soh})
+            if n % 10 == 1:
+                imp.append({"Cell_ID": cid, "Cycle_Index": 2 * n - 1,
+                            "Re_ohm": re0 * (1 + RECOVERY_TRUTH["g_e"] * s) * (1 + rng.normal(0, 0.01)), "Rct_ohm": np.nan})
+    return pd.DataFrame(rows), pd.DataFrame(imp), pd.DataFrame(truth)
+
+
+def recovery_true_shares(truth: pd.DataFrame) -> pd.DataFrame:
+    last = truth.sort_values("n").groupby("Cell_ID").tail(1).set_index("Cell_ID")
+    tot = last[list(MECHANISMS)].sum(axis=1)
+    return last[list(MECHANISMS)].div(tot, axis=0).assign(**{"capacity loss": 1 - last["SOH true"]})
+
+
+RECOVERY_PNAMES = ("k_sei", "Ea", "k_pl", "b_C", "a_c", "c", "k_lam", "a_I", "a_V", "g", "g_e")
+RECOVERY_LOG = {"k_sei", "k_pl", "k_lam"}
+RECOVERY_BOUNDS = {"k_sei": (1e-5, 1e-1), "Ea": (20.0, 80.0), "k_pl": (1e-5, 1e-1), "b_C": (0.0, 5.0), "a_c": (0.0, 5.0),
+          "c": (0.0, 5.0), "k_lam": (1e-4, 1e-1), "a_I": (0.0, 5.0), "a_V": (0.0, 5.0), "g": (0.0, 20.0),
+          "g_e": (0.0, 20.0)}
+
+
+def _recovery_conditions(ct: pd.DataFrame, cells):
+    out = {}
+    for c in cells:
+        d = ct[ct["Cell_ID"] == c].sort_values("n")
+        Tk = float(d["T_mean_C"].median()) + 273.15
+        out[c] = {"x_t": 1 / 298.15 - 1 / Tk, "cold": max(0.0, T_COLD_C - (Tk - 273.15)) / 10,
+                  "x_ic": math.log(float(d["I_ch_A"].median()) / 1.5), "x_i": math.log(float(d["I_dis_A"].median()) / 2.0),
+                  "depth": max(0.0, 2.7 - float(d["V_min_V"].median())) / 0.7,
+                  "a": d["cum_Ah"].to_numpy(float) / PINN_A_SCALE, "n": d["n"].to_numpy(float),
+                  "soh": d["SOH"].to_numpy(float), "r": (d["R_dc_ohm"] / d["R_dc_ohm"].head(3).median()).to_numpy(float)}
+    return out
+
+
+def recovery_mechanisms(p: dict, cd: dict):
+    """Exact solutions of the three rate laws in cumulative throughput a (constant conditions per battery)."""
+    f_sei = p["k_sei"] * math.exp(p["Ea"] * 1e3 / R_GAS * cd["x_t"])
+    f_pl = p["k_pl"] * math.exp(p["b_C"] * cd["cold"] + p["a_c"] * cd["x_ic"])
+    f_lam = p["k_lam"] * math.exp(p["a_I"] * cd["x_i"] + p["a_V"] * cd["depth"])
+    a = cd["a"]
+    s = np.sqrt(0.005 ** 2 + 2 * f_sei * a) - 0.005                   # d s/da = f/(s + d0)
+    m = f_lam * a                                                      # d m/da = f_lam
+    pl = f_pl * (a + 10 * p["c"] * f_lam * a ** 2)                     # d p/da = f_pl (1 + 20 c m)
+    return s, pl, m
+
+
+def _recovery_unpack(x):
+    return {k: (math.exp(v) if k in RECOVERY_LOG else v) for k, v in zip(RECOVERY_PNAMES, x)}
+
+
+def recovery_physics_fit(ct: pd.DataFrame, imp: pd.DataFrame, cells, restarts: int = 30, seed: int = 0, fix_links=None):
+    """Least-squares fit of the shared physics to capacity, resistance and Re of all batteries, from many starts.
+    fix_links: optional {"g": .., "g_e": ..} to fix the SEI-resistance links (e.g. to literature values)."""
+    from scipy.optimize import least_squares
+    cds = _recovery_conditions(ct, cells)
+    re = {}
+    for c in cells:
+        e = imp[imp["Cell_ID"] == c].sort_values("Cycle_Index")
+        if len(e) >= 3:
+            n_e = (e["Cycle_Index"].to_numpy() + 1) / 2
+            re[c] = (n_e, (e["Re_ohm"] / e["Re_ohm"].head(3).median()).to_numpy(float))
+    free = [k for k in RECOVERY_PNAMES if not (fix_links and k in fix_links)]
+
+    def full(xf):
+        x = dict(zip(free, xf))
+        p = {k: (math.exp(x[k]) if k in RECOVERY_LOG else x[k]) if k in x else fix_links[k] for k in RECOVERY_PNAMES}
+        return p
+
+    def resid(xf):
+        p = full(xf)
+        out = []
+        for c, cd in cds.items():
+            s, pl, m = recovery_mechanisms(p, cd)
+            soh = (1 - s - pl) * (1 - m)
+            out.append((soh - cd["soh"]) / 0.003)
+            out.append(((1 + p["g"] * s) / (1 + p["g"] * s[:3].mean()) - cd["r"]) / 0.01)
+            if c in re:
+                si = np.interp(re[c][0], cd["n"], s)
+                out.append(((1 + p["g_e"] * si) / (1 + p["g_e"] * si[:3].mean()) - re[c][1]) / 0.01)
+        return np.concatenate(out)
+
+    lo = [math.log(RECOVERY_BOUNDS[k][0]) if k in RECOVERY_LOG else RECOVERY_BOUNDS[k][0] for k in free]
+    hi = [math.log(RECOVERY_BOUNDS[k][1]) if k in RECOVERY_LOG else RECOVERY_BOUNDS[k][1] for k in free]
+    rng = np.random.default_rng(seed)
+    fits = []
+    for r in range(restarts):
+        x0 = rng.uniform(lo, hi)
+        try:
+            sol = least_squares(resid, x0, bounds=(lo, hi), max_nfev=400)
+        except Exception:
+            continue
+        p = full(sol.x)
+        sh = {}
+        for c, cd in cds.items():
+            s, pl, m = recovery_mechanisms(p, cd)
+            v = np.array([s[-1], pl[-1], m[-1]])
+            sh[c] = v / v.sum()
+        fits.append({"restart": r, "cost": float(sol.cost), "params": p, "shares": sh})
+    # cost of the TRUE parameters, for the diagnostic
+    true_x = [math.log(RECOVERY_TRUTH[k]) if k in RECOVERY_LOG else RECOVERY_TRUTH[k] for k in free]
+    return sorted(fits, key=lambda f: f["cost"]), float(0.5 * np.sum(resid(true_x) ** 2)), cds
+
+
+
+
+def recovery_physics_table(fits: List[Dict[str, Any]], true_cost: float, ts: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Best shared-physics fit against the truth, per battery, and a summary (uniqueness over the starts)."""
+    best = fits[0]
+    near = [f for f in fits if f["cost"] <= best["cost"] * 1.05 + 1.0]
+    rows = []
+    for c in ts.index:
+        tr = ts.loc[c, list(MECHANISMS)].to_numpy(float)
+        bs = best["shares"][c]
+        spread = np.std([f["shares"][c] for f in near], axis=0) if len(near) > 1 else np.zeros(3)
+        rows.append({"battery": c, **{f"{m} · truth": tr[j] for j, m in enumerate(MECHANISMS)},
+                     **{f"{m} · model": bs[j] for j, m in enumerate(MECHANISMS)},
+                     "error (share points)": 100 * float(np.mean(np.abs(bs - tr))),
+                     "dominant correct": bool(np.argmax(bs) == np.argmax(tr)),
+                     "spread over near-best starts (points)": 100 * float(spread.max())})
+    tab = pd.DataFrame(rows)
+    summ = {"starts": len(fits), "near-best starts": len(near), "best cost": best["cost"], "cost at the truth": true_cost,
+            "learned": best["params"], "mean error": float(tab["error (share points)"].mean()),
+            "dominant correct": float(tab["dominant correct"].mean())}
+    return tab, summ
+
+
+def recovery_pinn_table(ct: pd.DataFrame, imp: pd.DataFrame, ts: pd.DataFrame, targets: Sequence[str], version: int,
+                        seeds: Sequence[int] = (0, 1), iterations: int = 1500, progress: ProgressFn = None) -> pd.DataFrame:
+    """The PINN (v1 or v2) fitted for each target with the other simulated batteries; its split vs the truth."""
+    rows = []
+    for k, tgt in enumerate(targets):
+        _report(progress, k / max(len(targets), 1), f"PINN v{version} · {tgt}")
+        train = [c for c in RECOVERY_CELLS if c != tgt]
+        r = pinn_explain(ct, imp, tgt, train, version=version, seeds=seeds, model_params={"iterations": iterations})
+        at = r["attribution"]
+        tr = ts.loc[tgt, list(MECHANISMS)].to_numpy(float)
+        md = at.loc[list(MECHANISMS), "share mean"].to_numpy(float)
+        rows.append({"battery": tgt, **{f"{m} · truth": tr[j] for j, m in enumerate(MECHANISMS)},
+                     **{f"{m} · model": md[j] for j, m in enumerate(MECHANISMS)},
+                     "error (share points)": 100 * float(np.mean(np.abs(md - tr))),
+                     "dominant correct": bool(np.argmax(md) == np.argmax(tr)),
+                     "spread over seeds (points)": 100 * float(at["share SD"].fillna(0).max())})
+    _report(progress, 1.0, "done")
+    return pd.DataFrame(rows)

@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.16.1"
+REQUIRED_ENGINE = "5.17.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -6060,6 +6060,129 @@ def pinn_v2_section() -> None:
              f"mechanisms_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="pv2_csv")
 
 
+
+# ---- Recovery test: can a model find the TRUE mechanisms? (simulated batteries with a known split) ----
+REC_MODELS = ("Pure physics (one shared parameter set)", "PINN v2", "PINN v1")
+
+
+@st.cache_data(show_spinner=False)
+def recovery_data_cached(seed: int = 0) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    ct_r, imp_r, tr = te.recovery_cohort(seed)
+    return ct_r, imp_r, tr, te.recovery_true_shares(tr)
+
+
+@st.cache_data(show_spinner=False)
+def recovery_physics_cached(restarts: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    ct_r, imp_r, _tr, ts = recovery_data_cached()
+    fits, tc, _ = te.recovery_physics_fit(ct_r, imp_r, list(te.RECOVERY_CELLS), restarts=restarts)
+    return te.recovery_physics_table(fits, tc, ts)
+
+
+@st.cache_data(show_spinner=False)
+def recovery_pinn_cached(targets: Tuple[str, ...], version: int, seeds: Tuple[int, ...]) -> pd.DataFrame:
+    ct_r, imp_r, _tr, ts = recovery_data_cached()
+    return te.recovery_pinn_table(ct_r, imp_r, ts, list(targets), version, seeds)
+
+
+def fig_recovery(ts: pd.DataFrame, results: Dict[str, pd.DataFrame], P: Palette, cells: Sequence[str]) -> go.Figure:
+    xs_b, xs_s, vals = [], [], {m: [] for m in te.MECHANISMS}
+    for c in cells:
+        xs_b.append(c); xs_s.append("truth")
+        for m in te.MECHANISMS:
+            vals[m].append(100 * float(ts.loc[c, m]))
+        for name, tab in results.items():
+            row = tab[tab["battery"] == c]
+            if row.empty:
+                continue
+            xs_b.append(c); xs_s.append(name.split(" (")[0].replace("Pure physics", "physics"))
+            for m in te.MECHANISMS:
+                vals[m].append(100 * float(row[f"{m} · model"].iloc[0]))
+    fig = go.Figure()
+    for m in te.MECHANISMS:
+        fig.add_trace(go.Bar(x=[xs_b, xs_s], y=vals[m], name=m, marker_color=MECH_COLORS[MECH_KEYS[m]],
+                             hovertemplate="%{y:.0f} % of the capacity loss<extra>" + m + "</extra>"))
+    fig.update_layout(barmode="stack")
+    fig.update_yaxes(title_text="Share of the capacity loss (%)", range=[0, 100])
+    return style_fig(fig, P, 460, "True mechanism split and what each model finds (last cycle)", hovermode="closest")
+
+
+def recovery_section() -> None:
+    section("Level 4 · Recovery test · Can a model find the TRUE degradation mechanisms?")
+    st.markdown(
+        "On NASA data nobody knows how much capacity was lost to SEI growth, lithium plating or loss of active material, "
+        "so an explanation cannot be checked there. Here 11 batteries are **simulated with a known split**: hot ones "
+        "(43 °C) age mainly by SEI growth, cold ones charged fast (4 °C) mainly by plating, deep discharges at high "
+        "current by loss of active material. Each model sees only what it would see on NASA (capacity, resistance, "
+        "impedance Re and the test conditions), never the split, and its answer is compared with the truth. The "
+        "simulation uses rate laws of the same forms as PINN v2: the favourable case. Passing it is necessary, not "
+        "sufficient; a test with independent physics (PyBaMM) comes next.")
+    ct_r, imp_r, tr, ts = recovery_data_cached()
+    conds = pd.DataFrame(te.RECOVERY_CELLS, index=["ambient (°C)", "discharge (A)", "charge (A)", "cut-off (V)", "cycles"]).T
+    with st.expander("The simulated batteries and their true split"):
+        show_table(pd.concat([conds, (100 * ts).round(1).rename(columns=lambda c: c + " (%)")], axis=1))
+    c1, c2, c3 = st.columns([1.6, 1.2, 0.9])
+    models = c1.multiselect("Models to test", REC_MODELS, default=list(REC_MODELS[:2]), key="rec_models")
+    targets = c2.multiselect("Batteries for the PINN (about a minute each per seed)", list(te.RECOVERY_CELLS),
+                             default=["H1", "C1"], key="rec_targets")
+    n_seeds = c3.select_slider("PINN seeds", [1, 2, 3], value=2, key="rec_seeds")
+    st.caption("The pure physics model is fitted to all 11 batteries at once from 30 random starting points (seconds); "
+               "if all good fits agree, the answer is unique.")
+    cfg = (tuple(models), tuple(targets), int(n_seeds))
+    if st.button("Run the recovery test", key="rec_go", type="primary", icon=":material/fact_check:", disabled=not models):
+        res: Dict[str, Any] = {}
+        try:
+            if REC_MODELS[0] in models:
+                with st.spinner("Fitting the pure physics model…"):
+                    res[REC_MODELS[0]] = recovery_physics_cached(30)
+            for name, ver in ((REC_MODELS[1], 2), (REC_MODELS[2], 1)):
+                if name in models and targets:
+                    with st.spinner(f"Fitting {name} on {len(targets)} battery(ies)…"):
+                        res[name] = (recovery_pinn_cached(tuple(targets), ver, tuple(range(int(n_seeds)))), None)
+            st.session_state["rec"] = {"cfg": cfg, "res": res}
+        except Exception as exc:
+            report_error("Recovery test failed", exc, debug)
+    saved = st.session_state.get("rec")
+    if not saved or not saved["res"]:
+        placeholder("Press 'Run the recovery test': the true and recovered splits appear here.")
+        return
+    if saved["cfg"] != cfg:
+        st.warning("Settings changed since the last run; the results below use the previous settings.")
+    res = saved["res"]
+    tabs = {name: v[0] for name, v in res.items()}
+    summary = pd.DataFrame([{"Model": name, "Batteries": len(t), "Mean error (share points)": t["error (share points)"].mean(),
+                             "Dominant mechanism correct": f"{int(t['dominant correct'].sum())}/{len(t)}"}
+                            for name, t in tabs.items()]).set_index("Model")
+    show_table(summary.style.format({"Mean error (share points)": "{:.1f}"}),
+               note="Error: mean difference between the model's and the true share of each mechanism, in percentage "
+                    "points of the capacity loss. 0 = perfect; around 40 = no better than guessing one mechanism.")
+    shown = list(dict.fromkeys(list(saved["cfg"][1]) + (list(te.RECOVERY_CELLS) if REC_MODELS[0] in res else [])))
+    show(fig_recovery(ts, tabs, P, shown), key="rec_fig")
+    lines = []
+    if REC_MODELS[0] in res:
+        s = res[REC_MODELS[0]][1]
+        L = s["learned"]
+        lines.append(f"Pure physics: {s['mean error']:.1f} share points, dominant correct in {s['dominant correct']:.0%} of "
+                     f"batteries; {s['near-best starts']} of {s['starts']} starts reach the best fit and agree. Learned "
+                     f"SEI activation energy {L['Ea']:.1f} kJ/mol (truth {te.RECOVERY_TRUTH['Ea']:.0f}).")
+    for name in REC_MODELS[1:]:
+        if name in tabs:
+            t = tabs[name]
+            lines.append(f"{name}: {t['error (share points)'].mean():.1f} share points, dominant correct "
+                         f"{int(t['dominant correct'].sum())}/{len(t)}, spread over seeds up to "
+                         f"{t['spread over seeds (points)'].max():.0f} points.")
+    if REC_MODELS[0] in res and any(n in tabs for n in REC_MODELS[1:]):
+        good_phys = res[REC_MODELS[0]][1]["mean error"] < 5
+        bad_pinn = all(tabs[n]["error (share points)"].mean() > 20 for n in REC_MODELS[1:] if n in tabs)
+        if good_phys and bad_pinn:
+            lines.append("Reading: the mechanisms ARE identifiable from capacity, resistance and Re when one physics is "
+                         "shared by all batteries; the PINN misses them because its network and per-battery freedom let "
+                         "each battery choose its own split. A design problem, being fixed.")
+    card("Recovery test", lines)
+    out = pd.concat([t.assign(model=name) for name, t in tabs.items()], ignore_index=True)
+    download("Download the recovery test (CSV)", out.assign(**{"app version": te.ENGINE_VERSION}).to_csv(index=False).encode(),
+             f"recovery_test__v{te.ENGINE_VERSION}.csv", "text/csv", key="rec_csv")
+
+
 def pinn_section() -> None:
     model_level_section(
         4, "Level 4 · Physics-informed neural network: does knowing the physics improve the prediction?",
@@ -6102,6 +6225,7 @@ def view_models() -> None:
     deep_section()
     pinn_section()
     pinn_v2_section()
+    recovery_section()
     ladder_leaderboard()
     assessment_section()
 

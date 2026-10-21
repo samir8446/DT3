@@ -1,9 +1,21 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.16.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.17.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Recovery test in the app: can a model find the TRUE mechanisms? (v5.17.0)
+
+1. Engine section 47: 11 simulated batteries with a KNOWN split of SEI, plating and LAM (4/24/43 C, 1-4 A,
+   charge 0.75-1.5 A, cut-off 2.0-2.7 V; rate laws of PINN v2's forms), recovery_cohort, recovery_true_shares,
+   recovery_physics_fit (one shared parameter set, exact solutions, many starts), recovery_physics_table,
+   recovery_pinn_table. scripts/pinn_recovery.py now uses these.
+2. App, Models & forecasting, after PINN v2: "Level 4 · Recovery test · Can a model find the TRUE degradation
+   mechanisms?": the batteries and their true split, run pure physics / PINN v2 / PINN v1 (targets, seeds), summary
+   table (error in share points, dominant correct), truth-vs-model stacked bars per battery, conclusion card, CSV.
+3. Result: pure physics 1.1 share points, 11/11, 30/30 starts agree, Ea 47.9 kJ/mol (truth 50); PINN v2 44 points.
+4. tests/test_recovery.py; 20 tests pass; AppTest: section renders and runs; all views.
 
 ## PINN v2: faulty dQ/dV rule switched off, attribution labelled not validated (v5.16.1, fix)
 
