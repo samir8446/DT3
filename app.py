@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.16.0"
+REQUIRED_ENGINE = "5.16.1"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -5930,8 +5930,7 @@ def fig_mechanisms(res: Dict[str, Any], P: Palette, title: str) -> go.Figure:
 
 def fig_evidence(res: Dict[str, Any], P: Palette) -> Optional[go.Figure]:
     f = res["frames"]
-    pairs = [("dq_scale", "dQ/dV scale (LAM-like)"), ("dq_lli_mV", "dQ/dV shift (LLI-like, mV)"),
-             ("Re_rel", "EIS Re / Re,0 (SEI film)")]
+    pairs = [("Re_rel", "EIS Re / Re,0 (SEI film)"), ("R_rel", "Load-step resistance / initial")]
     pairs = [(k, t) for k, t in pairs if f"{k} observed" in f and f[f"{k} observed"].notna().any()]
     if not pairs:
         return None
@@ -5943,7 +5942,8 @@ def fig_evidence(res: Dict[str, Any], P: Palette) -> Optional[go.Figure]:
         fig.add_trace(go.Scatter(x=m["n"], y=m[k], mode="lines", name="PINN v2 (mean of seeds)",
                                  line=dict(color="#D55E00", width=2.2), showlegend=(j == 1), legendgroup="m"), 1, j)
         fig.update_xaxes(title_text="Cycle n", row=1, col=j)
-    return style_fig(fig, P, 380, "Does the explanation agree with the independent evidence?")
+    return style_fig(fig, P, 380, "Resistance evidence: measured and reproduced by PINN v2 (the Re link does not "
+                                  "bound the SEI amount on its own)")
 
 
 def attribution_table(res: Dict[str, Any]) -> pd.DataFrame:
@@ -5955,17 +5955,22 @@ def attribution_table(res: Dict[str, Any]) -> pd.DataFrame:
 
 
 def pinn_v2_section() -> None:
-    section("Level 4 · PINN v2 · Which degradation mechanisms explain this battery's capacity loss?")
+    section("Level 4 · PINN v2 (experimental) · Which degradation mechanisms explain this battery's capacity loss?")
     st.markdown(
-        "The capacity curve shows only the **sum** of the mechanisms; the **shape of the voltage curve** separates them. "
-        "Incremental-capacity analysis (dQ/dV) of every cycle gives three indicators: the curve **shrinks** when active "
-        "material is lost (LAM), charge and discharge curves **shift together** when lithium is lost (LLI: SEI growth, "
-        "plating), and **apart** when resistance grows (polarisation). **PINN v2** must reproduce these indicators, the "
-        "impedance Re (SEI film) and the resistance, not only the capacity. Its plating is driven by the cold and the "
-        "**charge** current, its LAM by the discharge current and the **depth of discharge**, its SEI by temperature "
-        "(activation energy kept in 20–80 kJ/mol), with signs fixed by electrochemistry, and it is trained on several "
-        "temperature groups so these effects can be learned. Its attribution is reported with the spread over seeds. "
-        "Without half-cell reference curves the dQ/dV indicators are indicators, not exact quantities.")
+        "The capacity curve shows only the **sum** of the mechanisms; the **shape of the voltage curve** carries more. "
+        "Incremental-capacity analysis (dQ/dV) of every cycle is shown first: how the peaks shrink, broaden and move, "
+        "the overall shrinkage, and the shift of charge and discharge curves together (lithium-loss-like) or apart "
+        "(polarisation). **PINN v2** then splits the capacity loss into SEI growth, lithium plating and loss of active "
+        "material, constrained by the capacity, the resistance and the impedance Re, with corrected physics (plating "
+        "driven by the cold and the **charge** current, LAM by the discharge current and the **depth of discharge**, "
+        "SEI activation energy kept in 20–80 kJ/mol, signs fixed by electrochemistry) and trained on several "
+        "temperature groups.")
+    st.warning("**Not yet validated.** The mechanism split is not yet backed by independent evidence. A first version "
+               "tied it to the overall dQ/dV shrinkage, which on NASA follows the capacity whatever the mechanism and "
+               "forced all loss into active material; that rule is switched off. Peak-resolved dQ/dV evidence will "
+               "constrain it again only after it has been validated on simulated LiCoO₂/graphite cells with known "
+               "mechanisms. Until then, read the split as a hypothesis and look at its spread over seeds.",
+               icon=":material/science:")
     groups = te.condition_groups(CT_RAW)
     grp_c = str(groups.loc[cell, "Group"]) if cell in groups.index else None
     # ---- 1. the evidence for this battery

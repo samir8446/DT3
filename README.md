@@ -1,9 +1,19 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.16.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.16.1)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## PINN v2: faulty dQ/dV rule switched off, attribution labelled not validated (v5.16.1, fix)
+
+1. On five NASA batteries v2 attributed 98-100 % of the loss to LAM: the global dQ/dV scale follows the capacity
+   whatever the mechanism, so "scale = 1 - LAM" forced the result. Both dQ/dV rules (scale, shift) are now OFF in the
+   training loss by default (dq_weight = 0); v2 keeps capacity, resistance and Re, the corrected physics, the bounds
+   and the cross-group training.
+2. App: section marked "experimental" with a "Not yet validated" notice; the evidence chart shows the resistance
+   evidence (Re and load-step resistance) instead of dQ/dV curves that only echoed the rule.
+3. Test: absurd dQ/dV values leave the v2 attribution unchanged. PINN v1 unchanged (fingerprint). 19 tests pass.
 
 ## PINN v2: degradation mechanisms explained with voltage-curve and impedance evidence (v5.16.0)
 

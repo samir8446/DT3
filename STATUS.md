@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.16.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.16.1 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.16.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.16.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.16.1"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.16.1"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -267,13 +267,35 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - Synthetic check (pure capacity scaling): v2 LAM 94-95 % +- 0.4 (v1 75 % +- 6, plating 16 % +- 5); reproduces the
   dQ/dV scale (0.858 vs 0.854); SEI Ea learned 25.6-26.0 kJ/mol across seeds (v1: stuck at its start).
 
+## 5s. PINN v2 on NASA (v5.16.0; all groups, 3 seeds): attribution INVALID (method error)
+- B0005, B0029, B0045, B0047, B0025: v2 gives 98-100 % LAM everywhere (v1 74-82 % LAM, plating 12-21 % +- 4-10).
+- Cause: the global dQ/dV scale a tracks capacity (SOH 0.701 vs a 0.639; 0.892/0.884; 0.697/0.707; 0.749/0.729;
+  0.969/0.961) whatever the mechanism; the rule "a = 1 - LAM" forced all loss into LAM. Synthetic check could not
+  catch it (uniformly scaled OCV, no electrodes). Also: Re link does not bound SEI (g_e free; B0005/B0047 Re +31 %
+  fitted with 2 % SEI). Observed LLI-like shift small and of mixed sign (-21 to +22 mV).
+- Valid: dQ/dV measurements, v2 physics/constraints/cross-group design, PINN v1 and Mission 2.
+- Fix: remove "scale = 1 - LAM", label v2 attribution not validated; then peak-resolved dQ/dV features (LCO/graphite
+  staging peaks), validated on a PyBaMM LCO/graphite benchmark with known LLI, LAM_NE, LAM_PE before use; check
+  peak resolution of real NASA curves at 1-2 A (B0005, B0045 images).
+
+## 5t. Fix and benchmark start (v5.16.1, 2026-10-21)
+- dQ/dV rules off in PINN v2 (dq_weight = 0); section experimental, "not yet validated" notice; test that dQ/dV
+  values no longer change the attribution.
+- NASA dQ/dV resolution (Diagnostics chart, raw voltage): B0005 (24 C, 2 A) one main peak ~3.69 V that halves and
+  moves ~60 mV lower (mostly polarisation, Re +31 %) plus a shoulder ~3.95-4.0 V; B0045 (4 C, 1 A) weak broad noisy
+  peak (~2 Ah/V) halving in 14 cycles: dQ/dV barely usable in the cold.
+- PyBaMM 26.10 with Ramadass2004 (LiCoO2/graphite) works, ~1 s per discharge. First test (SPMe, 1C, 10 % imposed):
+  LLI and graphite LAM give the same capacity loss (0.936/0.937) and nearly the same main peak -> not separable
+  at 1C from the main peak. LiCoO2 LAM gave capacity 1.044: artefact of not re-balancing the electrodes.
+
 ## 6. Next steps (full-signal physics phase)
-1. USER: upload v5.16.0 (twin_engine.py, app.py, scripts/dqdv_features.py, tests/test_dqdv.py) to GitHub; CI green.
-2. USER: in the app, Models & forecasting -> PINN v2 section, "All groups", 3 seeds, v1 comparison ON, for B0005,
-   B0029, B0045, B0047, B0025. Send the mechanism CSVs and camera images (mechanism chart, evidence check, table).
-3. Interpret against electrochemistry (43 C SEI, 4 C plating, 2.0 V cut-off LAM); check evidence agreement.
-4. Then: synthetic benchmark with known mechanisms (e.g. PyBaMM); dQ/dV + EIS inputs for all levels; assessment
-   capacity-based vs full-signal.
+1. USER: upload v5.16.1 (twin_engine.py, app.py, tests/test_dqdv.py) to GitHub; CI green.
+2. PyBaMM benchmark (standalone script): LCO/graphite cells with known LLI, LAM_NE, LAM_PE (each 0-20 %, and
+   mixtures); each cell fully charged (CC-CV to 4.2 V) then discharged at NASA rates (1 A, 2 A, 4 A scaled) and
+   temperatures (4, 24, 43 C); compute the same dQ/dV features (main peak height/width/area/position, shoulder,
+   charge/discharge shift). Result: which features identify which mode at NASA rates.
+3. Only validated features go back into PINN v2 (dq_weight > 0 with the validated mapping); attribution with
+   honest uncertainty where unidentifiable (cold).
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

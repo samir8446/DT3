@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.16.0"
+ENGINE_VERSION = "5.16.1"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -9111,9 +9111,12 @@ def attach_dqdv(ct: pd.DataFrame, ind: pd.DataFrame) -> pd.DataFrame:
 #               LAM   k_lam * m * exp(a_I x_Idis + a_V x_depth)                   a_I, a_V >= 0
 #   observed    SOH = (1 - LLI_SEI - LLI_pl)(1 - LAM)            capacity
 #               R_dc / R_dc,0 = 1 + g * LLI_SEI                  resistance (as in version 1)
-#               dQ/dV scale = 1 - LAM                            voltage-curve shrinkage
-#               dQ/dV LLI shift = kappa * (LLI_SEI + LLI_pl)     voltage-curve shift
 #               Re / Re,0 = 1 + g_e * LLI_SEI                    impedance (SEI film)
+#               dQ/dV scale = 1 - LAM, dQ/dV shift = kappa * LLI  OFF by default (dq_weight = 0), v5.16.1: on NASA
+#               the global dQ/dV scale tracks capacity whatever the mechanism, so "scale = 1 - LAM" forced all loss
+#               into LAM (98-100 % on five batteries). Peak-resolved features must first be validated on a simulator
+#               with known mechanisms (LCO/graphite) before they constrain the attribution again.
+# Limits: the Re link does not bound the SEI amount (g_e is free); the attribution is NOT validated.
 # Used to EXPLAIN a battery's recorded life (all its cycles), trained on several groups at once so temperature and
 # current vary. The attribution is reported with its spread over seeds.
 PINN2_EA_RANGE = (20.0, 80.0)
@@ -9230,7 +9233,7 @@ def _pinn2_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> 
         st_ = (h @ W3 + b3).softplus() * 0.25 * Tensor(X[:, [0]])
         return [st_ @ sel[j] for j in range(3)], zr
 
-    w_dq, w_re = float(p.get("dq_weight", 1.0)), float(p.get("re_weight", 1.0))
+    w_dq, w_re = float(p.get("dq_weight", 0.0)), float(p.get("re_weight", 1.0))   # dQ/dV rules off: see header
 
     def loss_obs(S):
         lsei, lpl, lam = S

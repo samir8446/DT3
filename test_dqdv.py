@@ -41,10 +41,21 @@ def test_pinn_v2_explains_with_the_evidence(synth):
     ct2 = te.attach_dqdv(ct, te.dqdv_indicators(store, ct, cells))
     r = te.pinn_explain(ct2, imp, cells[0], cells, version=2, seeds=(0, 1), model_params={"iterations": 800})
     last = r["frames"].sort_values("n").groupby("seed").tail(1)
-    assert (abs(last["dq_scale"] - last["dq_scale observed"]) < 0.03).all()   # reproduces the voltage-curve evidence
-    assert (abs(last["SOH (model)"] - last["SOH observed"]) < 0.03).all()
+    assert (abs(last["SOH (model)"] - last["SOH observed"]) < 0.03).all()     # reproduces the capacity
     ea = r["params"]["Activation energy, SEI (kJ/mol)"]
     assert ((ea >= 20) & (ea <= 80)).all()                                   # physical bounds hold
     assert abs(r["attribution"]["share mean"].sum() - 1) < 1e-6
     r1 = te.pinn_explain(ct, imp, cells[0], cells, version=1, seeds=(0,), model_params={"iterations": 800})
     assert set(te.MECHANISMS) <= set(r1["frames"].columns)
+
+
+def test_dqdv_rules_are_off_by_default(synth):
+    """v5.16.1: the global dQ/dV scale tracks capacity whatever the mechanism, so it must not constrain the split."""
+    store, ct, imp, cells = synth
+    ct2 = te.attach_dqdv(ct, te.dqdv_indicators(store, ct, cells))
+    kw = dict(seeds=(0,), model_params={"iterations": 600})
+    a = te.pinn_explain(ct2, imp, cells[0], cells, version=2, **kw)
+    ct3 = ct2.assign(dq_scale=0.5, dq_lli_mV=50.0)                       # absurd evidence: must change nothing
+    b = te.pinn_explain(ct3, imp, cells[0], cells, version=2, **kw)
+    cols = list(te.MECHANISMS)
+    assert np.allclose(a["frames"][cols].to_numpy(), b["frames"][cols].to_numpy(), atol=1e-12)
