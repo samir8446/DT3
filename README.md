@@ -1,9 +1,17 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.20.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.20.1)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Hybrid fixes (v5.20.1)
+
+1. The network correction is now zero at the start of life (multiplied by a / (a + 0.05)): on B0045 it started at
+   ~8 % at cycle 2, when the battery had lost almost nothing.
+2. Bound raised from 8 to 25 SOH points: on B0006 the physics alone misses ~20 points at end of life, and the 8-point
+   cap hid most of that unexplained part. The physics is frozen, so the bound cannot change the split.
+3. Validation unchanged: split 3.43 (identical), knee-battery fit 0.73 -> 0.33. Tests, AppTest and all views pass.
 
 ## Hybrid model; PINN v2 and recovery-test sections removed from the app (v5.20.0)
 

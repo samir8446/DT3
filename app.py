@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.20.0"
+REQUIRED_ENGINE = "5.20.1"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -6037,7 +6037,7 @@ def hybrid_section() -> None:
     st.markdown(
         "The **shared physics** (section above) computes SEI growth, lithium plating and loss of active material and is "
         "**frozen**; a **small neural network** then learns only what the physics leaves unexplained (measurement minus "
-        "physics). Its correction is bounded (±8 SOH points), penalised towards zero, and shown openly as a fourth "
+        "physics). Its correction is zero at the start of life, bounded (±25 SOH points), penalised towards zero, and shown openly as a fourth "
         "category, **not explained by the physics**. So the mechanism split stays the physics' split, the network adds "
         "accuracy, and a battery the network must correct strongly is a battery for which the physics is missing "
         "something (e.g. a knee). Why frozen: on simulated batteries with a known split, every variant in which the "

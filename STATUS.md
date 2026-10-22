@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.20.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.20.1 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.20.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.20.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.20.1"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.20.1"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -354,10 +354,21 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - App now (Models view, Level 4): original PINN, Shared physics (no neural network), Hybrid. PINN v2 and Recovery
   test sections removed from the app (engine/tests/scripts keep them).
 
+## 5aa. Hybrid on NASA (v5.20.0; Re; 30 starts; penalty 0.3) and fixes (v5.20.1)
+- Mean fit error physics alone 5.12 -> hybrid 2.27 SOH points. Hot (network <= 1.4 pts RMS) and Pulsed: physics
+  explains almost all.
+- Gap 1, room temperature late in life: B0005, B0006, B0018 need 20-25 % of their loss from the network (physics
+  flattens: SEI decelerates, LAM steady); B0007 fits (1.5 %).
+- Gap 2, cold early in life: B0041, B0045 lose ~10 % in the first ~15 cycles; network supplies 29-46 %.
+- Compromise: physics over-predicts B0033, B0036, B0046-48 by 6-8 points (shared parameters pulled by the gaps).
+- Flaws fixed in v5.20.1: correction now zero at the start of life (B0045 started at ~8 %); bound 8 -> 25 points (the
+  cap hid ~half of B0006's ~20-point gap). Rerun the hybrid on NASA with v5.20.1.
+- These gaps define physics version 3: an accelerating late-life mechanism at room temperature, and a fast early loss
+  in the cold.
+
 ## 6. Next steps (full-signal physics phase)
-1. USER: upload v5.20.0 (twin_engine.py, app.py, tests/test_recovery.py); CI green; app shows v5.20.0.
-2. USER: Models view -> Hybrid: run the check, then "Fit the hybrid to the NASA batteries" (Re, 30 starts, penalty
-   0.3). Send CSV + images (card, split with unexplained part, trajectory of B0006 and B0045).
+1. USER: upload v5.20.1 (twin_engine.py, app.py); CI green; app shows v5.20.1.
+2. USER: rerun the Hybrid on NASA (Re, 30 starts, penalty 0.3); send CSV + trajectories of B0006, B0045, B0005.
 3. Knee batteries: physics version 3 with plating triggered by lost graphite; SEI with ambient temperature (Ea floor).
 4. Score shared physics and hybrid as forecasters in the accuracy assessment.
 5. PyBaMM benchmark (5u issues) and step 2.

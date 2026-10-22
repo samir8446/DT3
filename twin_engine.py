@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.20.0"
+ENGINE_VERSION = "5.20.1"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -9760,12 +9760,13 @@ def nasa_physics_trajectory(res: Dict[str, Any], cell: str) -> pd.DataFrame:
 # The recovery test showed that a network which draws the mechanisms destroys their identifiability, while one
 # shared physics recovers them. The hybrid keeps that division of labour:
 #   SOH = (1 - LLI_SEI - LLI_pl)(1 - LAM)  [shared physics v2, the mechanism split]  +  delta  [network correction]
-# delta = B * tanh(net(throughput, conditions, battery code)), |delta| <= B = 8 SOH points, penalised towards 0.
+# delta = B * tanh(net(throughput, conditions, battery code)) * a/(a + 0.05): zero at the start of life,
+# |delta| <= B = 25 SOH points (8 hid most of B0006's gap), penalised towards 0.
 # The physics is fitted first and frozen; the network then learns only what the physics leaves (validated:
 # letting the network shape the physics worsened the split in every variant tried).
 # delta is reported as a fourth category, "not explained by the physics": a battery whose fade the network must
 # explain in large part is a battery for which the physics is missing something (e.g. a knee).
-HYBRID_BOUND = 0.08
+HYBRID_BOUND = 0.25                  # v5.20.1: 0.08 hid most of B0006's unexplained loss (~20 points)
 HYBRID_UNEXPLAINED = "Not explained by the physics (network correction)"
 
 
@@ -9794,14 +9795,18 @@ def _hybrid_net_fit(X: np.ndarray, y: np.ndarray, lam: float, seed: int, iters: 
     params = [W1, b1, W2, b2, W3, b3]
     Xt, Yt = Tensor(X), Tensor(y[:, None])
 
-    def net(Xin):
+    def ramp(Xn: np.ndarray) -> Tensor:              # zero correction at the start of life (column 0 = throughput a)
+        a_ = np.clip(Xn[:, [0]], 0, None)
+        return Tensor(a_ / (a_ + 0.05))
+
+    def net(Xin, Xn):
         h = (Xin @ W1 + b1).tanh()
         h = (h @ W2 + b2).tanh()
-        return (h @ W3 + b3).tanh() * HYBRID_BOUND
+        return (h @ W3 + b3).tanh() * HYBRID_BOUND * ramp(Xn)
 
     opt = Adam(params, lr=5e-3)
     for _ in range(iters):
-        out = net(Xt)
+        out = net(Xt, X)
         loss = ((out - Yt).square()).mean() * (1 / 0.01 ** 2) + (out.square()).mean() * (lam / 0.01 ** 2)
         for w in (W1, W2, W3):
             loss = loss + (w.square()).mean() * 1e-3
@@ -9809,7 +9814,7 @@ def _hybrid_net_fit(X: np.ndarray, y: np.ndarray, lam: float, seed: int, iters: 
             q.grad = np.zeros_like(q.data)
         loss.backward()
         opt.step()
-    return lambda Xin: net(Tensor(Xin)).data[:, 0]
+    return lambda Xin: net(Tensor(Xin), Xin).data[:, 0]
 
 
 def hybrid_fit_cds(cds: Dict[str, Dict[str, Any]], re: Dict[str, Any], fit_with: str = "Re", restarts: int = 20,
