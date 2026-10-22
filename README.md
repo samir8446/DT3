@@ -1,9 +1,25 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.21.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.22.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Physics version 3 (v5.22.0)
+
+1. Physics-based forecasts (v5.21) were too optimistic on almost every NASA battery: SEI decelerates, nothing
+   accelerates. nasa_mechanisms_v3: SEI = f_sei * a^z with the exponent z learned in [0.3, 1.5] (steady growth on
+   cracking particles allowed); plating triggered by lost graphite at any temperature (dp/da = k_tr (LAM - m_c)+) on
+   top of the cold-driven plating; LAM linear (v2's unused knee term removed). 12 shared parameters.
+2. Identifiability: on batteries generated with the v3 laws, v3 recovers the split (0.10 share points), z 0.86
+   (truth 0.9), m_c 0.030 (0.03), Ea 50.2 (50); all starts agree. Caveat: on batteries whose knee has no mechanism,
+   v3 reads the knee as triggered plating (7.5 vs 3.4 share points for v2): the most common cause, not the only one.
+3. Hybrid and forecasters are version-aware (hybrid_fit_cds / nasa_hybrid_fit version=, physics_forecast keys
+   "phys3:Shared physics v3", "hyb3:Hybrid v3").
+4. App: Version 3 is the default in "Shared physics on the NASA batteries"; the hybrid has a physics-version choice;
+   the assessment has "Level 4 · Shared physics v3 + hybrid v3" next to the v2 level.
+5. Tests: v3 recovers its own split and exponent; v3 forecasters causal. 29 tests pass; AppTest of the three
+   sections with v3; all views.
 
 ## Physics-based forecasters in the accuracy assessment; joint-training test (v5.21.0)
 

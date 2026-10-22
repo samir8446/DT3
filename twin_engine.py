@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.21.0"
+ENGINE_VERSION = "5.22.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -9591,12 +9591,40 @@ def nasa_mechanisms_v2(p: dict, cd: dict):
 
 NASA_V2_BOUNDS_NOKNEE = {**NASA_V2_BOUNDS, "beta0": (1e-3, 1.000001e-3), "beta_V": (0.0, 1e-9)}
 
+# Version 3 (v5.22): the physics forecasts were too optimistic (positive bias on almost every NASA battery: SEI
+# decelerates, nothing accelerates). Two additions, both electrochemical:
+#   SEI   s = f_sei * a^z, exponent z learned in [0.3, 1.5] (0.5: classic slowing growth; 1: steady, as when
+#         cracking particles keep exposing fresh surface; > 1: accelerating)
+#   plating triggered by lost graphite at any temperature: once LAM exceeds m_c, the anode loses its margin and
+#         lithium plates: dp/da = k_tr * (LAM - m_c)+  (on top of version 2's cold-driven plating)
+#   LAM   f_lam * a (version 2's generic knee term, unused on NASA, removed)
+NASA_V3_PNAMES = ("k_sei", "Ea", "z", "k_pl", "b_C", "k_lam", "a_I", "a_V", "k_tr", "m_c", "g", "g_e")
+NASA_V3_LOG = {"k_sei", "k_pl", "k_lam", "k_tr"}
+NASA_V3_BOUNDS = {"k_sei": (1e-5, 1.0), "Ea": (20.0, 80.0), "z": (0.3, 1.5), "k_pl": (1e-5, 1.0), "b_C": (0.0, 5.0),
+                  "k_lam": (1e-5, 1e-1), "a_I": (0.0, 5.0), "a_V": (0.0, 5.0), "k_tr": (1e-4, 100.0),
+                  "m_c": (0.0, 0.3), "g": (0.0, 20.0), "g_e": (0.0, 20.0)}
+
+
+def nasa_mechanisms_v3(p: dict, cd: dict):
+    """Exact solutions (see the version-3 header). Plating = cold-driven + triggered by lost graphite."""
+    a = np.asarray(cd["a"], float)
+    f_sei = p["k_sei"] * math.exp(p["Ea"] * 1e3 / R_GAS * cd["x_t"])
+    s = f_sei * np.power(np.clip(a, 0, None), p["z"])
+    f_lam = p["k_lam"] * math.exp(p["a_I"] * cd["x_i"] + p["a_V"] * cd["depth"])
+    m = f_lam * a
+    a_c = p["m_c"] / f_lam if f_lam > 0 else np.inf                 # throughput at which LAM reaches m_c
+    trig = 0.5 * p["k_tr"] * f_lam * np.clip(a - a_c, 0, None) ** 2  # integral of k_tr (f_lam a - m_c)+
+    pl = p["k_pl"] * cd["cold"] * math.exp(p["b_C"] * cd["cold"]) * a + trig
+    return s, pl, m
+
 
 def _nasa_spec(version: int):
     if version == 2:
         return NASA_V2_PNAMES, NASA_V2_LOG, NASA_V2_BOUNDS, nasa_mechanisms_v2
     if version == 22:                                         # v2 without its knee term: used by the hybrid
         return NASA_V2_PNAMES, NASA_V2_LOG, NASA_V2_BOUNDS_NOKNEE, nasa_mechanisms_v2
+    if version == 3:
+        return NASA_V3_PNAMES, NASA_V3_LOG, NASA_V3_BOUNDS, nasa_mechanisms_v3
     return RECOVERY_PNAMES, RECOVERY_LOG, RECOVERY_BOUNDS, recovery_mechanisms
 
 
@@ -9830,7 +9858,7 @@ def _hybrid_net_fit(X: np.ndarray, y: np.ndarray, lam: float, seed: int, iters: 
 
 def hybrid_fit_cds(cds: Dict[str, Dict[str, Any]], re: Dict[str, Any], fit_with: str = "Re", restarts: int = 20,
                    rounds: int = 0, lam: float = 0.3, seed: int = 0, progress: ProgressFn = None,
-                   battery_code: bool = True, ortho: float = 0.0) -> Dict[str, Any]:
+                   battery_code: bool = True, ortho: float = 0.0, version: int = 2) -> Dict[str, Any]:
     """Hybrid on prepared battery data.
     Default (frozen): shared physics v2 fitted first and frozen; the bounded network learns what it leaves.
     Joint training with guardrails: rounds > 0 refits physics and network alternately; battery_code=False removes the
@@ -9838,14 +9866,15 @@ def hybrid_fit_cds(cds: Dict[str, Dict[str, Any]], re: Dict[str, Any], fit_with:
     has the shape of the SEI, plating or LAM curves (it can only learn what differs from the mechanisms).
     Validation (2026-10-22, knee cohort): joint training WITHOUT guardrails worsened the split (3.9-6.8 vs 3.4)."""
     _report(progress, 0.0, "hybrid · shared physics")
-    phys = _shared_physics_core(cds, re, 2, fit_with, restarts, seed)
+    mech = _nasa_spec(version)[3]
+    phys = _shared_physics_core(cds, re, version, fit_with, restarts, seed)
     best = phys[0]
     feats = _hybrid_features(cds, battery_code)
 
     def net_round(p, k):
         Xs, ys, Bs = [], [], []
         for c, cd in cds.items():
-            s_, pl, m = nasa_mechanisms_v2(p, cd)
+            s_, pl, m = mech(p, cd)
             res_ = cd["soh"] - (1 - s_ - pl) * (1 - m)
             ok = np.isfinite(res_)
             Xs.append(feats[c][ok]); ys.append(res_[ok]); Bs.append(np.column_stack([s_, pl, m])[ok])
@@ -9856,32 +9885,33 @@ def hybrid_fit_cds(cds: Dict[str, Dict[str, Any]], re: Dict[str, Any], fit_with:
     predict, delta = net_round(best["params"], 0)
     for r_ in range(rounds):
         _report(progress, 0.5 + 0.5 * (r_ + 1) / (rounds + 1), f"hybrid · joint round {r_ + 1}/{rounds}")
-        refit = _shared_physics_core(cds, re, 2, fit_with, 2, seed + 100 + r_, offsets=delta, x0=[best["x"]])
+        refit = _shared_physics_core(cds, re, version, fit_with, 2, seed + 100 + r_, offsets=delta, x0=[best["x"]])
         best = refit[0]
         predict, delta = net_round(best["params"], r_ + 1)
     _report(progress, 1.0, "hybrid done")
     return {"params": best["params"], "delta": delta, "physics_only": phys[0]["params"], "physics_fits": phys,
             "data": cds, "re": re, "fit_with": fit_with, "lam": lam, "predict": predict, "order": list(cds),
-            "battery_code": battery_code, "rounds": rounds, "ortho": ortho}
+            "battery_code": battery_code, "rounds": rounds, "ortho": ortho, "version": version}
 
 
 def nasa_hybrid_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], fit_with: str = "Re",
                     restarts: int = 20, rounds: int = 0, lam: float = 0.3, seed: int = 0,
-                    progress: ProgressFn = None) -> Dict[str, Any]:
+                    progress: ProgressFn = None, version: int = 2) -> Dict[str, Any]:
     cds, re = _nasa_inputs(ct, imp, cells)
-    return hybrid_fit_cds(cds, re, fit_with, restarts, rounds, lam, seed, progress)
+    return hybrid_fit_cds(cds, re, fit_with, restarts, rounds, lam, seed, progress, version=version)
 
 
 def hybrid_table(h: Dict[str, Any], groups: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     """Per battery: the physics split (SEI, plating, LAM) and the part not explained by the physics, at the last
     cycle, as % of initial capacity and as shares of the model's capacity loss; fit error of physics alone and of
     the hybrid; size of the network correction."""
+    mech = _nasa_spec(h.get("version", 2))[3]
     rows = []
     for c, cd in h["data"].items():
-        s, pl, m = nasa_mechanisms_v2(h["params"], cd)
+        s, pl, m = mech(h["params"], cd)
         phys_soh = (1 - s - pl) * (1 - m)
         hyb_soh = phys_soh + h["delta"][c]
-        s0, pl0, m0 = nasa_mechanisms_v2(h["physics_only"], cd)
+        s0, pl0, m0 = mech(h["physics_only"], cd)
         phys0 = (1 - s0 - pl0) * (1 - m0)
         ok = np.isfinite(cd["soh"])
         unexpl = float(-h["delta"][c][-1])                 # > 0: the network adds loss the physics does not explain
@@ -9906,7 +9936,7 @@ def hybrid_table(h: Dict[str, Any], groups: Optional[pd.DataFrame] = None) -> Tu
 
 def hybrid_trajectory(h: Dict[str, Any], cell: str) -> pd.DataFrame:
     cd = h["data"][cell]
-    s, pl, m = nasa_mechanisms_v2(h["params"], cd)
+    s, pl, m = _nasa_spec(h.get("version", 2))[3](h["params"], cd)
     phys = (1 - s - pl) * (1 - m)
     return pd.DataFrame({"n": cd["n"], "SOH observed": cd["soh"], "SOH physics": phys, "SOH (model)": phys + h["delta"][cell],
                          MECHANISMS[0]: s, MECHANISMS[1]: pl, MECHANISMS[2]: m, HYBRID_UNEXPLAINED: -h["delta"][cell]})
@@ -9976,9 +10006,12 @@ def hybrid_validation(restarts: int = 10, seed: int = 0, progress: ProgressFn = 
 # Mission 2 models do. The hybrid adds its network correction, extrapolated (what this test must judge); the joint
 # hybrid uses the best guardrails found (battery code + orthogonality 100).
 PHYS_FORECAST = {"phys": "Shared physics v2 (no network)", "hyb": "Hybrid · frozen physics + network",
-                 "hybj": "Hybrid · joint training with guardrails"}
+                 "hybj": "Hybrid · joint training with guardrails", "phys3": "Shared physics v3 (no network)",
+                 "hyb3": "Hybrid v3 · frozen physics v3 + network"}
+PHYS_FORECAST_VERSION = {"phys": 2, "hyb": 2, "hybj": 2, "phys3": 3, "hyb3": 3}
 for _k, _lab in PHYS_FORECAST.items():
     PROTOCOL_MODELS[f"{_k}:{_lab.split(' ·')[0].split(' (')[0]}"] = ("Physics-based (shared)", _lab)
+PHYS_FORECAST_V3_KEYS = [k for k in PROTOCOL_MODELS if k.split(":")[0] in ("phys3", "hyb3")]
 PHYS_FORECAST_KEYS = [k for k in PROTOCOL_MODELS if k.split(":")[0] in PHYS_FORECAST]
 
 
@@ -9999,12 +10032,15 @@ def physics_forecast(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n
         rr = _re_relative(imp, cut, c, n0 if c == cell else None)
         if rr is not None:
             re[c] = rr
-    if kind == "phys":
-        p = _shared_physics_core(cds, re, 2, "Re", restarts, seed)[0]["params"]
+    version = PHYS_FORECAST_VERSION[kind]
+    mech = _nasa_spec(version)[3]
+    if kind in ("phys", "phys3"):
+        p = _shared_physics_core(cds, re, version, "Re", restarts, seed)[0]["params"]
         h = None
     else:
         joint = kind == "hybj"
-        h = hybrid_fit_cds(cds, re, "Re", restarts, 2 if joint else 0, 0.3, seed, None, True, 100.0 if joint else 0.0)
+        h = hybrid_fit_cds(cds, re, "Re", restarts, 2 if joint else 0, 0.3, seed, None, True, 100.0 if joint else 0.0,
+                           version=version)
         p = h["params"]
     cd = cds[cell]
     a_now = float(cd["a"][-1])
@@ -10013,7 +10049,7 @@ def physics_forecast(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n
 
     def model_soh(a_arr: np.ndarray) -> np.ndarray:
         cdx = {**cd, "a": a_arr}
-        s_, pl, m = nasa_mechanisms_v2(p, cdx)
+        s_, pl, m = mech(p, cdx)
         out = (1 - s_ - pl) * (1 - m)
         if h is not None:
             k = h["order"].index(cell)

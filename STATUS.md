@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.21.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.22.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.21.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.21.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.22.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.22.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -373,13 +373,31 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   points vs fleet shape 1.04 (demo fade is linear, the physics' SEI decelerates: forecasts too slow; mechanics
   verified). NASA run needed.
 
+## 5ac. Physics-based forecasters on NASA (v5.21.0; origin 30 %; Reference 5, Hot 4, Cold 5 batteries)
+- RMSE (SOH pts) Reference / Hot / Cold: fleet shape 4.34 / 3.21 / 3.20; Mission 2 frozen 4.47 (MLP) / 0.95 (DT) /
+  2.77 (GP); shared physics v2 8.34 / 2.99 / 4.40; frozen hybrid 6.43 / 3.35 / 4.12; joint hybrid 7.38 / 3.02 / 3.92.
+  None clearly beats the baseline; all clearly behind the Mission 2 models.
+- Systematic positive bias (too optimistic): B0005 +11, B0006 +6 to +12, Hot ~+3, Cold +2 to +5. Same gap as the
+  hybrid's explanation: SEI decelerates, nothing accelerates; the network cannot extrapolate the future acceleration.
+- Frozen hybrid EOL error 12.5 cycles vs fleet shape 32 where scorable (Reference, 2 batteries): a hint only.
+- DECISION PENDING (proposed): Option A physics v3 (non-decelerating SEI on cracking particles = learned growth
+  exponent; and/or plating triggered by lost graphite at room temperature), retest explanation + forecasting;
+  Option B safety net: one twin, forecasting by Mission 2 frozen models / ensemble, explanation + anomaly + what-if
+  by the hybrid.
+
+## 5ad. Physics version 3 built (v5.22.0, 2026-10-22; DECISION: option A)
+- SEI exponent z learned [0.3, 1.5]; plating triggered by lost graphite at any temperature (+ cold-driven plating);
+  LAM linear. Identifiable on its own laws (split 0.10 pts; z 0.86 vs 0.9; m_c 0.030; Ea 50.2). Reads any knee as
+  triggered plating (7.5 vs 3.4 pts on the knee cohort whose knee has no mechanism).
+- Demo: card flags v3's split as NOT unique (near-best starts differ by 10.9 pts): check uniqueness on NASA.
+
 ## 6. Next steps (full-signal physics phase)
-1. USER: upload v5.21.0 (twin_engine.py, app.py, tests/test_physics_forecast.py); CI green; app shows v5.21.0.
-2. USER: accuracy assessment, "Best 2 per level", levels: only "Level 4 · Shared physics + hybrids" (baselines are
-   always included), origin 30 %, for Reference, Hot, Cold. Send the CSVs. Compare with the Mission 2 frozen models.
-3. If the physics forecasters are competitive: Mission 3 on the frozen hybrid (anomaly detection from the unexplained
-   part, what-if within identifiable conditions). If not: physics v3 (late-life acceleration at room temperature,
-   early fast loss in the cold), then retest.
+1. USER: upload v5.22.0 (twin_engine.py, app.py, tests/test_physics_forecast.py); CI green; app shows v5.22.0.
+2. USER: (a) "Shared physics on the NASA batteries", Version 3, Re, 30 starts: CSV + card image (uniqueness, z, m_c);
+   (b) accuracy assessment, "Best 2 per level", only "Level 4 · Shared physics v3 + hybrid v3", 30 %, Reference,
+   Hot, Cold: CSVs.
+3. Judge: forecasting bias gone? beats fleet shape / Mission 2 frozen models? split unique, plausible, held-out check?
+   If yes: Mission 3 on hybrid v3. If no: option B (one twin, forecasting by Mission 2 models, explanation by hybrid).
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

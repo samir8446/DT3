@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.21.0"
+REQUIRED_ENGINE = "5.22.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -5225,7 +5225,8 @@ ACC_EXPLORATORY = {
 }
 ASSESS_SECONDS = {"PINN": 8.0, "PINN-ablation": 4.0, "persistence": 0.3, "trend": 0.3, "shape": 1.0, "Bayesian Ridge": 1.5, "Decision Tree": 1.5,
                   "Random Forest": 3.0, "SVM": 2.0, "Gaussian Process": 12.0, "XGBoost": 3.0, "LightGBM": 2.0,
-                  "MLP": 2.0, "GRU": 6.0, "Transformer": 4.0, "Shared physics v2": 6.0, "Hybrid": 15.0}
+                  "MLP": 2.0, "GRU": 6.0, "Transformer": 4.0, "Shared physics v2": 6.0, "Hybrid": 15.0, "Shared physics v3": 6.0,
+                  "Hybrid v3": 15.0}
 
 
 @st.cache_data(show_spinner=False, max_entries=20000)
@@ -5281,7 +5282,9 @@ def assessment_section() -> None:
                       "Level 3 · DL forecast": [f"dl:{k}" for k in te.DL_MODELS],
                       "Level 3 · DL measured": [f"dlm:{k}" for k in te.DL_MODELS],
                       "Level 4 · PINN + ablation": [f"pinn:{k}" for k in te.PINN_MODELS],
-                      "Level 4 · Shared physics + hybrids": list(te.PHYS_FORECAST_KEYS)}
+                      "Level 4 · Shared physics v2 + hybrids": [k for k in te.PHYS_FORECAST_KEYS
+                                                                if k not in te.PHYS_FORECAST_V3_KEYS],
+                      "Level 4 · Shared physics v3 + hybrid v3": list(te.PHYS_FORECAST_V3_KEYS)}
         levels = st.multiselect("Levels (baselines are always included: the verdict needs them)", list(level_keys),
                                 default=list(level_keys), key="acc_levels")
         keys = ["persistence", "trend", "shape"] + [k for lv in levels for k in level_keys[lv]]
@@ -5868,7 +5871,8 @@ def nasa_physics_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: st
     return te.nasa_physics_fit(_ct, _imp, list(cells), restarts=restarts, version=version, fit_with=fit_with)
 
 
-NP_VERSIONS = {"Version 2: plating only below 15 °C, knee term, no charge-current term (recommended)": 2,
+NP_VERSIONS = {"Version 3: learned SEI exponent + plating triggered by lost graphite (recommended)": 3,
+               "Version 2: plating only below 15 °C, knee term, no charge-current term": 2,
                "Version 1: first fit (plating at any temperature)": 1}
 NP_EVIDENCE = {"Impedance Re (SEI film); check with the load-step resistance": "Re",
                "Load-step resistance; check with Re": "R_dc"}
@@ -5922,7 +5926,11 @@ def nasa_physics_section() -> None:
                                help="Version 1 let plating run at any temperature and used it as a catch-all for steady "
                                     "fade at 30-40 °C. Version 2 follows electrochemistry: no plating above 15 °C cell "
                                     "temperature; no charge-current term, because NASA charged every battery at 1.5 A; "
-                                    "a shared knee term for accelerating fade.")]
+                                    "a shared knee term for accelerating fade. Version 3 adds what version 2's forecasts "
+                                    "missed (they were too optimistic): SEI growth with a learned exponent (steady growth "
+                                    "on cracking particles is allowed) and plating triggered by lost graphite at any "
+                                    "temperature, the classic cause of late-life knees. Version 3 reads any knee as "
+                                    "triggered plating: the most common cause, not the only one.")]
     fit_with = NP_EVIDENCE[c2.radio("Fit the SEI to", list(NP_EVIDENCE), key="np_ev",
                                     help="The other resistance measurement is held out and only used as a check.")]
     restarts = c3.select_slider("Random starts", [10, 30], value=30, key="np_starts")
@@ -5952,6 +5960,8 @@ def nasa_physics_section() -> None:
              f"Learned physics (version {s['version']}): SEI activation energy {L['Ea']:.1f} kJ/mol; plating cold "
              f"sensitivity {L['b_C']:.2f}; LAM current sensitivity {L['a_I']:.2f}, depth sensitivity {L['a_V']:.2f}"
              + (f"; knee {L['beta0']:.2f} (depth {L['beta_V']:.2f})." if s["version"] == 2 else
+                f"; SEI growth exponent {L['z']:.2f} (0.5 slows down, 1 steady, >1 accelerates); triggered plating "
+                f"rate {L['k_tr']:.3g} above lost active material {100 * L['m_c']:.1f} %." if s["version"] == 3 else
                 f"; charge-current sensitivity {L['a_c']:.2f}."),
              ("Parameters at a limit (NOT determined by the data): " + ", ".join(s["at_bound"]) + ".") if s["at_bound"]
              else "No parameter at a limit: all determined by the data."]
@@ -5989,8 +5999,8 @@ HYB_UNEXPL_COLOR = "#9AA3AD"
 
 @st.cache_data(show_spinner=False, max_entries=8)
 def hybrid_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...], restarts: int,
-                  fit_with: str, lam: float) -> Dict[str, Any]:
-    return te.nasa_hybrid_fit(_ct, _imp, list(cells), fit_with=fit_with, restarts=restarts, lam=lam)
+                  fit_with: str, lam: float, version: int = 3) -> Dict[str, Any]:
+    return te.nasa_hybrid_fit(_ct, _imp, list(cells), fit_with=fit_with, restarts=restarts, lam=lam, version=version)
 
 
 @st.cache_data(show_spinner=False)
@@ -6044,6 +6054,9 @@ def hybrid_section() -> None:
         "something (e.g. a knee). Why frozen: on simulated batteries with a known split, every variant in which the "
         "network also shaped the physics made the split worse; the network improves the fit, not the explanation.")
     cells = tuple(sorted({c for g in te.NASA_PHYSICS_GROUPS for c in te.protocol_cells(CT_RAW, g)}))
+    hv = {"Physics version 3 (recommended)": 3, "Physics version 2": 2}[st.radio(
+        "Physics inside the hybrid", ["Physics version 3 (recommended)", "Physics version 2"], key="hy_ver",
+        horizontal=True)]
     c1, c2, c3 = st.columns([1.6, 0.8, 0.9])
     fit_with = NP_EVIDENCE[c1.radio("Fit the SEI to", list(NP_EVIDENCE), key="hy_ev")]
     restarts = c2.select_slider("Random starts", [10, 30], value=30, key="hy_starts")
@@ -6068,12 +6081,12 @@ def hybrid_section() -> None:
                 "The knees bend the shared physics a little for every battery (split error not zero): a limit of "
                 "any shared model when some batteries behave differently."])
             show_table(v.set_index("battery").style.format("{:.2f}"))
-    cfg = (DATA_KEY_RAW, cells, int(restarts), fit_with, float(lam))
+    cfg = (DATA_KEY_RAW, cells, int(restarts), fit_with, float(lam), hv)
     if st.button("Fit the hybrid to the NASA batteries", key="hy_go", type="primary", icon=":material/hub:",
                  disabled=len(cells) < 3):
         try:
             with st.spinner("Shared physics first, then the network on what it leaves…"):
-                h = hybrid_cached(CT_RAW, imp, DATA_KEY_RAW, cells, int(restarts), fit_with, float(lam))
+                h = hybrid_cached(CT_RAW, imp, DATA_KEY_RAW, cells, int(restarts), fit_with, float(lam), hv)
             st.session_state["hy"] = {"cfg": cfg, "h": h}
         except Exception as exc:
             report_error("Hybrid fit failed", exc, debug)
@@ -6101,7 +6114,8 @@ def hybrid_section() -> None:
                         index=list(h["data"]).index(cell) if cell in h["data"] else 0)
     show(fig_hybrid_traj(te.hybrid_trajectory(h, pick), P, pick), key="hy_traj")
     download("Download the hybrid results (CSV)",
-             tab.assign(**{"app version": te.ENGINE_VERSION, "SEI fitted to": fit_with, "network penalty": lam,
+             tab.assign(**{"app version": te.ENGINE_VERSION, "physics version": h.get("version", 2),
+                           "SEI fitted to": fit_with, "network penalty": lam,
                            **{f"learned {k_}": v_ for k_, v_ in s["learned"].items()}}).to_csv(index=False).encode(),
              f"hybrid_NASA__v{te.ENGINE_VERSION}.csv", "text/csv", key="hy_csv")
 
