@@ -1,9 +1,24 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.24.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.25.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Mission 3 · anomaly detection with two indicators, robust to regeneration (v5.25.0)
+
+1. NASA scan with v5.24: alarms on most long-life batteries (NASA's rest periods: capacity jumps then relapses);
+   B0041 / B0045 (abnormal from the start) not seen. But kappa was highest for exactly the batteries the hybrid could
+   not explain (B0041 3.00, B0045 2.65, B0006 2.61, B0018 1.75, B0005 1.46; others 0.30-1.22).
+2. Engine section 52: FLEET indicator (kappa refitted every cycle vs the fleet physics fitted on the other batteries;
+   alarm when kappa > 1.8 for 5 cycles, after 8 cycles of history) and OWN indicator (Theil-Sen slope of the last 30
+   cycles vs the 30 before, z-test with the Theil-Sen intervals; alarm when z > 3 for 3 cycles).
+3. Validation cohort with NASA-like regeneration (+1.5 % every 18-25 cycles, decaying over ~4): 11/11 correct -
+   knees (R2, C2, H3) by OWN after 27-35 cycles, batteries 2.5x faster from the start (R3, C3) by FLEET at cycle 12,
+   6 healthy quiet on both (kappa 0.44-1.30). The v5.24 detector raised false alarms on all 8 non-knee batteries of
+   this cohort.
+4. App, Operations & control: anomaly section with both indicators (thresholds, check, NASA scan, three-panel replay:
+   SOH, kappa, slope z), CSV. 36 tests pass; AppTest; all views.
 
 ## Mission 3 · anomaly detection (v5.24.0)
 

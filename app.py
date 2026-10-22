@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.24.0"
+REQUIRED_ENGINE = "5.25.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -6174,108 +6174,115 @@ def view_models() -> None:
 # View 3: operations & optimal control
 # =============================================================================
 
-# ---- Mission 3 · Anomaly detection ----
+# ---- Mission 3 · Anomaly detection (two indicators, robust to capacity regeneration) ----
 @st.cache_data(show_spinner=False)
-def anomaly_validation_cached(h: float) -> pd.DataFrame:
-    return te.anomaly_validation(restarts=6, h=h)
+def anomaly_validation2_cached(kappa_thr: float, z_thr: float) -> pd.DataFrame:
+    return te.anomaly_validation2(restarts=6, kappa_thr=kappa_thr, z_thr=z_thr)
 
 
 @st.cache_data(show_spinner=False, max_entries=8)
-def anomaly_scan_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...],
-                        h: float) -> Dict[str, pd.DataFrame]:
-    return te.nasa_anomaly_scan(_ct, _imp, list(cells), restarts=6, h=h)
+def anomaly_scan2_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...],
+                         kappa_thr: float, z_thr: float) -> Dict[str, pd.DataFrame]:
+    return te.nasa_anomaly_scan2(_ct, _imp, list(cells), restarts=6, kappa_thr=kappa_thr, z_thr=z_thr)
 
 
-def fig_anomaly(tr: pd.DataFrame, P: Palette, cell: str, h: float) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.62, 0.38],
-                        subplot_titles=("Measured SOH and what the twin expected 10 cycles earlier",
-                                        "Evidence of faster-than-expected fade (CUSUM)"))
+def fig_anomaly2(tr: pd.DataFrame, P: Palette, cell: str, kappa_thr: float, z_thr: float) -> go.Figure:
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07, row_heights=[0.44, 0.28, 0.28],
+                        subplot_titles=("Measured SOH",
+                                        "FLEET indicator: ageing speed κ vs the fleet's physics",
+                                        "OWN indicator: is the fade slope steeper than in the previous window? (z)"))
     fig.add_trace(go.Scatter(x=tr["n"], y=100 * tr["SOH"], mode="markers", name="Measured SOH",
                              marker=dict(color=P.text, size=4)), 1, 1)
-    fig.add_trace(go.Scatter(x=tr["n"], y=100 * tr["expected"], name="Expected (own trend, 10 cycles earlier)",
-                             line=dict(color="#0072B2", width=1.8)), 1, 1)
-    fig.add_trace(go.Scatter(x=tr["n"], y=tr["cusum"], name="CUSUM", line=dict(color="#D55E00", width=2)), 2, 1)
-    fig.add_hline(y=h, line=dict(color="#D55E00", dash="dash", width=1), row=2, col=1)
-    fa = tr.attrs.get("first_alarm")
-    if fa is not None:
-        for r in (1, 2):
-            fig.add_vline(x=fa, line=dict(color="#D55E00", width=1.5), row=r, col=1)
-        fig.add_annotation(x=fa, y=1, yref="y domain", text=f"alarm at cycle {fa:.0f}", showarrow=False,
-                           xanchor="left", font=dict(color="#D55E00"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=tr["n"], y=tr["kappa"], name="κ", line=dict(color="#AA4499", width=2)), 2, 1)
+    fig.add_hline(y=kappa_thr, line=dict(color="#AA4499", dash="dash", width=1), row=2, col=1)
+    fig.add_hline(y=1.0, line=dict(color=P.text, dash="dot", width=0.8), row=2, col=1)
+    fig.add_trace(go.Scatter(x=tr["n"], y=tr["slope z"], name="slope z", line=dict(color="#D55E00", width=2)), 3, 1)
+    fig.add_hline(y=z_thr, line=dict(color="#D55E00", dash="dash", width=1), row=3, col=1)
+    for key, col, lab in (("first_fleet_alarm", "#AA4499", "FLEET alarm"), ("first_own_alarm", "#D55E00", "OWN alarm")):
+        x = tr.attrs.get(key)
+        if x is not None:
+            for r in (1, 2, 3):
+                fig.add_vline(x=x, line=dict(color=col, width=1.5), row=r, col=1)
+            fig.add_annotation(x=x, y=1, yref="y domain", text=f"{lab} at cycle {x:.0f}", showarrow=False,
+                               xanchor="left", font=dict(color=col), row=1, col=1)
     fig.update_yaxes(title_text="SOH (%)", row=1, col=1)
-    fig.update_yaxes(title_text="CUSUM", row=2, col=1)
-    fig.update_xaxes(title_text="Discharge cycle n", row=2, col=1)
-    return style_fig(fig, P, 520, f"Anomaly detection replay · {cell}")
+    fig.update_yaxes(title_text="κ", row=2, col=1)
+    fig.update_yaxes(title_text="z", row=3, col=1)
+    fig.update_xaxes(title_text="Discharge cycle n", row=3, col=1)
+    return style_fig(fig, P, 620, f"Anomaly detection replay · {cell}")
 
 
 def anomaly_section() -> None:
-    section("Mission 3 · Anomaly detection · Is a battery starting to age faster than before?")
+    section("Mission 3 · Anomaly detection · Is a battery ageing abnormally?")
     st.markdown(
-        "Each battery is replayed cycle by cycle, using only the past. The twin expects the next 10 cycles to continue "
-        "the battery's **own trend** of its previous 15 cycles; the shortfall (measured below expected) is divided by "
-        "the trend's **prediction error** and accumulated in a one-sided **CUSUM**, the standard industrial "
-        "change-detection test. A single noisy cycle cannot trigger it and capacity recoveries are ignored; only a "
-        "persistent acceleration of the fade raises the alarm, as at the start of a knee. The ageing-speed factor κ "
-        "(the shared physics adapted to the battery) is reported as context: κ > 1 means the battery ages faster than "
-        "the fleet's physics for its conditions.")
-    h = st.select_slider("Alarm threshold", [5.0, 8.0, 12.0], value=8.0, key="an_h",
-                         help="8: validated setting (all known knees found, no false alarm). 5: a few cycles earlier, "
-                              "one false alarm in validation. 12: fewer alarms, later.")
-    with st.expander("Check the detector on simulated batteries with known knees (about 10 seconds)"):
-        st.caption("11 batteries: three (R2, C2, H3) get a knee starting at cycle 53; eight are healthy. A good "
-                   "detector finds the three knees early and stays quiet on the eight others.")
-        if st.button("Run the check", key="an_val"):
+        "Each battery is replayed cycle by cycle, using only the past, with **two indicators**, each with its own "
+        "reference. **FLEET**: does the battery age faster than the fleet's physics predicts for its conditions? Its "
+        "ageing-speed factor κ is refitted every cycle; alarm when κ stays above the threshold (works from the first "
+        "cycles: a battery abnormal from the start). **OWN**: does the battery age faster than in its own past? The "
+        "robust (Theil–Sen) fade slope of the last 30 cycles is compared with the 30 before; alarm when it is "
+        "significantly steeper (a knee). A 30-cycle window spans a full rest-and-recovery period of the NASA tests, so "
+        "capacity regeneration shifts the level but hardly the slope. An alarm is a prompt to inspect, not a diagnosis.")
+    c1, c2 = st.columns(2)
+    kappa_thr = c1.select_slider("FLEET threshold (κ)", [1.5, 1.8, 2.2], value=1.8, key="an2_k",
+                                 help="1.8: validated (fast batteries found at cycle 12, healthy ones 0.44-1.30).")
+    z_thr = c2.select_slider("OWN threshold (z)", [2.5, 3.0, 4.0], value=3.0, key="an2_z",
+                             help="3.0: validated (all knees found, no false alarm despite regeneration).")
+    with st.expander("Check the detector on simulated batteries with known anomalies and regeneration (about 10 s)"):
+        st.caption("11 batteries, all with NASA-like capacity regeneration every 18-25 cycles: three get a knee from "
+                   "cycle 53 (R2, C2, H3), two age 2.5 times faster from the start (R3, C3), six are healthy with normal "
+                   "manufacturing spread. FLEET should flag the fast ones, OWN the knees, nobody else. (The first "
+                   "detector raised false alarms on all 8 non-knee batteries of this cohort.)")
+        if st.button("Run the check", key="an2_val"):
             with st.spinner("Replaying the simulated batteries…"):
-                st.session_state["an_val_res"] = anomaly_validation_cached(float(h))
-        v = st.session_state.get("an_val_res")
+                st.session_state["an2_val_res"] = anomaly_validation2_cached(float(kappa_thr), float(z_thr))
+        v = st.session_state.get("an2_val_res")
         if v is not None:
-            det = v["result"].astype(str).str.startswith("detected").sum()
-            fal = (v["result"] == "FALSE ALARM").sum()
-            card("Check on simulated batteries", [
-                f"Knees detected: {det} of 3; false alarms: {fal} of 8 healthy batteries.",
-                "Knee size when the alarm fired: " + ", ".join(
-                    f"{b} {ks:.1f} SOH points" for b, ks in v.dropna(subset=["knee size at the alarm (SOH points)"])[
-                        ["battery", "knee size at the alarm (SOH points)"]].itertuples(index=False))
-                + " (the measurement noise is about 0.3 points)." if det else "No knee detected."])
+            ok = v["result"].astype(str)
+            good = ok.str.startswith("OWN detected") | ok.str.startswith("FLEET detected") | (ok == "quiet (correct)")
+            good &= ~ok.str.contains("false alarm", case=False)
+            card("Check on simulated batteries", [f"{int(good.sum())} of {len(v)} batteries handled correctly.",
+                                                   "Knees: " + ", ".join(v.loc[v["truth"] == "knee", "result"]) + ".",
+                                                   "Fast from the start: " + ", ".join(v.loc[v["truth"] == "fast", "result"]) + "."])
             show_table(v.set_index("battery").style.format(precision=2, na_rep="—"))
     cells = tuple(sorted({c for g in te.NASA_PHYSICS_GROUPS for c in te.protocol_cells(CT_RAW, g)}))
     st.caption(f"{len(cells)} NASA batteries of the constant-condition groups.")
-    cfg = (DATA_KEY_RAW, cells, float(h))
-    if st.button("Scan the NASA batteries", key="an_go", type="primary", icon=":material/notifications_active:",
+    cfg = (DATA_KEY_RAW, cells, float(kappa_thr), float(z_thr))
+    if st.button("Scan the NASA batteries", key="an2_go", type="primary", icon=":material/notifications_active:",
                  disabled=len(cells) < 3):
         try:
             with st.spinner("Replaying every battery cycle by cycle…"):
-                scan = anomaly_scan_cached(CT_RAW, imp, DATA_KEY_RAW, cells, float(h))
-            st.session_state["an"] = {"cfg": cfg, "scan": scan}
+                scan = anomaly_scan2_cached(CT_RAW, imp, DATA_KEY_RAW, cells, float(kappa_thr), float(z_thr))
+            st.session_state["an2"] = {"cfg": cfg, "scan": scan}
         except Exception as exc:
             report_error("Anomaly scan failed", exc, debug)
-    saved = st.session_state.get("an")
+    saved = st.session_state.get("an2")
     if not saved:
-        placeholder("Press 'Scan the NASA batteries': the alarms per battery and a replay of any battery appear here.")
+        placeholder("Press 'Scan the NASA batteries': both indicators per battery and a replay of any battery appear here.")
         return
     if saved["cfg"] != cfg:
         st.warning("Settings changed since the last scan; the results below use the previous settings.")
     scan = saved["scan"]
     groups = te.condition_groups(CT_RAW)
-    summ = te.anomaly_summary(scan)
+    summ = te.anomaly_summary2(scan)
     summ.insert(1, "group", summ["battery"].map(lambda c: str(groups.loc[c, "Group"]) if c in groups.index else ""))
-    flagged = summ.loc[summ["first alarm (cycle)"].notna(), "battery"].tolist()
+    ff = summ.loc[summ["first FLEET alarm (cycle)"].notna(), ["battery", "first FLEET alarm (cycle)"]]
+    fo = summ.loc[summ["first OWN alarm (cycle)"].notna(), ["battery", "first OWN alarm (cycle)"]]
     card("Anomaly scan on NASA", [
-        f"{len(flagged)} of {len(summ)} batteries raised an alarm" + (": " + ", ".join(
-            f"{b} (cycle {fa:.0f} of {nc})" for b, fa, nc in summ.loc[summ["first alarm (cycle)"].notna(),
-                                                                       ["battery", "first alarm (cycle)", "cycles"]].itertuples(index=False))
-            if flagged else "."),
-        "An alarm means the fade accelerated beyond what the battery's own recent trend predicts; it is a prompt to "
-        "inspect the battery, not a diagnosis. Compare with the batteries the hybrid could not explain (B0005, B0006, "
-        "B0018 late in life; B0041, B0045 early)."])
+        f"FLEET (ages faster than the fleet): {len(ff)} of {len(summ)}" + (": " + ", ".join(
+            f"{b} (cycle {x:.0f})" for b, x in ff.itertuples(index=False)) if len(ff) else "."),
+        f"OWN (ages faster than its own past): {len(fo)} of {len(summ)}" + (": " + ", ".join(
+            f"{b} (cycle {x:.0f})" for b, x in fo.itertuples(index=False)) if len(fo) else "."),
+        "Compare with the batteries the hybrid could not explain (B0005, B0006, B0018 late in life; B0041, B0045 "
+        "early)."])
     show_table(summ.set_index("battery").style.format(precision=2, na_rep="—"))
-    pick = st.selectbox("Battery to replay", list(scan), key="an_cell",
+    flagged = list(dict.fromkeys(ff["battery"].tolist() + fo["battery"].tolist()))
+    pick = st.selectbox("Battery to replay", list(scan), key="an2_cell",
                         index=list(scan).index(flagged[0]) if flagged else 0)
-    show(fig_anomaly(scan[pick], P, pick, float(h)), key="an_fig", data=scan[pick])
+    show(fig_anomaly2(scan[pick], P, pick, float(kappa_thr), float(z_thr)), key="an2_fig", data=scan[pick])
     download("Download the anomaly scan (CSV)",
              pd.concat([tr.assign(battery=c) for c, tr in scan.items()], ignore_index=True)
-             .assign(**{"app version": te.ENGINE_VERSION, "threshold": h}).to_csv(index=False).encode(),
-             f"anomaly_scan_NASA__v{te.ENGINE_VERSION}.csv", "text/csv", key="an_csv")
+             .assign(**{"app version": te.ENGINE_VERSION, "kappa threshold": kappa_thr, "z threshold": z_thr})
+             .to_csv(index=False).encode(), f"anomaly_scan_NASA__v{te.ENGINE_VERSION}.csv", "text/csv", key="an2_csv")
 
 
 def view_ops() -> None:

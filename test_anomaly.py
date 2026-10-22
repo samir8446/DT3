@@ -21,3 +21,25 @@ def test_replay_is_causal():
     bad["soh"][cut:] = bad["soh"][cut:] - 0.2                # a catastrophic future
     b = te.anomaly_replay(None, bad)
     assert np.allclose(a["cusum"].to_numpy()[:cut], b["cusum"].to_numpy()[:cut])
+
+
+def test_two_indicators_with_regeneration():
+    v = te.anomaly_validation2(restarts=3)
+    res = dict(zip(v["battery"], v["result"]))
+    for c in te.HYBRID_KNEE_CELLS:
+        assert res[c].startswith("OWN detected")
+    for c in te.ANOMALY2_FAST:
+        assert res[c].startswith("FLEET detected") and "false" not in res[c].lower()
+    healthy = [c for c in res if c not in te.HYBRID_KNEE_CELLS and c not in te.ANOMALY2_FAST]
+    assert all(res[c] == "quiet (correct)" for c in healthy)
+
+
+def test_two_indicators_are_causal():
+    cds, re, _ = te.anomaly_cohort2(0)
+    cd = cds["R1"]
+    a = te.anomaly_replay2(None, cd)
+    bad = {**cd, "soh": cd["soh"].copy()}
+    bad["soh"][90:] -= 0.2
+    b = te.anomaly_replay2(None, bad)
+    za, zb = a["slope z"].to_numpy()[:90], b["slope z"].to_numpy()[:90]
+    assert np.allclose(np.nan_to_num(za), np.nan_to_num(zb))

@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.24.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.25.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.24.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.24.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.25.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.25.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -431,13 +431,31 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   for healthy batteries); standardising by cycle noise instead of prediction error -> false alarms.
 - In the app: Operations & control, top section. Not yet run on NASA.
 
+## 5ai. Anomaly scan on NASA (v5.24.0, threshold 8)
+- 8/20 batteries alarm: B0005 (cycle 44), B0006 (45, 4 episodes), B0007 (41), B0018 (23), B0033 (56), B0034 (71),
+  B0036 (65, 4 episodes), B0046 (32). Cause: NASA's rest periods -> capacity regeneration then fast relapse
+  (sawtooth); the own-trend CUSUM reacts to each relapse (B0007, B0036 alarm though explained by the physics). The
+  validation cohort had no regeneration.
+- B0041, B0045 not flagged: their fast loss is in the first ~15 cycles, before the detector has its own history.
+- KEY FINDING: kappa (ageing speed vs the fleet physics, leave-one-out) is highest for exactly the batteries the
+  hybrid could not explain: B0041 3.00 (limit), B0045 2.65, B0006 2.61, B0018 1.75, B0005 1.46; all others
+  0.30-1.22. Two independent analyses agree.
+- PROPOSED: two indicators: (1) faster than the fleet = kappa with an alarm rule (e.g. > 1.8), validated on
+  simulated batteries with a known faster speed; (2) faster than its own past = robust slope change (last ~20 vs
+  previous ~20 cycles, Theil-Sen), robust to regeneration; validate both on simulated batteries WITH regeneration.
+
+## 5aj. Two-indicator anomaly detector (v5.25.0, 2026-10-22)
+- FLEET (kappa > 1.8 for 5 cycles) + OWN (Theil-Sen slope, 30 vs previous 30 cycles, z > 3 for 3 cycles).
+- Validation WITH regeneration: 11/11 correct (knees by OWN after 27-35 cycles; 2.5x-fast batteries by FLEET at
+  cycle 12; healthy quiet). v5.24 detector: 8/8 false alarms on the same cohort. Not yet run on NASA.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.24.0 (twin_engine.py, app.py, tests/test_anomaly.py); CI green; app shows v5.24.0.
-2. USER: Operations & control -> anomaly detection: run the check, then "Scan the NASA batteries" (threshold 8).
-   Send the CSV + replay images of the flagged batteries (and of B0006, B0045).
-3. Then: assemble the option-B twin view (forecast by Mission 2 frozen models, explanation by the hybrid, anomalies,
-   what-if within identifiable conditions).
-4. Writing: Mission 2 chapter; physics phase chapter.
+1. USER: upload v5.25.0 (twin_engine.py, app.py, tests/test_anomaly.py); CI green; app shows v5.25.0.
+2. USER: Operations & control -> anomaly detection: run the check, then "Scan the NASA batteries" (thresholds 1.8
+   and 3.0). Send the CSV + replays of B0006, B0045, B0041 and any battery flagged by OWN.
+3. Then: assemble the option-B twin view (forecast by Mission 2 frozen models, explanation by the hybrid, the two
+   anomaly indicators, what-if within identifiable conditions).
+4. Writing: Mission 2 chapter; physics phase chapter; Mission 3 chapter.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

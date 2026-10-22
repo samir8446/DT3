@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.24.0"
+ENGINE_VERSION = "5.25.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10274,3 +10274,138 @@ def anomaly_validation(restarts: int = 6, progress: ProgressFn = None, **kw) -> 
             knee[c] = 100 * 0.6 * max(a_fa - 0.3, 0.0) ** 2
     summ["knee size at the alarm (SOH points)"] = summ["battery"].map(knee)
     return summ
+
+
+# =============================================================================
+# 52. MISSION 3 · ANOMALY DETECTION v2: two indicators, robust to capacity regeneration
+# =============================================================================
+# NASA scan with the v5.24 detector: alarms on most long-life batteries, triggered by NASA's rest periods (capacity
+# jumps up, then relapses faster than the trend); batteries abnormal from the start (B0041, B0045) not seen, the
+# detector needing 15 cycles of own history. But kappa (ageing speed vs the fleet physics) was highest for exactly the
+# batteries the hybrid could not explain. Hence two indicators, each with its own reference:
+#   FLEET   "ages faster than the fleet": kappa refitted every cycle on the battery's history (fleet physics fitted
+#           on the other batteries); alarm when kappa > kappa_thr for m_kappa consecutive cycles (after min_hist).
+#   OWN     "ages faster than its own past": Theil-Sen slope of the last W cycles vs the W before (per Ah of
+#           throughput), z = (slope_prev - slope_recent) / sqrt(se_prev^2 + se_recent^2), se from the Theil-Sen
+#           95 % interval; alarm when z > z_thr for m_slope consecutive cycles. A W-cycle window spans a full
+#           regeneration period: a jump shifts the level, hardly the robust slope.
+ANOMALY2_DEFAULTS = {"W": 30, "z_thr": 3.0, "m_slope": 3, "kappa_thr": 1.8, "m_kappa": 5, "min_hist": 8}
+
+
+def _theil_sen(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    from scipy.stats import theilslopes
+    sl, _ic, lo, hi = theilslopes(y, x, 0.95)
+    return float(sl), max(float(hi - lo) / (2 * 1.96), 1e-12)
+
+
+def anomaly_replay2(p: Optional[Dict[str, float]], cd: Dict[str, Any], W: int = 30, z_thr: float = 3.0,
+                    m_slope: int = 3, kappa_thr: float = 1.8, m_kappa: int = 5, min_hist: int = 8,
+                    version: int = 2) -> pd.DataFrame:
+    """Causal replay with the two indicators (see the section header). One row per cycle; first alarms in attrs."""
+    mech = _nasa_spec(version)[3]
+    n_, a, y = cd["n"], cd["a"], cd["soh"]
+    ok = np.isfinite(y)
+    rows, run_k, run_z = [], 0, 0
+    first_k = first_z = None
+    for i in range(len(n_)):
+        hist = np.nonzero(ok[: i + 1])[0]
+        kap = _kappa_fit(p, cd, i + 1, mech) if (p is not None and len(hist) >= min_hist) else np.nan
+        run_k = run_k + 1 if (np.isfinite(kap) and kap > kappa_thr) else 0
+        k_alarm = run_k >= m_kappa
+        z = np.nan
+        if len(hist) >= 2 * W:
+            rec, prev = hist[-W:], hist[-2 * W:-W]
+            s_r, se_r = _theil_sen(a[rec], y[rec])
+            s_p, se_p = _theil_sen(a[prev], y[prev])
+            z = (s_p - s_r) / math.sqrt(se_r ** 2 + se_p ** 2)
+        run_z = run_z + 1 if (np.isfinite(z) and z > z_thr) else 0
+        z_alarm = run_z >= m_slope
+        if k_alarm and first_k is None:
+            first_k = float(n_[i])
+        if z_alarm and first_z is None:
+            first_z = float(n_[i])
+        rows.append({"n": n_[i], "SOH": y[i], "kappa": kap, "fleet alarm": k_alarm, "slope z": z, "own alarm": z_alarm})
+    out = pd.DataFrame(rows)
+    out.attrs.update({"first_fleet_alarm": first_k, "first_own_alarm": first_z, "W": W})
+    return out
+
+
+def anomaly_scan2_cds(cds: Dict[str, Dict[str, Any]], re: Dict[str, Any], restarts: int = 6, seed: int = 0,
+                      progress: ProgressFn = None, **kw) -> Dict[str, pd.DataFrame]:
+    out = {}
+    for k_, c in enumerate(cds):
+        _report(progress, k_ / max(len(cds), 1), f"anomaly scan · {c}")
+        others = {x: cd for x, cd in cds.items() if x != c}
+        p = _shared_physics_core(others, {x: v for x, v in re.items() if x in others}, 2, "Re", restarts, seed)[0]["params"]
+        out[c] = anomaly_replay2(p, cds[c], **kw)
+    _report(progress, 1.0, "anomaly scan done")
+    return out
+
+
+def nasa_anomaly_scan2(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], restarts: int = 6,
+                       progress: ProgressFn = None, **kw) -> Dict[str, pd.DataFrame]:
+    cds, re = _nasa_inputs(ct, imp, cells)
+    return anomaly_scan2_cds(cds, re, restarts, 0, progress, **kw)
+
+
+def anomaly_summary2(scan: Dict[str, pd.DataFrame], truth: Optional[Dict[str, Tuple[str, Optional[float]]]] = None) -> pd.DataFrame:
+    rows = []
+    for c, tr in scan.items():
+        ff, fo = tr.attrs.get("first_fleet_alarm"), tr.attrs.get("first_own_alarm")
+        row = {"battery": c, "cycles": int(tr["n"].max()), "first FLEET alarm (cycle)": ff,
+               "first OWN alarm (cycle)": fo, "kappa at the end": float(tr["kappa"].dropna().iloc[-1]) if tr["kappa"].notna().any() else np.nan,
+               "max slope z": float(tr["slope z"].max()) if tr["slope z"].notna().any() else np.nan}
+        if truth is not None:
+            kind, onset = truth[c]
+            row["truth"] = kind
+            if kind == "knee":
+                row["result"] = (f"OWN detected, delay {fo - onset:.0f} cycles" if fo is not None and fo >= onset else
+                                 "OWN alarm BEFORE the knee" if fo is not None else "OWN MISSED")
+            elif kind == "fast":
+                row["result"] = ((f"FLEET detected at cycle {ff:.0f}" if ff is not None else "FLEET MISSED")
+                                 + ("; OWN false alarm" if fo is not None else ""))
+            else:
+                bad = [lab for lab, v in (("FLEET", ff), ("OWN", fo)) if v is not None]
+                row["result"] = ("FALSE ALARM: " + ", ".join(bad)) if bad else "quiet (correct)"
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+ANOMALY2_FAST = ("R3", "C3")
+
+
+def anomaly_cohort2(seed: int = 0):
+    """Validation batteries: knee cohort physics + manufacturing spread (healthy speed 0.85-1.15), two batteries
+    ageing 2.5x faster from the start (R3, C3), knees on R2, C2, H3 from a = 0.3, and NASA-like regeneration on all
+    (every 18-25 cycles a +1.5 % capacity jump decaying over ~4 cycles), noise 0.3 %."""
+    rng = np.random.default_rng(seed)
+    cds, re, truth = {}, {}, {}
+    for cid, (T, I, Ic, Vc, N) in RECOVERY_CELLS.items():
+        Tk = T + 273.15 + 0.5 * I
+        cd = {"x_t": 1 / 298.15 - 1 / Tk, "cold": max(0.0, T_COLD_C - (Tk - 273.15)) / 10, "x_ic": math.log(Ic / 1.5),
+              "x_i": math.log(I / 2.0), "depth": max(0.0, 2.7 - Vc) / 0.7, "T_C": Tk - 273.15, "I_dis": float(I),
+              "I_ch": float(Ic), "V_cut": float(Vc)}
+        a = np.cumsum(np.full(N, 2.0 * 0.85 / PINN_A_SCALE))
+        cd["a"], cd["n"] = a, np.arange(1, N + 1, dtype=float)
+        speed = 2.5 if cid in ANOMALY2_FAST else float(rng.uniform(0.85, 1.15))
+        s, pl, m = nasa_mechanisms_v2(HYBRID_TRUTH, {**cd, "a": speed * a})
+        soh = (1 - s - pl) * (1 - m)
+        if cid in HYBRID_KNEE_CELLS:
+            soh = soh - 0.6 * np.clip(a - 0.3, 0, None) ** 2
+        regen = np.zeros(N)
+        k_ = int(rng.integers(18, 26))
+        while k_ < N:
+            regen[k_:] += 0.015 * np.exp(-(np.arange(N - k_)) / 4.0)
+            k_ += int(rng.integers(18, 26))
+        cd["soh"] = soh + regen + rng.normal(0, 0.003, N)
+        cd["r"] = (1 + HYBRID_TRUTH["g"] * s) * (1 + rng.normal(0, 0.01, N))
+        re[cid] = (cd["n"][::10], (1 + HYBRID_TRUTH["g_e"] * s[::10]) * (1 + rng.normal(0, 0.01, len(cd["n"][::10]))))
+        onset = float(cd["n"][int(np.argmax(a > 0.3))]) if cid in HYBRID_KNEE_CELLS else None
+        truth[cid] = ("knee" if cid in HYBRID_KNEE_CELLS else "fast" if cid in ANOMALY2_FAST else "healthy", onset)
+        cds[cid] = cd
+    return cds, re, truth
+
+
+def anomaly_validation2(restarts: int = 6, progress: ProgressFn = None, **kw) -> pd.DataFrame:
+    cds, re, truth = anomaly_cohort2(0)
+    return anomaly_summary2(anomaly_scan2_cds(cds, re, restarts, 0, progress, **kw), truth)
