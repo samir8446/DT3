@@ -1,9 +1,24 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.19.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.20.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Hybrid model; PINN v2 and recovery-test sections removed from the app (v5.20.0)
+
+1. Engine section 49, hybrid: shared physics v2 fitted first and FROZEN (the mechanism split), then a small tanh
+   network (bounded to +-8 SOH points, penalised) fitted to what the physics leaves; its correction is reported as
+   "Not explained by the physics". _shared_physics_core factored out of nasa_physics_fit (results identical).
+2. Validation (hybrid_validation): batteries following physics v2 plus an unmodelled knee on R2, C2, H3. Every
+   variant in which the network also shaped the physics worsened the split (3.9-6.8 share points vs 3.4 for the
+   physics alone: alternating refits, robust loss, knee-free physics, refit without flagged batteries). Frozen
+   physics: split identical (3.43), fit error on knee batteries 0.73 -> 0.33, others 0.45 -> 0.31.
+3. App, Models & forecasting, Level 4: "Shared physics on the NASA batteries (no neural network)" kept and labelled;
+   new "Hybrid" section (fit, built-in check on simulated batteries, split with the unexplained part, fit
+   improvement, batteries the physics does not describe, trajectory, CSV). The "PINN v2 (experimental)" and
+   "Recovery test" sections are removed from the app; their engine code, tests and scripts remain.
+4. 23 tests pass; AppTest: hybrid section runs (check and NASA fit); all views.
 
 ## Shared physics on NASA, version 2 (v5.19.0)
 

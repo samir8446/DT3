@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.19.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.20.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.19.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.19.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.20.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.20.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -332,13 +332,35 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - Shared physics v2 built (v5.19.0): plating zero above 15 C, no charge-current term, shared knee term, fit SEI to
   Re (check: load-step resistance) or the reverse; card lists parameters at a limit. To be run on NASA.
 
+## 5y. Shared physics v2 on NASA (v5.19.0; Re in fit, R_dc held out; 30 starts; 20 batteries)
+- Group means SEI/plating/LAM (fit error): Hot 56/0/44 (1.6), Pulsed 53/0/47 (2.8; only 2-4 % lost), Reference
+  36/0/65 (7.1), High current 34/0/66 (7.2), Cold 12/71/17 (7.0). Plating only in Cold; unique (spread <= 0.09).
+- Fit as good as v1 on almost every battery (v1 freedom bought nothing). Held-out R_dc check: rank correlation
+  0.91-0.99 Hot, 0.57-0.97 Reference, 0.72-0.94 High current, 0.83-0.97 Cold; Pulsed negative (no signal).
+- At a limit: Ea (20 floor), b_C (0: all cold cells at ~9 C, one temperature), a_I (0: discharge current tied to
+  groups), beta0/beta_V (shared knee unused). Knee batteries still 9.6-12.1 pts (B0006, B0041, B0045, B0033, B0036).
+- Contradiction: Hot Re flat (-1.8 to +2.1 %) while SEI 56 % and R_dc rises (R_dc agrees with SEI, Re does not).
+- Thesis: physically consistent, unique, held-out-supported split; NASA design limits identify which sensitivities
+  cannot be learned (one cold temperature, one charge current, current confounded with temperature).
+- NEXT: knee by LAM-triggered plating (graphite margin) instead of a shared knee; SEI with ambient instead of
+  discharge temperature (does Ea leave the floor?); score as forecaster in the accuracy assessment.
+
+## 5z. Hybrid (v5.20.0, 2026-10-22)
+- Hybrid = shared physics v2 (frozen; the split) + bounded network on the residual ("not explained by the physics").
+- Validation on a known split with unmodelled knees: letting the network shape the physics always worsened the split
+  (3.9-6.8 vs 3.4 share points); frozen physics keeps 3.43 and improves fit (knee batteries 0.73 -> 0.33).
+  Lesson: the network improves the fit, not the explanation. Its correction localises knees only roughly (+1.3 to
+  +1.7 on knee batteries, but -1.3 on R4): a hint, not a proof.
+- App now (Models view, Level 4): original PINN, Shared physics (no neural network), Hybrid. PINN v2 and Recovery
+  test sections removed from the app (engine/tests/scripts keep them).
+
 ## 6. Next steps (full-signal physics phase)
-1. USER: upload v5.19.0 (twin_engine.py, app.py, tests/test_recovery.py); CI green; app shows v5.19.0.
-2. USER: "Shared physics on the NASA batteries" with Version 2, fit SEI to Re, 30 starts. Send CSV + images.
-3. Judge: plating only in Cold; Reference/High current split between SEI and LAM; fit errors (knee batteries);
-   parameters at a limit; held-out load-step resistance check; Hot Re flat vs SEI share.
-4. Score the shared physics as a forecaster in the accuracy assessment (from 30 % of life).
-5. Redesign PINN v2 = shared physics + small bounded network correction; recovery test; then PyBaMM step 2.
+1. USER: upload v5.20.0 (twin_engine.py, app.py, tests/test_recovery.py); CI green; app shows v5.20.0.
+2. USER: Models view -> Hybrid: run the check, then "Fit the hybrid to the NASA batteries" (Re, 30 starts, penalty
+   0.3). Send CSV + images (card, split with unexplained part, trajectory of B0006 and B0045).
+3. Knee batteries: physics version 3 with plating triggered by lost graphite; SEI with ambient temperature (Ea floor).
+4. Score shared physics and hybrid as forecasters in the accuracy assessment.
+5. PyBaMM benchmark (5u issues) and step 2.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

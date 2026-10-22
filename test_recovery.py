@@ -37,3 +37,11 @@ def test_nasa_physics_v2_no_plating_when_warm():
     warm = tab["cell temperature (°C)"] > te.T_COLD_C
     assert warm.any() and (tab.loc[warm, "LLI by lithium plating (%)"] == 0).all()
     assert s["version"] == 2 and not s["fit_r"] and isinstance(s["at_bound"], list)
+
+
+def test_hybrid_keeps_the_physics_split_and_improves_the_fit():
+    v = te.hybrid_validation(restarts=4, lam=0.3)
+    assert (v["split error, hybrid (points)"] - v["split error, physics alone (points)"]).abs().max() < 1e-9
+    k = v["battery"].isin(te.HYBRID_KNEE_CELLS)
+    assert v.loc[k, "fit error, hybrid (SOH points)"].mean() < v.loc[k, "fit error, physics alone (SOH points)"].mean()
+    assert (v["network correction at the end (SOH points)"].abs() <= 100 * te.HYBRID_BOUND + 1e-9).all()

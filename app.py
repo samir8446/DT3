@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.19.0"
+REQUIRED_ENGINE = "5.20.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -5846,8 +5846,7 @@ def fig_mechanisms(f: Any, P: Palette, battery: str) -> go.Figure:
 
 
 
-# ---- PINN v2 · degradation mechanisms (voltage-curve evidence, impedance, cross-group training) ----
-PV2_GROUPS = ("Reference", "High current", "Hot", "Cold", "Pulsed load")   # conditions constant within a battery
+# ---- mechanism colours and electrochemical expectations (shared by the physics and hybrid sections) ----
 PV2_EXPECT = {
     "Hot": "At 43 °C, SEI growth is commonly reported as a major contributor (it accelerates with temperature), "
            "together with loss of active material.",
@@ -5859,329 +5858,6 @@ PV2_EXPECT = {
     "Pulsed load": "Pulsed discharge with rests: no single expected mechanism; compare with the other groups.",
 }
 MECH_KEYS = {"LLI by SEI growth": "SEI", "LLI by lithium plating": "plating", "Loss of active material": "LAM"}
-
-
-@st.cache_data(show_spinner=False, max_entries=64)
-def dqdv_cell_cached(_store: te.ParquetStore, key: str, cell: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    return te.dqdv_cell(_store, CT_RAW, cell)
-
-
-@st.cache_data(show_spinner=False, max_entries=8)
-def dqdv_all_cached(_store: te.ParquetStore, key: str, cells: Tuple[str, ...]) -> pd.DataFrame:
-    return te.dqdv_indicators(_store, CT_RAW, list(cells))
-
-
-@st.cache_data(show_spinner=False, max_entries=16)
-def explain_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str, train: Tuple[str, ...],
-                   version: int, seeds: Tuple[int, ...]) -> Dict[str, Any]:
-    return te.pinn_explain(_ct, _imp, cell, list(train), version=version, seeds=seeds)
-
-
-def fig_dqdv_curves(curves: Dict[str, Any], P: Palette, cell: str) -> go.Figure:
-    fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.08,
-                        subplot_titles=("Discharge (IR-corrected)", "Charge, constant-current part (IR-corrected)"))
-    for col, mode in enumerate(("discharge", "charge"), 1):
-        cs = sorted(curves.get(mode, []), key=lambda x: x[0])
-        if not cs:
-            continue
-        pick = cs[:: max(1, len(cs) // 10)]
-        cols = sample_colorscale("Viridis", [k / max(len(pick) - 1, 1) for k in range(len(pick))])
-        for k, (n, g, y) in enumerate(pick):
-            fig.add_trace(go.Scatter(x=g, y=y, mode="lines", line=dict(color=cols[k], width=1.6),
-                                     name=f"cycle {n}", legendgroup=f"c{n}", showlegend=(col == 1),
-                                     hovertemplate=f"cycle {n}: %{{y:.2f}} Ah/V at %{{x:.3f}} V<extra></extra>"), 1, col)
-        fig.update_xaxes(title_text="Voltage (V)", row=1, col=col)
-    fig.update_yaxes(title_text="dQ/dV (Ah/V)", row=1, col=1)
-    return style_fig(fig, P, 430, f"Incremental capacity over life · {cell}", hovermode="closest")
-
-
-def fig_dqdv_indicators(md: pd.DataFrame, P: Palette, cell: str) -> go.Figure:
-    fig = make_subplots(rows=1, cols=2, horizontal_spacing=0.1,
-                        subplot_titles=("Curve shrinkage (LAM-like) and SOH", "Curve shift (LLI-like) and polarisation"))
-    fig.add_trace(go.Scatter(x=md["n"], y=md["dq_scale"], name="dQ/dV scale (LAM-like)",
-                             line=dict(color=MECH_COLORS["LAM"], width=2.2)), 1, 1)
-    fig.add_trace(go.Scatter(x=md["n"], y=md["SOH"], name="SOH (capacity)", line=dict(color=P.text, width=1.4, dash="dot")), 1, 1)
-    fig.add_trace(go.Scatter(x=md["n"], y=md["dq_lli_mV"], name="LLI-like shift (mV)",
-                             line=dict(color=MECH_COLORS["SEI"], width=2.2)), 1, 2)
-    fig.add_trace(go.Scatter(x=md["n"], y=md["dq_pol_mV"], name="Polarisation (mV)",
-                             line=dict(color="#882255", width=1.6, dash="dash")), 1, 2)
-    fig.update_xaxes(title_text="Discharge cycle n")
-    fig.update_yaxes(title_text="Scale / SOH", row=1, col=1)
-    fig.update_yaxes(title_text="mV", row=1, col=2)
-    return style_fig(fig, P, 400, f"Degradation-mode indicators from the voltage curves · {cell}")
-
-
-def fig_mechanisms(res: Dict[str, Any], P: Palette, title: str) -> go.Figure:
-    f = res["frames"]
-    m = f.groupby("n")[list(te.MECHANISMS) + ["SOH observed", "SOH (model)"]].mean().reset_index()
-    fig = go.Figure()
-    for mech in te.MECHANISMS:
-        fig.add_trace(go.Scatter(x=m["n"], y=100 * m[mech].clip(lower=0), name=mech, stackgroup="mech", mode="lines",
-                                 line=dict(width=0.6, color=MECH_COLORS[MECH_KEYS[mech]]),
-                                 hovertemplate="%{y:.2f} % of initial capacity<extra>" + mech + "</extra>"))
-    fig.add_trace(go.Scatter(x=m["n"], y=100 * (1 - m["SOH observed"]), name="Measured capacity loss",
-                             mode="markers", marker=dict(color=P.text, size=4)))
-    fig.add_trace(go.Scatter(x=m["n"], y=100 * (1 - m["SOH (model)"]), name="Model capacity loss",
-                             line=dict(color=P.text, width=1.4, dash="dot")))
-    fig.update_xaxes(title_text="Discharge cycle n")
-    fig.update_yaxes(title_text="Share of initial capacity (%)", rangemode="tozero")
-    return style_fig(fig, P, 440, title)
-
-
-def fig_evidence(res: Dict[str, Any], P: Palette) -> Optional[go.Figure]:
-    f = res["frames"]
-    pairs = [("Re_rel", "EIS Re / Re,0 (SEI film)"), ("R_rel", "Load-step resistance / initial")]
-    pairs = [(k, t) for k, t in pairs if f"{k} observed" in f and f[f"{k} observed"].notna().any()]
-    if not pairs:
-        return None
-    fig = make_subplots(rows=1, cols=len(pairs), horizontal_spacing=0.08, subplot_titles=[t for _, t in pairs])
-    m = f.groupby("n").mean(numeric_only=True).reset_index()
-    for j, (k, _t) in enumerate(pairs, 1):
-        fig.add_trace(go.Scatter(x=m["n"], y=m[f"{k} observed"], mode="markers", name="Observed",
-                                 marker=dict(color=P.text, size=4), showlegend=(j == 1), legendgroup="o"), 1, j)
-        fig.add_trace(go.Scatter(x=m["n"], y=m[k], mode="lines", name="PINN v2 (mean of seeds)",
-                                 line=dict(color="#D55E00", width=2.2), showlegend=(j == 1), legendgroup="m"), 1, j)
-        fig.update_xaxes(title_text="Cycle n", row=1, col=j)
-    return style_fig(fig, P, 380, "Resistance evidence: measured and reproduced by PINN v2 (the Re link does not "
-                                  "bound the SEI amount on its own)")
-
-
-def attribution_table(res: Dict[str, Any]) -> pd.DataFrame:
-    at = res["attribution"].copy()
-    return pd.DataFrame({"Share of capacity loss": [f"{100 * a:.0f} % ± {100 * b:.0f}" for a, b in
-                                                     zip(at["share mean"], at["share SD"].fillna(0))],
-                         "Capacity lost (% of initial)": (100 * at["capacity fraction at the last cycle"]).round(2)},
-                        index=at.index)
-
-
-def pinn_v2_section() -> None:
-    section("Level 4 · PINN v2 (experimental) · Which degradation mechanisms explain this battery's capacity loss?")
-    st.markdown(
-        "The capacity curve shows only the **sum** of the mechanisms; the **shape of the voltage curve** carries more. "
-        "Incremental-capacity analysis (dQ/dV) of every cycle is shown first: how the peaks shrink, broaden and move, "
-        "the overall shrinkage, and the shift of charge and discharge curves together (lithium-loss-like) or apart "
-        "(polarisation). **PINN v2** then splits the capacity loss into SEI growth, lithium plating and loss of active "
-        "material, constrained by the capacity, the resistance and the impedance Re, with corrected physics (plating "
-        "driven by the cold and the **charge** current, LAM by the discharge current and the **depth of discharge**, "
-        "SEI activation energy kept in 20–80 kJ/mol, signs fixed by electrochemistry) and trained on several "
-        "temperature groups.")
-    st.warning("**Not yet validated.** The mechanism split is not yet backed by independent evidence. A first version "
-               "tied it to the overall dQ/dV shrinkage, which on NASA follows the capacity whatever the mechanism and "
-               "forced all loss into active material; that rule is switched off. Peak-resolved dQ/dV evidence will "
-               "constrain it again only after it has been validated on simulated LiCoO₂/graphite cells with known "
-               "mechanisms. Until then, read the split as a hypothesis and look at its spread over seeds.",
-               icon=":material/science:")
-    groups = te.condition_groups(CT_RAW)
-    grp_c = str(groups.loc[cell, "Group"]) if cell in groups.index else None
-    # ---- 1. the evidence for this battery
-    try:
-        with st.spinner(f"Incremental-capacity analysis of {cell} (runs once)…"):
-            f_c, curves = dqdv_cell_cached(store, DATA_KEY_RAW, cell)
-    except Exception as exc:
-        report_error("dQ/dV analysis failed", exc, debug)
-        return
-    if f_c.empty:
-        st.info(f"No constant-current curves usable for dQ/dV on {cell}.")
-        return
-    md = te.dqdv_modes(f_c).sort_values("n")
-    show(fig_dqdv_curves(curves, P, cell), key="pv2_curves")
-    show(fig_dqdv_indicators(md, P, cell), key="pv2_ind", data=md)
-    # ---- 2. the explanation
-    if grp_c not in PV2_GROUPS:
-        st.info(f"{cell} belongs to the {grp_c or 'no'} group: its test conditions change during life (or its logging "
-                "failed), so a mechanism attribution would mix ageing with condition changes. Select a battery of "
-                + ", ".join(PV2_GROUPS) + ".")
-        return
-    c1, c2, c3 = st.columns([1.6, 1.0, 1.2])
-    scope = c1.radio("Train on", ["All groups (temperature and current vary)", f"{grp_c} group only"], key="pv2_scope",
-                     help="All groups: the batteries of " + ", ".join(PV2_GROUPS) + " with at least 25 cycles. Only with "
-                          "several temperatures and currents can the model learn how they change each mechanism.")
-    n_seeds = c2.select_slider("Seeds", [1, 3, 5], value=3, key="pv2_seeds",
-                               help="The attribution is repeated with different random seeds; a share that changes with "
-                                    "the seed is not physical.")
-    with_v1 = c3.toggle("Also run PINN v1 (capacity only)", value=True, key="pv2_v1")
-    if scope.startswith("All"):
-        train = sorted({c for g in PV2_GROUPS for c in te.protocol_cells(CT_RAW, g)} - {cell})
-    else:
-        train = [c for c in te.protocol_cells(CT_RAW, grp_c) if c != cell]
-    seeds = tuple(range(int(n_seeds)))
-    st.caption(f"{len(train)} training batteries + {cell} · {n_seeds} seed(s) · dQ/dV is computed once for every "
-               "battery used (a few minutes the first time), each PINN fit takes about a minute per seed.")
-    cfg = (DATA_KEY_RAW, cell, tuple(train), seeds, bool(with_v1))
-    if st.button("Explain this battery's degradation", key="pv2_go", type="primary", icon=":material/biotech:",
-                 disabled=len(train) < 2):
-        try:
-            with st.spinner("Incremental-capacity analysis of the training batteries (runs once)…"):
-                ind = dqdv_all_cached(store, DATA_KEY_RAW, tuple(sorted(set(train) | {cell})))
-            ct2 = te.attach_dqdv(CT_RAW, ind)
-            with st.spinner("Fitting PINN v2 for each seed…"):
-                res2 = explain_cached(ct2, imp, DATA_KEY_RAW + "|dqdv", cell, tuple(train), 2, seeds)
-            res1 = None
-            if with_v1:
-                with st.spinner("Fitting PINN v1 for each seed…"):
-                    res1 = explain_cached(CT_RAW, imp, DATA_KEY_RAW, cell, tuple(train), 1, seeds)
-            st.session_state["pv2"] = {"cfg": cfg, "res2": res2, "res1": res1}
-        except Exception as exc:
-            report_error("PINN v2 explanation failed", exc, debug)
-    saved = st.session_state.get("pv2")
-    if not saved or saved["cfg"][1] != cell:
-        placeholder("Press 'Explain this battery's degradation': the mechanism breakdown, the evidence check and the "
-                    "learned physics appear here.")
-        return
-    if saved["cfg"] != cfg:
-        st.warning("Settings changed since the last run; the results below use the previous settings.")
-    res2, res1 = saved["res2"], saved["res1"]
-    show(fig_mechanisms(res2, P, f"PINN v2: capacity loss of {cell} split into mechanisms (mean of "
-                                 f"{len(res2['seeds'])} seed(s))"), key="pv2_mech", data=res2["frames"])
-    lines = [f"Dominant mechanism: {res2['dominant']} (in {res2['dominant_agreement']} seeds)."]
-    if grp_c in PV2_EXPECT:
-        lines.append("Electrochemical expectation for this group: " + PV2_EXPECT[grp_c])
-    card(f"PINN v2 · {cell}", lines)
-    tabs = {"PINN v2": attribution_table(res2)}
-    if res1 is not None:
-        tabs["PINN v1 (capacity only)"] = attribution_table(res1)
-    cmp_ = pd.concat(tabs, axis=1)
-    show_table(cmp_, note="Share of the capacity lost at the battery's last cycle, mean ± SD over seeds. A large SD "
-                          "means the data cannot tell that mechanism apart from the others.")
-    ev = fig_evidence(res2, P)
-    if ev is not None:
-        show(ev, key="pv2_evidence", data=res2["frames"])
-    pr = res2["params"].drop(columns=["seed"])
-    show_table(pd.DataFrame({"mean": pr.mean(), "SD over seeds": pr.std(ddof=1) if len(pr) > 1 else 0.0}).style.format(
-        "{:.3g}"), note="Learned physics. The activation energy is bounded to 20–80 kJ/mol; the sensitivities are "
-                        "non-negative by construction. A parameter that does not move from its starting value "
-                        "(about 30 kJ/mol, sensitivities ~0.3–1) was not informed by the data.")
-    stamp = {"app version": te.ENGINE_VERSION, "cell": cell, "group": grp_c, "training batteries": " ".join(res2["train_cells"]),
-             "seeds": " ".join(map(str, res2["seeds"]))}
-    out = res2["frames"].assign(model="PINN v2")
-    if res1 is not None:
-        out = pd.concat([out, res1["frames"].assign(model="PINN v1")], ignore_index=True)
-    download("Download the mechanism breakdown (CSV)", out.assign(**stamp).to_csv(index=False).encode(),
-             f"mechanisms_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="pv2_csv")
-
-
-
-# ---- Recovery test: can a model find the TRUE mechanisms? (simulated batteries with a known split) ----
-REC_MODELS = ("Pure physics (one shared parameter set)", "PINN v2", "PINN v1")
-
-
-@st.cache_data(show_spinner=False)
-def recovery_data_cached(seed: int = 0) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    ct_r, imp_r, tr = te.recovery_cohort(seed)
-    return ct_r, imp_r, tr, te.recovery_true_shares(tr)
-
-
-@st.cache_data(show_spinner=False)
-def recovery_physics_cached(restarts: int) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    ct_r, imp_r, _tr, ts = recovery_data_cached()
-    fits, tc, _ = te.recovery_physics_fit(ct_r, imp_r, list(te.RECOVERY_CELLS), restarts=restarts)
-    return te.recovery_physics_table(fits, tc, ts)
-
-
-@st.cache_data(show_spinner=False)
-def recovery_pinn_cached(targets: Tuple[str, ...], version: int, seeds: Tuple[int, ...]) -> pd.DataFrame:
-    ct_r, imp_r, _tr, ts = recovery_data_cached()
-    return te.recovery_pinn_table(ct_r, imp_r, ts, list(targets), version, seeds)
-
-
-def fig_recovery(ts: pd.DataFrame, results: Dict[str, pd.DataFrame], P: Palette, cells: Sequence[str]) -> go.Figure:
-    xs_b, xs_s, vals = [], [], {m: [] for m in te.MECHANISMS}
-    for c in cells:
-        xs_b.append(c); xs_s.append("truth")
-        for m in te.MECHANISMS:
-            vals[m].append(100 * float(ts.loc[c, m]))
-        for name, tab in results.items():
-            row = tab[tab["battery"] == c]
-            if row.empty:
-                continue
-            xs_b.append(c); xs_s.append(name.split(" (")[0].replace("Pure physics", "physics"))
-            for m in te.MECHANISMS:
-                vals[m].append(100 * float(row[f"{m} · model"].iloc[0]))
-    fig = go.Figure()
-    for m in te.MECHANISMS:
-        fig.add_trace(go.Bar(x=[xs_b, xs_s], y=vals[m], name=m, marker_color=MECH_COLORS[MECH_KEYS[m]],
-                             hovertemplate="%{y:.0f} % of the capacity loss<extra>" + m + "</extra>"))
-    fig.update_layout(barmode="stack")
-    fig.update_yaxes(title_text="Share of the capacity loss (%)", range=[0, 100])
-    return style_fig(fig, P, 460, "True mechanism split and what each model finds (last cycle)", hovermode="closest")
-
-
-def recovery_section() -> None:
-    section("Level 4 · Recovery test · Can a model find the TRUE degradation mechanisms?")
-    st.markdown(
-        "On NASA data nobody knows how much capacity was lost to SEI growth, lithium plating or loss of active material, "
-        "so an explanation cannot be checked there. Here 11 batteries are **simulated with a known split**: hot ones "
-        "(43 °C) age mainly by SEI growth, cold ones charged fast (4 °C) mainly by plating, deep discharges at high "
-        "current by loss of active material. Each model sees only what it would see on NASA (capacity, resistance, "
-        "impedance Re and the test conditions), never the split, and its answer is compared with the truth. The "
-        "simulation uses rate laws of the same forms as PINN v2: the favourable case. Passing it is necessary, not "
-        "sufficient; a test with independent physics (PyBaMM) comes next.")
-    ct_r, imp_r, tr, ts = recovery_data_cached()
-    conds = pd.DataFrame(te.RECOVERY_CELLS, index=["ambient (°C)", "discharge (A)", "charge (A)", "cut-off (V)", "cycles"]).T
-    with st.expander("The simulated batteries and their true split"):
-        show_table(pd.concat([conds, (100 * ts).round(1).rename(columns=lambda c: c + " (%)")], axis=1))
-    c1, c2, c3 = st.columns([1.6, 1.2, 0.9])
-    models = c1.multiselect("Models to test", REC_MODELS, default=list(REC_MODELS[:2]), key="rec_models")
-    targets = c2.multiselect("Batteries for the PINN (about a minute each per seed)", list(te.RECOVERY_CELLS),
-                             default=["H1", "C1"], key="rec_targets")
-    n_seeds = c3.select_slider("PINN seeds", [1, 2, 3], value=2, key="rec_seeds")
-    st.caption("The pure physics model is fitted to all 11 batteries at once from 30 random starting points (seconds); "
-               "if all good fits agree, the answer is unique.")
-    cfg = (tuple(models), tuple(targets), int(n_seeds))
-    if st.button("Run the recovery test", key="rec_go", type="primary", icon=":material/fact_check:", disabled=not models):
-        res: Dict[str, Any] = {}
-        try:
-            if REC_MODELS[0] in models:
-                with st.spinner("Fitting the pure physics model…"):
-                    res[REC_MODELS[0]] = recovery_physics_cached(30)
-            for name, ver in ((REC_MODELS[1], 2), (REC_MODELS[2], 1)):
-                if name in models and targets:
-                    with st.spinner(f"Fitting {name} on {len(targets)} battery(ies)…"):
-                        res[name] = (recovery_pinn_cached(tuple(targets), ver, tuple(range(int(n_seeds)))), None)
-            st.session_state["rec"] = {"cfg": cfg, "res": res}
-        except Exception as exc:
-            report_error("Recovery test failed", exc, debug)
-    saved = st.session_state.get("rec")
-    if not saved or not saved["res"]:
-        placeholder("Press 'Run the recovery test': the true and recovered splits appear here.")
-        return
-    if saved["cfg"] != cfg:
-        st.warning("Settings changed since the last run; the results below use the previous settings.")
-    res = saved["res"]
-    tabs = {name: v[0] for name, v in res.items()}
-    summary = pd.DataFrame([{"Model": name, "Batteries": len(t), "Mean error (share points)": t["error (share points)"].mean(),
-                             "Dominant mechanism correct": f"{int(t['dominant correct'].sum())}/{len(t)}"}
-                            for name, t in tabs.items()]).set_index("Model")
-    show_table(summary.style.format({"Mean error (share points)": "{:.1f}"}),
-               note="Error: mean difference between the model's and the true share of each mechanism, in percentage "
-                    "points of the capacity loss. 0 = perfect; around 40 = no better than guessing one mechanism.")
-    shown = list(dict.fromkeys(list(saved["cfg"][1]) + (list(te.RECOVERY_CELLS) if REC_MODELS[0] in res else [])))
-    show(fig_recovery(ts, tabs, P, shown), key="rec_fig")
-    lines = []
-    if REC_MODELS[0] in res:
-        s = res[REC_MODELS[0]][1]
-        L = s["learned"]
-        lines.append(f"Pure physics: {s['mean error']:.1f} share points, dominant correct in {s['dominant correct']:.0%} of "
-                     f"batteries; {s['near-best starts']} of {s['starts']} starts reach the best fit and agree. Learned "
-                     f"SEI activation energy {L['Ea']:.1f} kJ/mol (truth {te.RECOVERY_TRUTH['Ea']:.0f}).")
-    for name in REC_MODELS[1:]:
-        if name in tabs:
-            t = tabs[name]
-            lines.append(f"{name}: {t['error (share points)'].mean():.1f} share points, dominant correct "
-                         f"{int(t['dominant correct'].sum())}/{len(t)}, spread over seeds up to "
-                         f"{t['spread over seeds (points)'].max():.0f} points.")
-    if REC_MODELS[0] in res and any(n in tabs for n in REC_MODELS[1:]):
-        good_phys = res[REC_MODELS[0]][1]["mean error"] < 5
-        bad_pinn = all(tabs[n]["error (share points)"].mean() > 20 for n in REC_MODELS[1:] if n in tabs)
-        if good_phys and bad_pinn:
-            lines.append("Reading: the mechanisms ARE identifiable from capacity, resistance and Re when one physics is "
-                         "shared by all batteries; the PINN misses them because its network and per-battery freedom let "
-                         "each battery choose its own split. A design problem, being fixed.")
-    card("Recovery test", lines)
-    out = pd.concat([t.assign(model=name) for name, t in tabs.items()], ignore_index=True)
-    download("Download the recovery test (CSV)", out.assign(**{"app version": te.ENGINE_VERSION}).to_csv(index=False).encode(),
-             f"recovery_test__v{te.ENGINE_VERSION}.csv", "text/csv", key="rec_csv")
-
 
 
 # ---- Shared physics on the real NASA batteries ----
@@ -6225,9 +5901,13 @@ def fig_nasa_traj(tr: pd.DataFrame, P: Palette, cell: str) -> go.Figure:
 
 
 def nasa_physics_section() -> None:
-    section("Level 4 · Shared physics on the NASA batteries · Which mechanisms explain the real capacity loss?")
+    section("Level 4 · Shared physics on the NASA batteries (no neural network) · Which mechanisms explain the real "
+            "capacity loss?")
     st.markdown(
-        "The model that **passed the recovery test**: one set of physics parameters for **all** batteries, with SEI "
+        "A purely physics-based model, **without any neural network**: three degradation equations with 11 physical "
+        "parameters estimated from the data. It is the model that **passed the recovery test** (simulated batteries with "
+        "a known split: 1.1 share points of error, against 42–45 for the PINN): one set of physics parameters for "
+        "**all** batteries, with SEI "
         "growth, lithium plating and loss of active material computed from their rate laws, so differences between "
         "batteries can only come from their **conditions** (temperature, charge and discharge current, depth of "
         "discharge). It is fitted to every battery of the constant-condition groups at once, from many random starts. "
@@ -6301,6 +5981,130 @@ def nasa_physics_section() -> None:
              f"shared_physics_NASA__v{te.ENGINE_VERSION}.csv", "text/csv", key="np_csv")
 
 
+
+# ---- Hybrid: shared physics (the explanation) + a small bounded network (what the physics misses) ----
+HYB_UNEXPL_COLOR = "#9AA3AD"
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def hybrid_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...], restarts: int,
+                  fit_with: str, lam: float) -> Dict[str, Any]:
+    return te.nasa_hybrid_fit(_ct, _imp, list(cells), fit_with=fit_with, restarts=restarts, lam=lam)
+
+
+@st.cache_data(show_spinner=False)
+def hybrid_validation_cached(lam: float) -> pd.DataFrame:
+    return te.hybrid_validation(restarts=10, lam=lam)
+
+
+def fig_hybrid_shares(tab: pd.DataFrame, P: Palette) -> go.Figure:
+    order = {"Hot": 0, "High current": 1, "Reference": 2, "Pulsed load": 3, "Cold": 4}
+    t = tab.assign(_o=tab["group"].map(order).fillna(9)).sort_values(["_o", "battery"])
+    fig = go.Figure()
+    for m in te.MECHANISMS:
+        fig.add_trace(go.Bar(x=[t["group"], t["battery"]], y=t[f"{m} (%)"], name=m, marker_color=MECH_COLORS[MECH_KEYS[m]],
+                             hovertemplate="%{y:.0f} % of the capacity loss<extra>" + m + "</extra>"))
+    col = f"{te.HYBRID_UNEXPLAINED} (%)"
+    fig.add_trace(go.Bar(x=[t["group"], t["battery"]], y=t[col], name="Not explained by the physics (network)",
+                         marker_color=HYB_UNEXPL_COLOR, marker_pattern_shape="/",
+                         hovertemplate="%{y:.0f} % of the capacity loss<extra>not explained by the physics</extra>"))
+    fig.update_layout(barmode="stack")
+    fig.update_yaxes(title_text="Share of the capacity loss (%)", range=[0, 100])
+    return style_fig(fig, P, 460, "Hybrid: mechanism split (physics) and the part the physics does not explain (network)",
+                     hovermode="closest")
+
+
+def fig_hybrid_traj(tr: pd.DataFrame, P: Palette, cell: str) -> go.Figure:
+    fig = go.Figure()
+    for m in te.MECHANISMS:
+        fig.add_trace(go.Scatter(x=tr["n"], y=100 * tr[m].clip(lower=0), name=m, stackgroup="mech", mode="lines",
+                                 line=dict(width=0.6, color=MECH_COLORS[MECH_KEYS[m]])))
+    fig.add_trace(go.Scatter(x=tr["n"], y=100 * tr[te.HYBRID_UNEXPLAINED].clip(lower=0), name="Not explained by the physics",
+                             stackgroup="mech", mode="lines", line=dict(width=0.6, color=HYB_UNEXPL_COLOR)))
+    fig.add_trace(go.Scatter(x=tr["n"], y=100 * (1 - tr["SOH observed"]), name="Measured capacity loss", mode="markers",
+                             marker=dict(color=P.text, size=4)))
+    fig.add_trace(go.Scatter(x=tr["n"], y=100 * (1 - tr["SOH physics"]), name="Physics alone",
+                             line=dict(color=P.text, width=1.2, dash="dash")))
+    fig.add_trace(go.Scatter(x=tr["n"], y=100 * (1 - tr["SOH (model)"]), name="Hybrid (physics + network)",
+                             line=dict(color="#D55E00", width=2)))
+    fig.update_xaxes(title_text="Discharge cycle n")
+    fig.update_yaxes(title_text="Share of initial capacity (%)", rangemode="tozero")
+    return style_fig(fig, P, 430, f"Hybrid fit of {cell}: physics mechanisms, network correction and measurement")
+
+
+def hybrid_section() -> None:
+    section("Level 4 · Hybrid · Shared physics (the explanation) + a small neural network (what the physics misses)")
+    st.markdown(
+        "The **shared physics** (section above) computes SEI growth, lithium plating and loss of active material and is "
+        "**frozen**; a **small neural network** then learns only what the physics leaves unexplained (measurement minus "
+        "physics). Its correction is bounded (±8 SOH points), penalised towards zero, and shown openly as a fourth "
+        "category, **not explained by the physics**. So the mechanism split stays the physics' split, the network adds "
+        "accuracy, and a battery the network must correct strongly is a battery for which the physics is missing "
+        "something (e.g. a knee). Why frozen: on simulated batteries with a known split, every variant in which the "
+        "network also shaped the physics made the split worse; the network improves the fit, not the explanation.")
+    cells = tuple(sorted({c for g in te.NASA_PHYSICS_GROUPS for c in te.protocol_cells(CT_RAW, g)}))
+    c1, c2, c3 = st.columns([1.6, 0.8, 0.9])
+    fit_with = NP_EVIDENCE[c1.radio("Fit the SEI to", list(NP_EVIDENCE), key="hy_ev")]
+    restarts = c2.select_slider("Random starts", [10, 30], value=30, key="hy_starts")
+    lam = c3.select_slider("Network penalty", [0.1, 0.3, 1.0], value=0.3, key="hy_lam",
+                           help="Higher: the network corrects less. The mechanism split does not depend on it.")
+    with st.expander("Check the hybrid on simulated batteries with a known split (about 10 seconds)"):
+        st.caption("11 batteries follow the shared physics exactly; three of them (R2, C2, H3) also get a knee the "
+                   "physics cannot describe. A good hybrid keeps the physics' split and fits the knees better.")
+        if st.button("Run the check", key="hy_val"):
+            with st.spinner("Fitting physics and network on the simulated batteries…"):
+                st.session_state["hy_val_res"] = hybrid_validation_cached(float(lam))
+        v = st.session_state.get("hy_val_res")
+        if v is not None:
+            k = v["battery"].isin(te.HYBRID_KNEE_CELLS)
+            card("Check on simulated batteries", [
+                f"Split error (share points, mean): physics alone {v['split error, physics alone (points)'].mean():.2f}, "
+                f"hybrid {v['split error, hybrid (points)'].mean():.2f} (identical by design).",
+                f"Fit error on the knee batteries: physics alone {v.loc[k, 'fit error, physics alone (SOH points)'].mean():.2f}, "
+                f"hybrid {v.loc[k, 'fit error, hybrid (SOH points)'].mean():.2f} SOH points; on the others "
+                f"{v.loc[~k, 'fit error, physics alone (SOH points)'].mean():.2f} and "
+                f"{v.loc[~k, 'fit error, hybrid (SOH points)'].mean():.2f}.",
+                "The knees bend the shared physics a little for every battery (split error not zero): a limit of "
+                "any shared model when some batteries behave differently."])
+            show_table(v.set_index("battery").style.format("{:.2f}"))
+    cfg = (DATA_KEY_RAW, cells, int(restarts), fit_with, float(lam))
+    if st.button("Fit the hybrid to the NASA batteries", key="hy_go", type="primary", icon=":material/hub:",
+                 disabled=len(cells) < 3):
+        try:
+            with st.spinner("Shared physics first, then the network on what it leaves…"):
+                h = hybrid_cached(CT_RAW, imp, DATA_KEY_RAW, cells, int(restarts), fit_with, float(lam))
+            st.session_state["hy"] = {"cfg": cfg, "h": h}
+        except Exception as exc:
+            report_error("Hybrid fit failed", exc, debug)
+    saved = st.session_state.get("hy")
+    if not saved:
+        placeholder("Press 'Fit the hybrid to the NASA batteries': the split with the unexplained part, the fit "
+                    "improvement and the batteries the physics does not describe appear here.")
+        return
+    if saved["cfg"] != cfg:
+        st.warning("Settings changed since the last run; the results below use the previous settings.")
+    h = saved["h"]
+    groups = te.condition_groups(CT_RAW)
+    tab, s = te.hybrid_table(h, groups)
+    need = s["batteries needing the network"]
+    card("Hybrid on NASA", [
+        f"Mean fit error: physics alone {s['mean fit physics']:.2f}, hybrid {s['mean fit hybrid']:.2f} SOH points.",
+        ("Batteries the physics does not describe well (network correction above 2 SOH points RMS): " + ", ".join(need) + "."
+         ) if need else "No battery needs a large network correction: the physics describes all of them.",
+        "The SEI / plating / LAM split is the shared physics' split (frozen); the grey part is what the network adds."])
+    show(fig_hybrid_shares(tab, P), key="hy_shares", data=tab)
+    show_table(tab.set_index("battery").style.format(precision=2, na_rep="—"),
+               note="Physics over-predicts the loss: the network removes loss the physics predicts but the battery did "
+                    "not show (shown as a number, not in the bars).")
+    pick = st.selectbox("Battery to inspect", list(h["data"]), key="hy_cell",
+                        index=list(h["data"]).index(cell) if cell in h["data"] else 0)
+    show(fig_hybrid_traj(te.hybrid_trajectory(h, pick), P, pick), key="hy_traj")
+    download("Download the hybrid results (CSV)",
+             tab.assign(**{"app version": te.ENGINE_VERSION, "SEI fitted to": fit_with, "network penalty": lam,
+                           **{f"learned {k_}": v_ for k_, v_ in s["learned"].items()}}).to_csv(index=False).encode(),
+             f"hybrid_NASA__v{te.ENGINE_VERSION}.csv", "text/csv", key="hy_csv")
+
+
 def pinn_section() -> None:
     model_level_section(
         4, "Level 4 · Physics-informed neural network: does knowing the physics improve the prediction?",
@@ -6342,9 +6146,8 @@ def view_models() -> None:
     trajectory_section()
     deep_section()
     pinn_section()
-    pinn_v2_section()
-    recovery_section()
     nasa_physics_section()
+    hybrid_section()
     ladder_leaderboard()
     assessment_section()
 

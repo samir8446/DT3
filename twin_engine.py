@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.19.0"
+ENGINE_VERSION = "5.20.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -9589,9 +9589,14 @@ def nasa_mechanisms_v2(p: dict, cd: dict):
     return s, pl, m
 
 
+NASA_V2_BOUNDS_NOKNEE = {**NASA_V2_BOUNDS, "beta0": (1e-3, 1.000001e-3), "beta_V": (0.0, 1e-9)}
+
+
 def _nasa_spec(version: int):
     if version == 2:
         return NASA_V2_PNAMES, NASA_V2_LOG, NASA_V2_BOUNDS, nasa_mechanisms_v2
+    if version == 22:                                         # v2 without its knee term: used by the hybrid
+        return NASA_V2_PNAMES, NASA_V2_LOG, NASA_V2_BOUNDS_NOKNEE, nasa_mechanisms_v2
     return RECOVERY_PNAMES, RECOVERY_LOG, RECOVERY_BOUNDS, recovery_mechanisms
 
 
@@ -9619,23 +9624,14 @@ def _nasa_conditions(ct: pd.DataFrame, cells: Sequence[str]) -> Dict[str, Dict[s
     return out
 
 
-def nasa_physics_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], restarts: int = 30,
-                     use_re: bool = False, seed: int = 0, progress: ProgressFn = None, version: int = 1,
-                     fit_with: Optional[str] = None) -> Dict[str, Any]:
-    """Fit the shared physics to real batteries (see the section header). Returns the fits sorted by cost, the
-    per-battery data, and the measured Re (relative) per battery for the check."""
+def _shared_physics_core(cds: Dict[str, Dict[str, Any]], re: Dict[str, Any], version: int, fit_with: str,
+                         restarts: int, seed: int = 0, progress: ProgressFn = None,
+                         offsets: Optional[Dict[str, np.ndarray]] = None,
+                         x0: Optional[Sequence[np.ndarray]] = None, robust: bool = False) -> List[Dict[str, Any]]:
+    """Least-squares fit of one shared physics to all batteries from x0 (warm starts) and `restarts` random starts.
+    offsets: per-battery SOH corrections to remove from the measurement first (the hybrid's network part)."""
     from scipy.optimize import least_squares
-    cds = _nasa_conditions(ct, cells)
-    if len(cds) < 3:
-        raise ValueError("shared physics: needs at least 3 batteries with 10 valid cycles")
-    re = {}
-    for c in cds:
-        rr = _re_relative(imp, ct, c)
-        if rr is not None:
-            re[c] = rr
     names, logs, bounds, mech = _nasa_spec(version)
-    if fit_with is None:                                     # version 1 behaviour: resistance always, Re optional
-        fit_with = "both" if use_re else "R_dc"
     fit_r, fit_re = fit_with in ("R_dc", "both"), fit_with in ("Re", "both")
 
     def full(x):
@@ -9647,7 +9643,8 @@ def nasa_physics_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Seque
         for c, cd in cds.items():
             s, pl, m = mech(p, cd)
             soh = (1 - s - pl) * (1 - m)
-            e = (soh - cd["soh"]) / 0.01
+            target = cd["soh"] - offsets[c] if offsets is not None and c in offsets else cd["soh"]
+            e = (soh - target) / 0.01
             out.append(e[np.isfinite(e)])
             if fit_r:
                 rm = (1 + p["g"] * s) / (1 + p["g"] * s[:5].mean()) - cd["r"]
@@ -9660,21 +9657,47 @@ def nasa_physics_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Seque
     lo = [math.log(bounds[k][0]) if k in logs else bounds[k][0] for k in names]
     hi = [math.log(bounds[k][1]) if k in logs else bounds[k][1] for k in names]
     rng = np.random.default_rng(seed)
+    starts = [np.clip(np.asarray(v, float), lo, hi) for v in (x0 or [])]
+    starts += [rng.uniform(lo, hi) for _ in range(restarts)]
     fits = []
-    for r_ in range(restarts):
-        _report(progress, r_ / max(restarts, 1), f"shared physics · start {r_ + 1}/{restarts}")
+    for r_, s0 in enumerate(starts):
+        _report(progress, r_ / max(len(starts), 1), f"shared physics · start {r_ + 1}/{len(starts)}")
         try:
-            sol = least_squares(resid, rng.uniform(lo, hi), bounds=(lo, hi), max_nfev=400)
+            sol = (least_squares(resid, s0, bounds=(lo, hi), max_nfev=400, loss="soft_l1", f_scale=2.0) if robust
+                   else least_squares(resid, s0, bounds=(lo, hi), max_nfev=400))
         except Exception:
             continue
-        p = full(sol.x)
-        fits.append({"restart": r_, "cost": float(sol.cost), "params": p})
+        fits.append({"restart": r_, "cost": float(sol.cost), "params": full(sol.x), "x": sol.x.copy()})
     _report(progress, 1.0, "shared physics done")
     if not fits:
         raise ValueError("shared physics: no start converged")
     fits.sort(key=lambda f: f["cost"])
-    return {"fits": fits, "data": cds, "re": re, "use_re": fit_re, "fit_r": fit_r, "version": version,
-            "fit_with": fit_with}
+    return fits
+
+
+def _nasa_inputs(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str]):
+    cds = _nasa_conditions(ct, cells)
+    if len(cds) < 3:
+        raise ValueError("shared physics: needs at least 3 batteries with 10 valid cycles")
+    re = {}
+    for c in cds:
+        rr = _re_relative(imp, ct, c)
+        if rr is not None:
+            re[c] = rr
+    return cds, re
+
+
+def nasa_physics_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], restarts: int = 30,
+                     use_re: bool = False, seed: int = 0, progress: ProgressFn = None, version: int = 1,
+                     fit_with: Optional[str] = None) -> Dict[str, Any]:
+    """Fit the shared physics to real batteries (see the section header). Returns the fits sorted by cost, the
+    per-battery data, and the measured Re (relative) per battery for the check."""
+    cds, re = _nasa_inputs(ct, imp, cells)
+    if fit_with is None:                                     # version 1 behaviour: resistance always, Re optional
+        fit_with = "both" if use_re else "R_dc"
+    fits = _shared_physics_core(cds, re, version, fit_with, restarts, seed, progress)
+    return {"fits": fits, "data": cds, "re": re, "use_re": fit_with in ("Re", "both"),
+            "fit_r": fit_with in ("R_dc", "both"), "version": version, "fit_with": fit_with}
 
 
 def nasa_physics_table(res: Dict[str, Any], groups: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
@@ -9729,3 +9752,195 @@ def nasa_physics_trajectory(res: Dict[str, Any], cell: str) -> pd.DataFrame:
     s, pl, m = _nasa_spec(res.get("version", 1))[3](res["fits"][0]["params"], cd)
     return pd.DataFrame({"n": cd["n"], "SOH observed": cd["soh"], "SOH (model)": (1 - s - pl) * (1 - m),
                          MECHANISMS[0]: s, MECHANISMS[1]: pl, MECHANISMS[2]: m})
+
+
+# =============================================================================
+# 49. HYBRID: SHARED PHYSICS (the explanation) + A SMALL BOUNDED NETWORK (what the physics misses)
+# =============================================================================
+# The recovery test showed that a network which draws the mechanisms destroys their identifiability, while one
+# shared physics recovers them. The hybrid keeps that division of labour:
+#   SOH = (1 - LLI_SEI - LLI_pl)(1 - LAM)  [shared physics v2, the mechanism split]  +  delta  [network correction]
+# delta = B * tanh(net(throughput, conditions, battery code)), |delta| <= B = 8 SOH points, penalised towards 0.
+# The physics is fitted first and frozen; the network then learns only what the physics leaves (validated:
+# letting the network shape the physics worsened the split in every variant tried).
+# delta is reported as a fourth category, "not explained by the physics": a battery whose fade the network must
+# explain in large part is a battery for which the physics is missing something (e.g. a knee).
+HYBRID_BOUND = 0.08
+HYBRID_UNEXPLAINED = "Not explained by the physics (network correction)"
+
+
+def _hybrid_features(cds: Dict[str, Dict[str, Any]]) -> Dict[str, np.ndarray]:
+    names = list(cds)
+    out = {}
+    for k, c in enumerate(names):
+        cd = cds[c]
+        n = len(cd["a"])
+        onehot = np.zeros((n, len(names)))
+        onehot[:, k] = 0.5
+        cond = np.array([cd["x_t"] * 100, cd["cold"], cd["x_i"], cd["depth"]])
+        out[c] = np.column_stack([cd["a"], cd["a"] ** 2, np.tile(cond, (n, 1)), onehot])
+    return out
+
+
+def _hybrid_net_fit(X: np.ndarray, y: np.ndarray, lam: float, seed: int, iters: int = 1500, hidden: int = 16):
+    """Small tanh network, output bounded to +-HYBRID_BOUND, trained on the physics residual with a penalty on its
+    size (lam) and weight decay. Returns a predict function."""
+    rng = np.random.default_rng(seed)
+    F = X.shape[1]
+    g_ = lambda *s_: Tensor(rng.normal(0, 1 / math.sqrt(s_[0]), size=s_))
+    W1, b1 = g_(F, hidden), Tensor(np.zeros((1, hidden)))
+    W2, b2 = g_(hidden, hidden), Tensor(np.zeros((1, hidden)))
+    W3, b3 = Tensor(rng.normal(0, 0.01, size=(hidden, 1))), Tensor(np.zeros((1, 1)))
+    params = [W1, b1, W2, b2, W3, b3]
+    Xt, Yt = Tensor(X), Tensor(y[:, None])
+
+    def net(Xin):
+        h = (Xin @ W1 + b1).tanh()
+        h = (h @ W2 + b2).tanh()
+        return (h @ W3 + b3).tanh() * HYBRID_BOUND
+
+    opt = Adam(params, lr=5e-3)
+    for _ in range(iters):
+        out = net(Xt)
+        loss = ((out - Yt).square()).mean() * (1 / 0.01 ** 2) + (out.square()).mean() * (lam / 0.01 ** 2)
+        for w in (W1, W2, W3):
+            loss = loss + (w.square()).mean() * 1e-3
+        for q in params:
+            q.grad = np.zeros_like(q.data)
+        loss.backward()
+        opt.step()
+    return lambda Xin: net(Tensor(Xin)).data[:, 0]
+
+
+def hybrid_fit_cds(cds: Dict[str, Dict[str, Any]], re: Dict[str, Any], fit_with: str = "Re", restarts: int = 20,
+                   rounds: int = 0, lam: float = 0.3, seed: int = 0, progress: ProgressFn = None) -> Dict[str, Any]:
+    """Hybrid on prepared battery data. Shared physics v2 is fitted first and FROZEN (the mechanism split); the
+    bounded network is then fitted to what the physics leaves (measurement - physics).
+    Validation (2026-10-22, knee cohort): every variant in which the network also shaped the physics (alternating
+    refits, robust loss, knee-free physics, refit without flagged batteries) made the split worse (3.9-6.8 share
+    points vs 3.4 for the physics alone); the network improves the fit, not the explanation. Hence frozen physics.
+    rounds > 0 restores the alternating refit (kept only for comparison)."""
+    _report(progress, 0.0, "hybrid · shared physics")
+    phys = _shared_physics_core(cds, re, 2, fit_with, restarts, seed)
+    best = phys[0]
+    feats = _hybrid_features(cds)
+
+    def net_round(p, k):
+        Xs, ys = [], []
+        for c, cd in cds.items():
+            s, pl, m = nasa_mechanisms_v2(p, cd)
+            res_ = cd["soh"] - (1 - s - pl) * (1 - m)
+            ok = np.isfinite(res_)
+            Xs.append(feats[c][ok]); ys.append(res_[ok])
+        predict = _hybrid_net_fit(np.vstack(Xs), np.concatenate(ys), lam, seed + k)
+        return {c: predict(feats[c]) for c in cds}
+
+    _report(progress, 0.5, "hybrid · network on the physics residual")
+    delta = net_round(best["params"], 0)
+    for r_ in range(rounds):
+        refit = _shared_physics_core(cds, re, 2, fit_with, 2, seed + 100 + r_, offsets=delta, x0=[best["x"]])
+        best = refit[0]
+        delta = net_round(best["params"], r_ + 1)
+    _report(progress, 1.0, "hybrid done")
+    return {"params": best["params"], "delta": delta, "physics_only": phys[0]["params"], "physics_fits": phys,
+            "data": cds, "re": re, "fit_with": fit_with, "lam": lam}
+
+
+def nasa_hybrid_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], fit_with: str = "Re",
+                    restarts: int = 20, rounds: int = 0, lam: float = 0.3, seed: int = 0,
+                    progress: ProgressFn = None) -> Dict[str, Any]:
+    cds, re = _nasa_inputs(ct, imp, cells)
+    return hybrid_fit_cds(cds, re, fit_with, restarts, rounds, lam, seed, progress)
+
+
+def hybrid_table(h: Dict[str, Any], groups: Optional[pd.DataFrame] = None) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """Per battery: the physics split (SEI, plating, LAM) and the part not explained by the physics, at the last
+    cycle, as % of initial capacity and as shares of the model's capacity loss; fit error of physics alone and of
+    the hybrid; size of the network correction."""
+    rows = []
+    for c, cd in h["data"].items():
+        s, pl, m = nasa_mechanisms_v2(h["params"], cd)
+        phys_soh = (1 - s - pl) * (1 - m)
+        hyb_soh = phys_soh + h["delta"][c]
+        s0, pl0, m0 = nasa_mechanisms_v2(h["physics_only"], cd)
+        phys0 = (1 - s0 - pl0) * (1 - m0)
+        ok = np.isfinite(cd["soh"])
+        unexpl = float(-h["delta"][c][-1])                 # > 0: the network adds loss the physics does not explain
+        parts = np.array([s[-1], pl[-1], m[-1]])
+        tot = parts.sum() + max(unexpl, 0.0)
+        row = {"battery": c, "group": str(groups.loc[c, "Group"]) if groups is not None and c in groups.index else "",
+               "cell temperature (°C)": cd["T_C"], "discharge (A)": cd["I_dis"], "cut-off (V)": cd["V_cut"],
+               "capacity lost (%)": 100 * (1 - float(cd["soh"][ok][-3:].mean())),
+               "fit error, physics alone (SOH points)": 100 * float(np.sqrt(np.mean((phys0[ok] - cd["soh"][ok]) ** 2))),
+               "fit error, hybrid (SOH points)": 100 * float(np.sqrt(np.mean((hyb_soh[ok] - cd["soh"][ok]) ** 2))),
+               "network correction, RMS (SOH points)": 100 * float(np.sqrt(np.mean(h["delta"][c] ** 2))),
+               **{f"{k} (%)": 100 * float(parts[j] / tot) if tot > 0 else np.nan for j, k in enumerate(MECHANISMS)},
+               f"{HYBRID_UNEXPLAINED} (%)": 100 * max(unexpl, 0.0) / tot if tot > 0 else np.nan,
+               "physics over-predicts the loss by (SOH points)": 100 * max(-unexpl, 0.0)}
+        rows.append(row)
+    tab = pd.DataFrame(rows)
+    summ = {"learned": h["params"], "mean fit physics": float(tab["fit error, physics alone (SOH points)"].mean()),
+            "mean fit hybrid": float(tab["fit error, hybrid (SOH points)"].mean()),
+            "batteries needing the network": tab.loc[tab["network correction, RMS (SOH points)"] > 2, "battery"].tolist()}
+    return tab, summ
+
+
+def hybrid_trajectory(h: Dict[str, Any], cell: str) -> pd.DataFrame:
+    cd = h["data"][cell]
+    s, pl, m = nasa_mechanisms_v2(h["params"], cd)
+    phys = (1 - s - pl) * (1 - m)
+    return pd.DataFrame({"n": cd["n"], "SOH observed": cd["soh"], "SOH physics": phys, "SOH (model)": phys + h["delta"][cell],
+                         MECHANISMS[0]: s, MECHANISMS[1]: pl, MECHANISMS[2]: m, HYBRID_UNEXPLAINED: -h["delta"][cell]})
+
+
+# ---- validation: batteries that follow the v2 physics PLUS a knee the physics cannot describe ----
+HYBRID_TRUTH = {"k_sei": 4.0e-3, "Ea": 50.0, "k_pl": 0.35, "b_C": 1.0, "k_lam": 0.012, "a_I": 0.6, "a_V": 2.0,
+                "beta0": 1e-3, "beta_V": 0.0, "g": 3.0, "g_e": 5.0}
+HYBRID_KNEE_CELLS = ("R2", "C2", "H3")                       # an extra accelerating loss after a = 0.3
+
+
+def hybrid_validation_cohort(seed: int = 0):
+    """Battery data with a KNOWN v2 split plus an unmodelled knee on three batteries. Returns (cds, re, truth shares
+    of the three mechanisms at the last cycle, knee size per battery)."""
+    rng = np.random.default_rng(seed)
+    cds, re, shares, knee = {}, {}, {}, {}
+    for cid, (T, I, Ic, Vc, N) in RECOVERY_CELLS.items():
+        Tk = T + 273.15 + 0.5 * I
+        cd = {"x_t": 1 / 298.15 - 1 / Tk, "cold": max(0.0, T_COLD_C - (Tk - 273.15)) / 10, "x_ic": math.log(Ic / 1.5),
+              "x_i": math.log(I / 2.0), "depth": max(0.0, 2.7 - Vc) / 0.7, "T_C": Tk - 273.15, "I_dis": float(I),
+              "I_ch": float(Ic), "V_cut": float(Vc)}
+        a = np.cumsum(np.full(N, 2.0 * 0.85 / PINN_A_SCALE))
+        cd["a"], cd["n"] = a, np.arange(1, N + 1, dtype=float)
+        s, pl, m = nasa_mechanisms_v2(HYBRID_TRUTH, cd)
+        kn = 0.6 * np.clip(a - 0.3, 0, None) ** 2 * (cid in HYBRID_KNEE_CELLS)
+        soh = (1 - s - pl) * (1 - m) - kn
+        cd["soh"] = soh + rng.normal(0, 0.003, N)
+        cd["r"] = (1 + HYBRID_TRUTH["g"] * s) * (1 + rng.normal(0, 0.01, N))
+        n_e = cd["n"][::10]
+        re[cid] = (n_e, (1 + HYBRID_TRUTH["g_e"] * s[::10]) * (1 + rng.normal(0, 0.01, len(n_e))))
+        v = np.array([s[-1], pl[-1], m[-1]])
+        shares[cid] = v / v.sum()
+        knee[cid] = float(kn[-1])
+        cds[cid] = cd
+    return cds, re, shares, knee
+
+
+def hybrid_validation(restarts: int = 10, seed: int = 0, progress: ProgressFn = None, lam: float = 0.3) -> pd.DataFrame:
+    """Physics alone vs hybrid on the knee cohort: error of the mechanism split (share points, among the three
+    mechanisms) against the truth, fit error, and how much the network takes on each battery."""
+    cds, re, shares, knee = hybrid_validation_cohort(seed)
+    h = hybrid_fit_cds(cds, re, "Re", restarts, 0, lam, seed, progress)
+    rows = []
+    for c, cd in cds.items():
+        tr = shares[c]
+        out = {"battery": c, "knee (SOH points)": 100 * knee[c]}
+        for lab, p in (("physics alone", h["physics_only"]), ("hybrid", h["params"])):
+            s, pl, m = nasa_mechanisms_v2(p, cd)
+            v = np.array([s[-1], pl[-1], m[-1]])
+            sh = v / v.sum()
+            soh_m = (1 - s - pl) * (1 - m) + (h["delta"][c] if lab == "hybrid" else 0)
+            out[f"split error, {lab} (points)"] = 100 * float(np.mean(np.abs(sh - tr)))
+            out[f"fit error, {lab} (SOH points)"] = 100 * float(np.sqrt(np.mean((soh_m - cd["soh"]) ** 2)))
+        out["network correction at the end (SOH points)"] = 100 * float(-h["delta"][c][-1])
+        rows.append(out)
+    return pd.DataFrame(rows)
