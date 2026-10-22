@@ -1,9 +1,23 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.20.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.21.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Physics-based forecasters in the accuracy assessment; joint-training test (v5.21.0)
+
+1. Engine section 50, physics_forecast: shared physics v2 ("phys:Shared physics v2"), frozen hybrid ("hyb:Hybrid"),
+   joint hybrid with guardrails ("hybj:Hybrid") as forecasters. Trained on every other battery of the constant-
+   condition groups plus the target's history up to n0 only; future extrapolated cycle by cycle (throughput from the
+   predicted capacity); starts from SOH now (median of the last 3 clean cycles); band from the prefix fit error.
+   Test: corrupting the target's data after n0 changes nothing.
+2. Hybrid joint training with guardrails (hybrid_fit_cds: rounds, battery_code, ortho = penalty on the correction's
+   projection onto the SEI / plating / LAM curves). Validation on the known split: frozen 3.43 share points; joint
+   without guardrails 5.08; no battery code 5.09; + orthogonality 10: 4.96; 100: 4.25; code + 100: 4.17 (fit worse
+   as guardrails tighten). Frozen stays the explanation model; the joint variant is kept only to compare forecasts.
+3. App: accuracy assessment level "Level 4 · Shared physics + hybrids".
+4. tests/test_physics_forecast.py (3); 26 tests pass; AppTest of the assessment with the new level; all views.
 
 ## Hybrid fixes (v5.20.1)
 

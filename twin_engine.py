@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.20.1"
+ENGINE_VERSION = "5.21.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -9770,20 +9770,24 @@ HYBRID_BOUND = 0.25                  # v5.20.1: 0.08 hid most of B0006's unexpla
 HYBRID_UNEXPLAINED = "Not explained by the physics (network correction)"
 
 
-def _hybrid_features(cds: Dict[str, Dict[str, Any]]) -> Dict[str, np.ndarray]:
-    names = list(cds)
-    out = {}
-    for k, c in enumerate(names):
-        cd = cds[c]
-        n = len(cd["a"])
-        onehot = np.zeros((n, len(names)))
+def _hybrid_row_features(cd: Dict[str, Any], k: int, nb: int, battery_code: bool = True) -> np.ndarray:
+    n = len(cd["a"])
+    cond = np.array([cd["x_t"] * 100, cd["cold"], cd["x_i"], cd["depth"]])
+    cols = [cd["a"], cd["a"] ** 2, np.tile(cond, (n, 1))]
+    if battery_code:
+        onehot = np.zeros((n, nb))
         onehot[:, k] = 0.5
-        cond = np.array([cd["x_t"] * 100, cd["cold"], cd["x_i"], cd["depth"]])
-        out[c] = np.column_stack([cd["a"], cd["a"] ** 2, np.tile(cond, (n, 1)), onehot])
-    return out
+        cols.append(onehot)
+    return np.column_stack(cols)
 
 
-def _hybrid_net_fit(X: np.ndarray, y: np.ndarray, lam: float, seed: int, iters: int = 1500, hidden: int = 16):
+def _hybrid_features(cds: Dict[str, Dict[str, Any]], battery_code: bool = True) -> Dict[str, np.ndarray]:
+    names = list(cds)
+    return {c: _hybrid_row_features(cds[c], k, len(names), battery_code) for k, c in enumerate(names)}
+
+
+def _hybrid_net_fit(X: np.ndarray, y: np.ndarray, lam: float, seed: int, iters: int = 1500, hidden: int = 16,
+                    basis: Optional[np.ndarray] = None, ortho: float = 0.0):
     """Small tanh network, output bounded to +-HYBRID_BOUND, trained on the physics residual with a penalty on its
     size (lam) and weight decay. Returns a predict function."""
     rng = np.random.default_rng(seed)
@@ -9805,9 +9809,16 @@ def _hybrid_net_fit(X: np.ndarray, y: np.ndarray, lam: float, seed: int, iters: 
         return (h @ W3 + b3).tanh() * HYBRID_BOUND * ramp(Xn)
 
     opt = Adam(params, lr=5e-3)
+    B = None
+    if basis is not None and ortho > 0:                 # unit-norm mechanism curves: the network must stay orthogonal
+        Bn = basis / np.maximum(np.linalg.norm(basis, axis=0, keepdims=True), 1e-12)
+        B = [Tensor(Bn[:, [k]] * len(X)) for k in range(Bn.shape[1])]
     for _ in range(iters):
         out = net(Xt, X)
         loss = ((out - Yt).square()).mean() * (1 / 0.01 ** 2) + (out.square()).mean() * (lam / 0.01 ** 2)
+        if B is not None:
+            for b_ in B:                                # (projection of the correction on a mechanism curve)^2
+                loss = loss + ((out * b_).mean().square()) * (ortho / (0.01 ** 2 * len(X)))
         for w in (W1, W2, W3):
             loss = loss + (w.square()).mean() * 1e-3
         for q in params:
@@ -9818,37 +9829,40 @@ def _hybrid_net_fit(X: np.ndarray, y: np.ndarray, lam: float, seed: int, iters: 
 
 
 def hybrid_fit_cds(cds: Dict[str, Dict[str, Any]], re: Dict[str, Any], fit_with: str = "Re", restarts: int = 20,
-                   rounds: int = 0, lam: float = 0.3, seed: int = 0, progress: ProgressFn = None) -> Dict[str, Any]:
-    """Hybrid on prepared battery data. Shared physics v2 is fitted first and FROZEN (the mechanism split); the
-    bounded network is then fitted to what the physics leaves (measurement - physics).
-    Validation (2026-10-22, knee cohort): every variant in which the network also shaped the physics (alternating
-    refits, robust loss, knee-free physics, refit without flagged batteries) made the split worse (3.9-6.8 share
-    points vs 3.4 for the physics alone); the network improves the fit, not the explanation. Hence frozen physics.
-    rounds > 0 restores the alternating refit (kept only for comparison)."""
+                   rounds: int = 0, lam: float = 0.3, seed: int = 0, progress: ProgressFn = None,
+                   battery_code: bool = True, ortho: float = 0.0) -> Dict[str, Any]:
+    """Hybrid on prepared battery data.
+    Default (frozen): shared physics v2 fitted first and frozen; the bounded network learns what it leaves.
+    Joint training with guardrails: rounds > 0 refits physics and network alternately; battery_code=False removes the
+    battery code from the network (no per-battery explanation); ortho > 0 penalises any part of the correction that
+    has the shape of the SEI, plating or LAM curves (it can only learn what differs from the mechanisms).
+    Validation (2026-10-22, knee cohort): joint training WITHOUT guardrails worsened the split (3.9-6.8 vs 3.4)."""
     _report(progress, 0.0, "hybrid · shared physics")
     phys = _shared_physics_core(cds, re, 2, fit_with, restarts, seed)
     best = phys[0]
-    feats = _hybrid_features(cds)
+    feats = _hybrid_features(cds, battery_code)
 
     def net_round(p, k):
-        Xs, ys = [], []
+        Xs, ys, Bs = [], [], []
         for c, cd in cds.items():
-            s, pl, m = nasa_mechanisms_v2(p, cd)
-            res_ = cd["soh"] - (1 - s - pl) * (1 - m)
+            s_, pl, m = nasa_mechanisms_v2(p, cd)
+            res_ = cd["soh"] - (1 - s_ - pl) * (1 - m)
             ok = np.isfinite(res_)
-            Xs.append(feats[c][ok]); ys.append(res_[ok])
-        predict = _hybrid_net_fit(np.vstack(Xs), np.concatenate(ys), lam, seed + k)
-        return {c: predict(feats[c]) for c in cds}
+            Xs.append(feats[c][ok]); ys.append(res_[ok]); Bs.append(np.column_stack([s_, pl, m])[ok])
+        predict = _hybrid_net_fit(np.vstack(Xs), np.concatenate(ys), lam, seed + k, basis=np.vstack(Bs), ortho=ortho)
+        return predict, {c: predict(feats[c]) for c in cds}
 
     _report(progress, 0.5, "hybrid · network on the physics residual")
-    delta = net_round(best["params"], 0)
+    predict, delta = net_round(best["params"], 0)
     for r_ in range(rounds):
+        _report(progress, 0.5 + 0.5 * (r_ + 1) / (rounds + 1), f"hybrid · joint round {r_ + 1}/{rounds}")
         refit = _shared_physics_core(cds, re, 2, fit_with, 2, seed + 100 + r_, offsets=delta, x0=[best["x"]])
         best = refit[0]
-        delta = net_round(best["params"], r_ + 1)
+        predict, delta = net_round(best["params"], r_ + 1)
     _report(progress, 1.0, "hybrid done")
     return {"params": best["params"], "delta": delta, "physics_only": phys[0]["params"], "physics_fits": phys,
-            "data": cds, "re": re, "fit_with": fit_with, "lam": lam}
+            "data": cds, "re": re, "fit_with": fit_with, "lam": lam, "predict": predict, "order": list(cds),
+            "battery_code": battery_code, "rounds": rounds, "ortho": ortho}
 
 
 def nasa_hybrid_fit(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], fit_with: str = "Re",
@@ -9930,11 +9944,12 @@ def hybrid_validation_cohort(seed: int = 0):
     return cds, re, shares, knee
 
 
-def hybrid_validation(restarts: int = 10, seed: int = 0, progress: ProgressFn = None, lam: float = 0.3) -> pd.DataFrame:
+def hybrid_validation(restarts: int = 10, seed: int = 0, progress: ProgressFn = None, lam: float = 0.3,
+                      rounds: int = 0, battery_code: bool = True, ortho: float = 0.0) -> pd.DataFrame:
     """Physics alone vs hybrid on the knee cohort: error of the mechanism split (share points, among the three
     mechanisms) against the truth, fit error, and how much the network takes on each battery."""
     cds, re, shares, knee = hybrid_validation_cohort(seed)
-    h = hybrid_fit_cds(cds, re, "Re", restarts, 0, lam, seed, progress)
+    h = hybrid_fit_cds(cds, re, "Re", restarts, rounds, lam, seed, progress, battery_code, ortho)
     rows = []
     for c, cd in cds.items():
         tr = shares[c]
@@ -9949,3 +9964,85 @@ def hybrid_validation(restarts: int = 10, seed: int = 0, progress: ProgressFn = 
         out["network correction at the end (SOH points)"] = 100 * float(-h["delta"][c][-1])
         rows.append(out)
     return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 50. PHYSICS-BASED FORECASTERS IN THE ACCURACY ASSESSMENT (shared physics, hybrid, joint hybrid)
+# =============================================================================
+# A battery forecast from cycle n0 is trained on every OTHER battery of the constant-condition groups (the shared
+# physics needs several temperatures to be identifiable: its design) plus this battery's own history up to n0 only.
+# The future is extrapolated cycle by cycle: each cycle's throughput follows from the predicted capacity, so no
+# future data are used. The forecast starts from the battery's SOH now (median of its last 3 clean cycles), as the
+# Mission 2 models do. The hybrid adds its network correction, extrapolated (what this test must judge); the joint
+# hybrid uses the best guardrails found (battery code + orthogonality 100).
+PHYS_FORECAST = {"phys": "Shared physics v2 (no network)", "hyb": "Hybrid · frozen physics + network",
+                 "hybj": "Hybrid · joint training with guardrails"}
+for _k, _lab in PHYS_FORECAST.items():
+    PROTOCOL_MODELS[f"{_k}:{_lab.split(' ·')[0].split(' (')[0]}"] = ("Physics-based (shared)", _lab)
+PHYS_FORECAST_KEYS = [k for k in PROTOCOL_MODELS if k.split(":")[0] in PHYS_FORECAST]
+
+
+def physics_forecast(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n0: int, kind: str = "phys",
+                     restarts: int = 6, seed: int = 0) -> Any:
+    """Forecast of one battery from cycle n0 with the shared physics ('phys'), the frozen hybrid ('hyb') or the joint
+    hybrid with guardrails ('hybj'). Returns an object with n_grid, soh, lo, hi (the assessment's interface)."""
+    from types import SimpleNamespace
+    pool = sorted({c for g in NASA_PHYSICS_GROUPS for c in protocol_cells(ct, g)} - {cell})
+    tgt = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]].sort_values("n")
+    n_last = int(tgt["n"].max())
+    cut = ct[(ct["Cell_ID"] != cell) | (ct["n"] <= n0)]           # the target's future is never seen
+    cds = _nasa_conditions(cut, list(pool) + [cell])
+    if cell not in cds or len(cds) < 4:
+        raise ValueError("physics forecast: needs this battery's first 10 clean cycles and 3 other batteries")
+    re = {}
+    for c in cds:
+        rr = _re_relative(imp, cut, c, n0 if c == cell else None)
+        if rr is not None:
+            re[c] = rr
+    if kind == "phys":
+        p = _shared_physics_core(cds, re, 2, "Re", restarts, seed)[0]["params"]
+        h = None
+    else:
+        joint = kind == "hybj"
+        h = hybrid_fit_cds(cds, re, "Re", restarts, 2 if joint else 0, 0.3, seed, None, True, 100.0 if joint else 0.0)
+        p = h["params"]
+    cd = cds[cell]
+    a_now = float(cd["a"][-1])
+    soh_now = float(np.nanmedian(cd["soh"][-3:]))
+    c_bol = float(tgt["C_bol_Ah"].iloc[0]) if "C_bol_Ah" in tgt and np.isfinite(tgt["C_bol_Ah"].iloc[0]) else 2.0
+
+    def model_soh(a_arr: np.ndarray) -> np.ndarray:
+        cdx = {**cd, "a": a_arr}
+        s_, pl, m = nasa_mechanisms_v2(p, cdx)
+        out = (1 - s_ - pl) * (1 - m)
+        if h is not None:
+            k = h["order"].index(cell)
+            out = out + h["predict"](_hybrid_row_features(cdx, k, len(h["order"]), h["battery_code"]))
+        return out
+
+    shift = soh_now - float(model_soh(np.array([a_now]))[0])  # start from the battery's SOH now
+    n_fut = np.arange(int(n0) + 1, n_last + 1)
+    a_fut, soh_fut, a_k, soh_k = [], [], a_now, soh_now
+    for _ in n_fut:                                           # throughput from the predicted capacity
+        a_k = a_k + c_bol * max(soh_k, 0.05) / PINN_A_SCALE
+        soh_k = float(model_soh(np.array([a_k]))[0]) + shift
+        a_fut.append(a_k); soh_fut.append(soh_k)
+    fit_now = model_soh(cd["a"]) + shift
+    r0 = float(np.sqrt(np.nanmean((fit_now - cd["soh"]) ** 2))) if np.isfinite(cd["soh"]).any() else 0.01
+    n_grid = np.concatenate([cd["n"], n_fut]).astype(float)
+    soh = np.concatenate([cd["soh"], np.array(soh_fut)])
+    o = np.argsort(n_grid)
+    n_grid, soh = n_grid[o], soh[o]
+    half = 2 * max(r0, 0.005) * np.sqrt(1 + np.clip(n_grid - n0, 0, None) / max(n0, 1))
+    return SimpleNamespace(model=PHYS_FORECAST[kind], n_grid=n_grid, soh=soh, lo=soh - half, hi=soh + half,
+                           cv_rmse=np.nan, n0=n0, params=p)
+
+
+_protocol_forecast_l4 = _protocol_forecast
+
+
+def _protocol_forecast(key, store, ct, imp, cell, n0, train, eol_ah):  # noqa: F811
+    kind = key.split(":", 1)[0]
+    if kind in PHYS_FORECAST:
+        return physics_forecast(ct, imp, cell, n0, kind)
+    return _protocol_forecast_l4(key, store, ct, imp, cell, n0, train, eol_ah)

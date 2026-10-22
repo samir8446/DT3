@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.20.1 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.21.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.20.1"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.20.1"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.21.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.21.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -366,12 +366,20 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - These gaps define physics version 3: an accelerating late-life mechanism at room temperature, and a fast early loss
   in the cold.
 
+## 5ab. Joint training test and physics forecasters (v5.21.0, 2026-10-22)
+- Joint hybrid with guardrails never beats frozen on the split (frozen 3.43; joint 4.17-5.09 share points; fit worse
+  as guardrails tighten). DECISION: frozen hybrid = explanation model.
+- Physics forecasters in the assessment (section 50): causal (tested), start at SOH now. Demo data: 5.9-6.4 SOH
+  points vs fleet shape 1.04 (demo fade is linear, the physics' SEI decelerates: forecasts too slow; mechanics
+  verified). NASA run needed.
+
 ## 6. Next steps (full-signal physics phase)
-1. USER: upload v5.20.1 (twin_engine.py, app.py); CI green; app shows v5.20.1.
-2. USER: rerun the Hybrid on NASA (Re, 30 starts, penalty 0.3); send CSV + trajectories of B0006, B0045, B0005.
-3. Knee batteries: physics version 3 with plating triggered by lost graphite; SEI with ambient temperature (Ea floor).
-4. Score shared physics and hybrid as forecasters in the accuracy assessment.
-5. PyBaMM benchmark (5u issues) and step 2.
+1. USER: upload v5.21.0 (twin_engine.py, app.py, tests/test_physics_forecast.py); CI green; app shows v5.21.0.
+2. USER: accuracy assessment, "Best 2 per level", levels: only "Level 4 · Shared physics + hybrids" (baselines are
+   always included), origin 30 %, for Reference, Hot, Cold. Send the CSVs. Compare with the Mission 2 frozen models.
+3. If the physics forecasters are competitive: Mission 3 on the frozen hybrid (anomaly detection from the unexplained
+   part, what-if within identifiable conditions). If not: physics v3 (late-life acceleration at room temperature,
+   early fast loss in the cold), then retest.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

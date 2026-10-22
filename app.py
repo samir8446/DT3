@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.20.1"
+REQUIRED_ENGINE = "5.21.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -5225,7 +5225,7 @@ ACC_EXPLORATORY = {
 }
 ASSESS_SECONDS = {"PINN": 8.0, "PINN-ablation": 4.0, "persistence": 0.3, "trend": 0.3, "shape": 1.0, "Bayesian Ridge": 1.5, "Decision Tree": 1.5,
                   "Random Forest": 3.0, "SVM": 2.0, "Gaussian Process": 12.0, "XGBoost": 3.0, "LightGBM": 2.0,
-                  "MLP": 2.0, "GRU": 6.0, "Transformer": 4.0}
+                  "MLP": 2.0, "GRU": 6.0, "Transformer": 4.0, "Shared physics v2": 6.0, "Hybrid": 15.0}
 
 
 @st.cache_data(show_spinner=False, max_entries=20000)
@@ -5280,7 +5280,8 @@ def assessment_section() -> None:
         level_keys = {"Level 2 · ML forecast": [f"traj:{m}" for m in av], "Level 2 · ML measured": [f"trajm:{m}" for m in av],
                       "Level 3 · DL forecast": [f"dl:{k}" for k in te.DL_MODELS],
                       "Level 3 · DL measured": [f"dlm:{k}" for k in te.DL_MODELS],
-                      "Level 4 · PINN + ablation": [f"pinn:{k}" for k in te.PINN_MODELS]}
+                      "Level 4 · PINN + ablation": [f"pinn:{k}" for k in te.PINN_MODELS],
+                      "Level 4 · Shared physics + hybrids": list(te.PHYS_FORECAST_KEYS)}
         levels = st.multiselect("Levels (baselines are always included: the verdict needs them)", list(level_keys),
                                 default=list(level_keys), key="acc_levels")
         keys = ["persistence", "trend", "shape"] + [k for lv in levels for k in level_keys[lv]]
