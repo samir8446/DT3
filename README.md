@@ -1,9 +1,19 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.22.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.23.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Ageing-speed factor for the physics forecasts (v5.23.0)
+
+1. Physics forecasts stayed too optimistic with v3; the shared physics has no battery-specific information.
+   physics_forecast kinds phys2k, hyb2k, phys3k, hyb3k: after the shared fit (unchanged), one factor kappa in
+   [0.3, 3] is fitted on the forecast battery's own history only; its mechanisms run kappa times faster per Ah (the
+   same for all three: the split is kept). Assessment level "Level 4 · Physics + ageing-speed factor".
+2. Demo (Reference, 30 %): worse than without (v2 5.73 -> 7.53, v3 4.87 -> 5.53): kappa changes the speed, not the
+   shape of the fade; when the physics' shape differs, fitting the early history extrapolates worse. NASA decides.
+3. Tests: causal; a battery with faster history gets a larger kappa. 32 tests pass; AppTest; all views.
 
 ## Physics version 3 (v5.22.0)
 

@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.22.0"
+ENGINE_VERSION = "5.23.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10007,11 +10007,21 @@ def hybrid_validation(restarts: int = 10, seed: int = 0, progress: ProgressFn = 
 # hybrid uses the best guardrails found (battery code + orthogonality 100).
 PHYS_FORECAST = {"phys": "Shared physics v2 (no network)", "hyb": "Hybrid · frozen physics + network",
                  "hybj": "Hybrid · joint training with guardrails", "phys3": "Shared physics v3 (no network)",
-                 "hyb3": "Hybrid v3 · frozen physics v3 + network"}
-PHYS_FORECAST_VERSION = {"phys": 2, "hyb": 2, "hybj": 2, "phys3": 3, "hyb3": 3}
+                 "hyb3": "Hybrid v3 · frozen physics v3 + network",
+                 "phys2k": "Physics v2 + ageing speed", "hyb2k": "Hybrid v2 + ageing speed",
+                 "phys3k": "Physics v3 + ageing speed", "hyb3k": "Hybrid v3 + ageing speed"}
+PHYS_FORECAST_VERSION = {"phys": 2, "hyb": 2, "hybj": 2, "phys3": 3, "hyb3": 3, "phys2k": 2, "hyb2k": 2, "phys3k": 3,
+                         "hyb3k": 3}
+# ageing-speed factor (v5.23): the shared physics has no battery-specific information, so two batteries under the same
+# conditions get the same forecast; B0005 ages faster than its group and every physics forecast was too optimistic.
+# kappa is fitted on the forecast battery's own history only (after the shared fit, which it cannot change): its
+# mechanisms run kappa times faster per Ah (manufacturing variation); the same for all three, so the split is kept.
+PHYS_SPEED_KINDS = {"phys2k", "hyb2k", "phys3k", "hyb3k"}
+PHYS_KAPPA_RANGE = (0.3, 3.0)
 for _k, _lab in PHYS_FORECAST.items():
     PROTOCOL_MODELS[f"{_k}:{_lab.split(' ·')[0].split(' (')[0]}"] = ("Physics-based (shared)", _lab)
 PHYS_FORECAST_V3_KEYS = [k for k in PROTOCOL_MODELS if k.split(":")[0] in ("phys3", "hyb3")]
+PHYS_FORECAST_SPEED_KEYS = [k for k in PROTOCOL_MODELS if k.split(":")[0] in PHYS_SPEED_KINDS]
 PHYS_FORECAST_KEYS = [k for k in PROTOCOL_MODELS if k.split(":")[0] in PHYS_FORECAST]
 
 
@@ -10034,7 +10044,7 @@ def physics_forecast(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n
             re[c] = rr
     version = PHYS_FORECAST_VERSION[kind]
     mech = _nasa_spec(version)[3]
-    if kind in ("phys", "phys3"):
+    if kind in ("phys", "phys3", "phys2k", "phys3k"):
         p = _shared_physics_core(cds, re, version, "Re", restarts, seed)[0]["params"]
         h = None
     else:
@@ -10047,14 +10057,27 @@ def physics_forecast(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n
     soh_now = float(np.nanmedian(cd["soh"][-3:]))
     c_bol = float(tgt["C_bol_Ah"].iloc[0]) if "C_bol_Ah" in tgt and np.isfinite(tgt["C_bol_Ah"].iloc[0]) else 2.0
 
+    kappa = 1.0
+
     def model_soh(a_arr: np.ndarray) -> np.ndarray:
         cdx = {**cd, "a": a_arr}
-        s_, pl, m = mech(p, cdx)
+        s_, pl, m = mech(p, {**cd, "a": kappa * a_arr})        # mechanisms run kappa times faster per Ah
         out = (1 - s_ - pl) * (1 - m)
         if h is not None:
             k = h["order"].index(cell)
             out = out + h["predict"](_hybrid_row_features(cdx, k, len(h["order"]), h["battery_code"]))
         return out
+
+    if kind in PHYS_SPEED_KINDS:                               # kappa from this battery's own history only
+        from scipy.optimize import minimize_scalar
+        ok = np.isfinite(cd["soh"])
+
+        def prefix_err(lk: float) -> float:
+            nonlocal kappa
+            kappa = math.exp(lk)
+            return float(np.mean((model_soh(cd["a"][ok]) - cd["soh"][ok]) ** 2))
+        sol = minimize_scalar(prefix_err, bounds=tuple(math.log(v) for v in PHYS_KAPPA_RANGE), method="bounded")
+        kappa = math.exp(float(sol.x))
 
     shift = soh_now - float(model_soh(np.array([a_now]))[0])  # start from the battery's SOH now
     n_fut = np.arange(int(n0) + 1, n_last + 1)
@@ -10071,7 +10094,7 @@ def physics_forecast(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, n
     n_grid, soh = n_grid[o], soh[o]
     half = 2 * max(r0, 0.005) * np.sqrt(1 + np.clip(n_grid - n0, 0, None) / max(n0, 1))
     return SimpleNamespace(model=PHYS_FORECAST[kind], n_grid=n_grid, soh=soh, lo=soh - half, hi=soh + half,
-                           cv_rmse=np.nan, n0=n0, params=p)
+                           cv_rmse=np.nan, n0=n0, params=p, kappa=kappa)
 
 
 _protocol_forecast_l4 = _protocol_forecast

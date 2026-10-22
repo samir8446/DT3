@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.22.0"
+REQUIRED_ENGINE = "5.23.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -5226,7 +5226,8 @@ ACC_EXPLORATORY = {
 ASSESS_SECONDS = {"PINN": 8.0, "PINN-ablation": 4.0, "persistence": 0.3, "trend": 0.3, "shape": 1.0, "Bayesian Ridge": 1.5, "Decision Tree": 1.5,
                   "Random Forest": 3.0, "SVM": 2.0, "Gaussian Process": 12.0, "XGBoost": 3.0, "LightGBM": 2.0,
                   "MLP": 2.0, "GRU": 6.0, "Transformer": 4.0, "Shared physics v2": 6.0, "Hybrid": 15.0, "Shared physics v3": 6.0,
-                  "Hybrid v3": 15.0}
+                  "Hybrid v3": 15.0, "Physics v2 + ageing speed": 6.0, "Hybrid v2 + ageing speed": 15.0,
+                  "Physics v3 + ageing speed": 6.0, "Hybrid v3 + ageing speed": 15.0}
 
 
 @st.cache_data(show_spinner=False, max_entries=20000)
@@ -5283,8 +5284,10 @@ def assessment_section() -> None:
                       "Level 3 · DL measured": [f"dlm:{k}" for k in te.DL_MODELS],
                       "Level 4 · PINN + ablation": [f"pinn:{k}" for k in te.PINN_MODELS],
                       "Level 4 · Shared physics v2 + hybrids": [k for k in te.PHYS_FORECAST_KEYS
-                                                                if k not in te.PHYS_FORECAST_V3_KEYS],
-                      "Level 4 · Shared physics v3 + hybrid v3": list(te.PHYS_FORECAST_V3_KEYS)}
+                                                                if k not in te.PHYS_FORECAST_V3_KEYS
+                                                                and k not in te.PHYS_FORECAST_SPEED_KEYS],
+                      "Level 4 · Shared physics v3 + hybrid v3": list(te.PHYS_FORECAST_V3_KEYS),
+                      "Level 4 · Physics + ageing-speed factor": list(te.PHYS_FORECAST_SPEED_KEYS)}
         levels = st.multiselect("Levels (baselines are always included: the verdict needs them)", list(level_keys),
                                 default=list(level_keys), key="acc_levels")
         keys = ["persistence", "trend", "shape"] + [k for lv in levels for k in level_keys[lv]]

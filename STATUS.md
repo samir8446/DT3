@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.22.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.23.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.22.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.22.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.23.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.23.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -391,13 +391,31 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   triggered plating (7.5 vs 3.4 pts on the knee cohort whose knee has no mechanism).
 - Demo: card flags v3's split as NOT unique (near-best starts differ by 10.9 pts): check uniqueness on NASA.
 
+## 5ae. Physics v3 on NASA (v5.22.0)
+- Explanation (Re, 30 starts): learned z = 1.33 (SEI accelerates); triggered plating unused (k_tr ~0, m_c at 0.3);
+  at limits: Ea, b_C, k_lam, a_I, m_c. Group means SEI/plating/LAM: Hot 23/0/77, Reference 23/0/77, High current
+  25/0/75, Pulsed 14/0/86, Cold 2/77/21. Unique within the version; mean fit 5.21 (v2 5.12).
+- MODEL-FORM UNCERTAINTY: Hot SEI 56 % (v2) vs 23 % (v3) with similar fit -> warm SEI vs LAM split NOT determined by
+  capacity + resistance + Re. Robust across versions: plating only and dominant in the cold (71-77 %); warm = SEI +
+  LAM mix; NASA design limits.
+- Forecasting (30 %): physics v3 8.14 / 3.37 / 4.37, hybrid v3 6.89 / 3.53 / 4.33 (Reference / Hot / Cold) vs fleet
+  shape 4.34 / 3.21 / 3.20: no gain over v2; still optimistic (B0005 +11). Likely cause: no battery-specific
+  information in the shared physics (B0005 ages faster than its group; fleet shape adapts per battery).
+- PROPOSED: per-battery ageing-speed factor (same for all mechanisms, fitted on the battery's own history: cannot
+  shift the split) -> rerun forecasting. If still not competitive: option B for Mission 3.
+
+## 5af. Ageing-speed factor (v5.23.0, 2026-10-22) - last physics forecasting attempt (user: if not working -> B)
+- kappa per forecast battery, fitted on its own history, same for all mechanisms. Demo: worse (changes speed, not
+  shape). NASA run decides.
+
 ## 6. Next steps (full-signal physics phase)
-1. USER: upload v5.22.0 (twin_engine.py, app.py, tests/test_physics_forecast.py); CI green; app shows v5.22.0.
-2. USER: (a) "Shared physics on the NASA batteries", Version 3, Re, 30 starts: CSV + card image (uniqueness, z, m_c);
-   (b) accuracy assessment, "Best 2 per level", only "Level 4 · Shared physics v3 + hybrid v3", 30 %, Reference,
-   Hot, Cold: CSVs.
-3. Judge: forecasting bias gone? beats fleet shape / Mission 2 frozen models? split unique, plausible, held-out check?
-   If yes: Mission 3 on hybrid v3. If no: option B (one twin, forecasting by Mission 2 models, explanation by hybrid).
+1. USER: upload v5.23.0 (twin_engine.py, app.py, tests/test_physics_forecast.py); CI green; app shows v5.23.0.
+2. USER: accuracy assessment, "Best 2 per level", only "Level 4 · Physics + ageing-speed factor", 30 %, Reference,
+   Hot, Cold. Send the CSVs.
+3. DECISION (agreed with user): if no physics model is competitive (vs fleet shape and Mission 2 frozen models) ->
+   OPTION B for Mission 3: forecasting by the Mission 2 frozen models; explanation by the hybrid (robust findings +
+   model-form uncertainty); anomaly detection from the hybrid's unexplained part; what-if within identifiable
+   conditions. One twin, each capability backed by its own test.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

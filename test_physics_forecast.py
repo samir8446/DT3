@@ -13,7 +13,7 @@ def data():
     return store, ct, imp, sorted(ct["Cell_ID"].unique())
 
 
-@pytest.mark.parametrize("kind", ["phys", "hyb", "phys3", "hyb3"])
+@pytest.mark.parametrize("kind", ["phys", "hyb", "phys3", "hyb3", "phys2k", "hyb3k"])
 def test_forecast_never_sees_the_future(data, kind):
     store, ct, imp, cells = data
     tgt, n0 = cells[0], 30
@@ -59,3 +59,15 @@ def test_physics_v3_recovers_its_own_split_and_exponent():
         s, pl, m = te.nasa_mechanisms_v3(p, cd); v = np.array([s[-1], pl[-1], m[-1]])
         err.append(100 * np.mean(np.abs(v / v.sum() - sh[c])))
     assert np.mean(err) < 1.0 and abs(p["z"] - 0.9) < 0.1 and abs(p["m_c"] - 0.03) < 0.01
+
+
+def test_ageing_speed_follows_the_battery(data):
+    """A battery whose history fades twice as fast as recorded gets kappa > 1; the split mechanism is untouched."""
+    store, ct, imp, cells = data
+    tgt, n0 = cells[0], 40
+    fast = ct.copy()
+    sel = (fast["Cell_ID"] == tgt) & (fast["n"] <= n0)
+    fast.loc[sel, "SOH"] = 1 - 2 * (1 - fast.loc[sel, "SOH"])
+    f0 = te.physics_forecast(ct, imp, tgt, n0, "phys2k", restarts=2)
+    f1 = te.physics_forecast(fast, imp, tgt, n0, "phys2k", restarts=2)
+    assert f1.kappa > f0.kappa and te.PHYS_KAPPA_RANGE[0] <= f0.kappa <= te.PHYS_KAPPA_RANGE[1]
