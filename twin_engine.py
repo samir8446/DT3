@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.23.0"
+ENGINE_VERSION = "5.24.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10105,3 +10105,172 @@ def _protocol_forecast(key, store, ct, imp, cell, n0, train, eol_ah):  # noqa: F
     if kind in PHYS_FORECAST:
         return physics_forecast(ct, imp, cell, n0, kind)
     return _protocol_forecast_l4(key, store, ct, imp, cell, n0, train, eol_ah)
+
+
+# =============================================================================
+# 51. MISSION 3 · ANOMALY DETECTION: is this battery ageing faster than the twin expects?
+# =============================================================================
+# Strictly causal replay of one battery. The fleet's behaviour is the shared physics v2 fitted on all OTHER batteries
+# (fitted once). At cycle n the expectation for cycles (n - lag, n] is built only from cycles <= n - lag: the physics
+# adapted to this battery (ageing-speed factor kappa fitted on its history so far) and anchored to its SOH then.
+# One-sided CUSUM on the standardised shortfall (expected - measured) / sigma: evidence that the battery fades FASTER
+# than expected accumulates, a single noisy cycle cannot trigger it, recoveries (regeneration) are ignored.
+# Alarm when the CUSUM exceeds h. sigma = noise of the expectation during warm-up (floor 0.4 SOH points).
+# Validation (known knees on R2, C2, H3; 8 healthy batteries): fleet-physics expectation -> 5 false alarms (the
+# fleet physics is slightly wrong for healthy batteries); own-trend expectation standardised by the cycle noise ->
+# 2 false alarms (the extrapolation error was ignored); own trend + regression prediction error, h = 8 -> 3/3 knees
+# detected, 0/8 false alarms (DEFAULT). h = 5: a few cycles faster, 1 false alarm.
+ANOMALY_DEFAULTS = {"lag": 10, "k": 0.5, "h": 8.0, "warmup": 20, "method": "trend"}
+
+
+def _kappa_fit(p: Dict[str, float], cd: Dict[str, Any], upto: int, mech) -> float:
+    from scipy.optimize import minimize_scalar
+    a, y = cd["a"][:upto], cd["soh"][:upto]
+    ok = np.isfinite(y)
+    if ok.sum() < 5:
+        return 1.0
+
+    def err(lk: float) -> float:
+        s_, pl, m = mech(p, {**cd, "a": math.exp(lk) * a[ok]})
+        return float(np.mean(((1 - s_ - pl) * (1 - m) - y[ok]) ** 2))
+    sol = minimize_scalar(err, bounds=tuple(math.log(v) for v in PHYS_KAPPA_RANGE), method="bounded")
+    return math.exp(float(sol.x))
+
+
+def anomaly_replay(p: Dict[str, float], cd: Dict[str, Any], lag: int = 10, k: float = 0.5, h: float = 8.0,
+                   warmup: int = 20, version: int = 2, method: str = "trend", window: int = 15) -> pd.DataFrame:
+    """Causal replay of one battery (see the section header). One row per cycle.
+    method "physics": expectation from the fleet physics adapted with kappa (validation: too many false alarms, the
+    fleet physics is slightly wrong for healthy batteries). method "trend" (default): expectation = continuation of
+    the battery's own last `window` cycles in throughput; sigma from the scatter around that trend; a knee is an
+    acceleration of the battery's own fade. kappa from the fleet physics is still reported as context."""
+    if method == "trend":
+        return _anomaly_replay_trend(p, cd, lag, k, h, warmup, version, window)
+    mech = _nasa_spec(version)[3]
+    n_, a, y = cd["n"], cd["a"], cd["soh"]
+    rows, S, sig, warm = [], 0.0, None, []
+    for i in range(len(n_)):
+        j = i - lag                                            # last cycle the expectation may use
+        if j < 5 or not np.isfinite(y[i]):
+            rows.append({"n": n_[i], "SOH": y[i], "expected": np.nan, "shortfall": np.nan, "cusum": 0.0,
+                         "kappa": np.nan, "alarm": False})
+            continue
+        kap = _kappa_fit(p, cd, j + 1, mech)
+
+        def soh_at(aa):
+            s_, pl, m = mech(p, {**cd, "a": kap * np.atleast_1d(aa)})
+            return (1 - s_ - pl) * (1 - m)
+        anchor = float(np.nanmedian(y[max(0, j - 2):j + 1]))
+        expected = anchor + float(soh_at(a[i])[0] - soh_at(a[j])[0])
+        short = expected - y[i]                                # > 0: faster fade than expected
+        if i < warmup:
+            warm.append(short)
+            rows.append({"n": n_[i], "SOH": y[i], "expected": expected, "shortfall": short, "cusum": 0.0,
+                         "kappa": kap, "alarm": False})
+            continue
+        if sig is None:
+            sig = max(float(np.std(warm)) if len(warm) >= 3 else 0.004, 0.004)
+        S = max(0.0, S + short / sig - k)
+        rows.append({"n": n_[i], "SOH": y[i], "expected": expected, "shortfall": short, "cusum": S, "kappa": kap,
+                     "alarm": S > h})
+    out = pd.DataFrame(rows)
+    out.attrs["sigma"] = sig
+    al = out.loc[out["alarm"], "n"]
+    out.attrs["first_alarm"] = float(al.iloc[0]) if len(al) else None
+    return out
+
+
+def _anomaly_replay_trend(p, cd, lag, k, h, warmup, version, window) -> pd.DataFrame:
+    mech = _nasa_spec(version)[3]
+    n_, a, y = cd["n"], cd["a"], cd["soh"]
+    rows, S = [], 0.0
+    sig_hist: List[float] = []
+    for i in range(len(n_)):
+        j = i - lag
+        lo = max(0, j - window + 1)
+        idx = np.arange(lo, j + 1) if j >= 0 else np.array([], int)
+        idx = idx[np.isfinite(y[idx])] if len(idx) else idx
+        if len(idx) < 6 or not np.isfinite(y[i]):
+            rows.append({"n": n_[i], "SOH": y[i], "expected": np.nan, "shortfall": np.nan, "cusum": S,
+                         "kappa": np.nan, "alarm": S > h})
+            continue
+        slope, icpt = np.polyfit(a[idx], y[idx], 1)
+        resid = y[idx] - (slope * a[idx] + icpt)
+        sig_i = max(1.4826 * float(np.median(np.abs(resid - np.median(resid)))), 0.004)   # robust scatter
+        expected = float(slope * a[i] + icpt)
+        short = expected - y[i]
+        kap = _kappa_fit(p, cd, j + 1, mech) if p is not None else np.nan
+        if i < warmup:
+            sig_hist.append(sig_i)
+            rows.append({"n": n_[i], "SOH": y[i], "expected": expected, "shortfall": short, "cusum": 0.0,
+                         "kappa": kap, "alarm": False})
+            continue
+        sig = max(sig_i, float(np.median(sig_hist)) if sig_hist else 0.004)
+        # prediction error of the extrapolated trend, not the noise of one cycle: slope uncertainty grows with the
+        # distance extrapolated (v5.24: dividing by the cycle noise gave false alarms on healthy batteries)
+        am = a[idx].mean()
+        sxx = float(np.sum((a[idx] - am) ** 2))
+        se = sig * math.sqrt(1 + 1 / len(idx) + ((a[i] - am) ** 2 / sxx if sxx > 0 else 0.0))
+        S = max(0.0, S + short / se - k)
+        rows.append({"n": n_[i], "SOH": y[i], "expected": expected, "shortfall": short, "cusum": S, "kappa": kap,
+                     "alarm": S > h})
+    out = pd.DataFrame(rows)
+    out.attrs["sigma"] = float(np.median(sig_hist)) if sig_hist else None
+    al = out.loc[out["alarm"], "n"]
+    out.attrs["first_alarm"] = float(al.iloc[0]) if len(al) else None
+    return out
+
+
+def anomaly_scan_cds(cds: Dict[str, Dict[str, Any]], re: Dict[str, Any], restarts: int = 6, seed: int = 0,
+                     progress: ProgressFn = None, **kw) -> Dict[str, pd.DataFrame]:
+    """Every battery replayed against the physics fitted on all the others (leave-one-out)."""
+    out = {}
+    for k_, c in enumerate(cds):
+        _report(progress, k_ / max(len(cds), 1), f"anomaly scan · {c}")
+        others = {x: cd for x, cd in cds.items() if x != c}
+        p = _shared_physics_core(others, {x: v for x, v in re.items() if x in others}, 2, "Re", restarts, seed)[0]["params"]
+        out[c] = anomaly_replay(p, cds[c], **kw)
+    _report(progress, 1.0, "anomaly scan done")
+    return out
+
+
+def nasa_anomaly_scan(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cells: Sequence[str], restarts: int = 6,
+                      progress: ProgressFn = None, **kw) -> Dict[str, pd.DataFrame]:
+    cds, re = _nasa_inputs(ct, imp, cells)
+    return anomaly_scan_cds(cds, re, restarts, 0, progress, **kw)
+
+
+def anomaly_summary(scan: Dict[str, pd.DataFrame], knee_onset: Optional[Dict[str, float]] = None) -> pd.DataFrame:
+    rows = []
+    for c, tr in scan.items():
+        fa = tr.attrs.get("first_alarm")
+        row = {"battery": c, "first alarm (cycle)": fa, "cycles": int(tr["n"].max()),
+               "max CUSUM": float(tr["cusum"].max()), "noise sigma (SOH points)": 100 * (tr.attrs.get("sigma") or np.nan),
+               "kappa at the end": float(tr["kappa"].dropna().iloc[-1]) if tr["kappa"].notna().any() else np.nan}
+        if knee_onset is not None:
+            ko = knee_onset.get(c)
+            row["true knee onset (cycle)"] = ko
+            row["result"] = (("detected, delay %d cycles" % (fa - ko) if fa is not None and fa >= ko else
+                              "ALARM BEFORE the knee" if fa is not None else "MISSED") if ko is not None else
+                             ("FALSE ALARM" if fa is not None else "quiet (correct)"))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def anomaly_validation(restarts: int = 6, progress: ProgressFn = None, **kw) -> pd.DataFrame:
+    """Known truth: the knee cohort of section 49 (knee starts at throughput a = 0.3 on R2, C2, H3)."""
+    cds, re, _sh, _kn = hybrid_validation_cohort(0)
+    onset = {}
+    for c in HYBRID_KNEE_CELLS:
+        idx = int(np.argmax(cds[c]["a"] > 0.3))
+        onset[c] = float(cds[c]["n"][idx])
+    scan = anomaly_scan_cds(cds, re, restarts, 0, progress, **kw)
+    summ = anomaly_summary(scan, {c: onset.get(c) for c in cds})
+    knee = {}
+    for c in HYBRID_KNEE_CELLS:                               # how big the knee was when the alarm fired
+        fa = scan[c].attrs.get("first_alarm")
+        if fa is not None:
+            a_fa = float(np.interp(fa, cds[c]["n"], cds[c]["a"]))
+            knee[c] = 100 * 0.6 * max(a_fa - 0.3, 0.0) ** 2
+    summ["knee size at the alarm (SOH points)"] = summ["battery"].map(knee)
+    return summ

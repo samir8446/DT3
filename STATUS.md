@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.23.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.24.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.23.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.23.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.24.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.24.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -408,14 +408,36 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - kappa per forecast battery, fitted on its own history, same for all mechanisms. Demo: worse (changes speed, not
   shape). NASA run decides.
 
-## 6. Next steps (full-signal physics phase)
-1. USER: upload v5.23.0 (twin_engine.py, app.py, tests/test_physics_forecast.py); CI green; app shows v5.23.0.
-2. USER: accuracy assessment, "Best 2 per level", only "Level 4 · Physics + ageing-speed factor", 30 %, Reference,
-   Hot, Cold. Send the CSVs.
-3. DECISION (agreed with user): if no physics model is competitive (vs fleet shape and Mission 2 frozen models) ->
-   OPTION B for Mission 3: forecasting by the Mission 2 frozen models; explanation by the hybrid (robust findings +
-   model-form uncertainty); anomaly detection from the hybrid's unexplained part; what-if within identifiable
-   conditions. One twin, each capability backed by its own test.
+## 5ag. Ageing-speed factor on NASA (v5.23.0) -> DECISION: OPTION B
+- RMSE Reference / Hot (run interrupted: 3 batteries, B0032 missing) / Cold: fleet shape 4.34 / 3.62 / 3.20; best
+  physics with speed: hybrid v2 6.27 / physics v3 2.98 / physics v3 3.13 (without speed 6.43 / 3.37 / 4.37);
+  Mission 2 frozen 4.47 / 0.95 / 2.77. Speed helps Cold (ties baseline), slightly Hot, not Reference (B0005 +11-13).
+- Physics never beats the Mission 2 models -> per the agreed rule, OPTION B.
+- Phase conclusions: (1) data-driven Mission 2 models are the best forecasters; physics forecasts systematically
+  optimistic (SEI laws miss late-life fade; learned exponent, triggered plating, speed factor did not fix the shape);
+  (2) shared physics explains (recovery test), robust: plating only and dominant in the cold, warm = SEI + LAM mix,
+  SEI/LAM proportion model-form dependent; (3) network improves fit not explanation; joint training worsens split.
+
+## MISSION 3 (option B): one twin, each capability from the model proven best at it
+- Forecast SOH/EOL: Mission 2 frozen model per group; accuracy over life: re-anchoring to measured capacity;
+  explanation: hybrid v2 split + model-form uncertainty; anomaly detection: hybrid unexplained part + deviation from
+  the forecast; what-if: shared physics sensitivities only for conditions NASA varied.
+- FIRST STEP proposed: anomaly detector, replayed cycle by cycle; test = flags knee batteries (B0006, B0045, B0041)
+  before their accelerated fade, few false alarms elsewhere.
+
+## 5ah. Mission 3 · anomaly detector (v5.24.0, 2026-10-22)
+- Own-trend CUSUM, standardised by the trend's prediction error, h = 8 (validated: 3/3 knees, 0/8 false alarms,
+  alarm at 0.9-1.5 SOH points of knee). Lessons: fleet physics as expectation -> false alarms (it is slightly wrong
+  for healthy batteries); standardising by cycle noise instead of prediction error -> false alarms.
+- In the app: Operations & control, top section. Not yet run on NASA.
+
+## 6. Next steps (Mission 3, option B)
+1. USER: upload v5.24.0 (twin_engine.py, app.py, tests/test_anomaly.py); CI green; app shows v5.24.0.
+2. USER: Operations & control -> anomaly detection: run the check, then "Scan the NASA batteries" (threshold 8).
+   Send the CSV + replay images of the flagged batteries (and of B0006, B0045).
+3. Then: assemble the option-B twin view (forecast by Mission 2 frozen models, explanation by the hybrid, anomalies,
+   what-if within identifiable conditions).
+4. Writing: Mission 2 chapter; physics phase chapter.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

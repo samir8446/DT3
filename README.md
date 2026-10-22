@@ -1,9 +1,22 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.23.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.24.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Mission 3 · anomaly detection (v5.24.0)
+
+1. Engine section 51: causal replay of every battery; expectation for the next 10 cycles = continuation of the
+   battery's own last 15 cycles (in throughput); shortfall divided by the regression's prediction error
+   (sigma * sqrt(1 + 1/m + (a - mean)^2 / Saa)); one-sided CUSUM (k = 0.5), alarm above h = 8. The shared physics
+   (fitted leave-one-out) gives the ageing-speed factor kappa as context.
+2. Validation on the knee cohort (knees on R2, C2, H3 from cycle 53; 8 healthy): fleet-physics expectation 5 false
+   alarms; own trend / cycle noise 2; own trend / prediction error, h = 8: 3/3 knees, 0/8 false alarms, alarm when the
+   knee adds 0.9-1.5 SOH points (noise ~0.3). h = 5: a few cycles earlier, 1 false alarm.
+3. App, Operations & control (top): "Mission 3 · Anomaly detection": threshold, built-in check, NASA scan (alarms per
+   battery with kappa), replay chart (measured vs expected, CUSUM, alarm), CSV.
+4. tests/test_anomaly.py (validation, causality); 34 tests pass; AppTest; all views.
 
 ## Ageing-speed factor for the physics forecasts (v5.23.0)
 
