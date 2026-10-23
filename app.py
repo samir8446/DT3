@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.27.0"
+REQUIRED_ENGINE = "5.28.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -3495,6 +3495,7 @@ def view_study() -> None:
 
 
 EVENT_STYLE = {"alarm": ("red", ":material/warning:"), "common": ("orange", ":material/groups:"),
+               "eol": ("violet", ":material/battery_alert:"),
                "cleared": ("green", ":material/check_circle:"), "info": ("gray", ":material/info:")}
 
 
@@ -3538,7 +3539,7 @@ def live_anomaly_panel(tr: pd.DataFrame, ev: pd.DataFrame, n: int, n_max: float)
         lines = []
         for r in seen.itertuples(index=False):
             col, ic = EVENT_STYLE.get(r.kind, ("gray", ":material/info:"))
-            lab = {"alarm": "alarm", "common": "common event", "cleared": "back to normal", "info": "note"}[r.kind]
+            lab = {"alarm": "alarm", "common": "common event", "cleared": "back to normal", "info": "note", "eol": "end of life"}[r.kind]
             lines.append(f"{ic} :{col}[**cycle {r.cycle:.0f} · {r.indicator} {lab}**] — {r[3]}")
         with st.container(height=min(260, 48 + 46 * len(lines)), border=True):
             st.markdown("  \n".join(lines))
@@ -6389,11 +6390,12 @@ def fig_anomaly2(tr: pd.DataFrame, P: Palette, cell: str, kappa_thr: float, z_th
 DETECTION_COLORS = {"Normal": "#9AA3AD", "Regeneration (normal)": "#56B4E9",
                     "FLEET alarm: ages faster than the fleet": "#AA4499",
                     "OWN alarm: fade steeper than its own past": "#D55E00", "Common test event": "#E69F00",
-                    "FLEET + OWN alarm": "#CC0000"}
+                    "FLEET + OWN alarm": "#CC0000", "Past end of life": "#6B1E1E"}
 
 
 def fig_detection_live(tr: pd.DataFrame, status: List[str], n: int, P: Palette, cell: str, kappa_thr: float,
-                       z_thr: float) -> go.Figure:
+                       z_thr: float, removed: Optional[pd.DataFrame] = None, soh_eol: Optional[float] = None,
+                       n_eol: Optional[float] = None) -> go.Figure:
     n_last = float(tr["n"].max())
     now = tr[tr["n"] <= n]
     st_now = status[:len(now)]
@@ -6408,6 +6410,20 @@ def fig_detection_live(tr: pd.DataFrame, status: List[str], n: int, P: Palette, 
                                      marker=dict(color=col, size=9 if lab != "Normal" else 6,
                                                  line=dict(width=0.5, color=P.plot_bg) if lab != "Normal" else None),
                                      hovertemplate="cycle %{x}: %{y:.1f} %<extra>" + lab + "</extra>"), 1, 1)
+    if removed is not None and len(removed):
+        rm = removed[removed["n"] <= n]
+        if len(rm):
+            fig.add_trace(go.Scatter(x=rm["n"], y=100 * rm["SOH"], mode="markers", name="Removed by data cleaning",
+                                     marker=dict(color="rgba(0,0,0,0)", size=7, line=dict(color="#9AA3AD", width=1.2)),
+                                     hovertemplate="cycle %{x}: %{y:.1f} % (removed: recovery after a rest or invalid "
+                                                   "measurement; not used by the detector)<extra></extra>"), 1, 1)
+    if soh_eol is not None and np.isfinite(soh_eol):
+        fig.add_hline(y=100 * soh_eol, line=dict(color="#6B1E1E", dash="dash", width=1.2), row=1, col=1)
+        fig.add_annotation(x=0, y=100 * soh_eol, xref="x", yref="y", text=f"end of life {100 * soh_eol:.1f} %",
+                           showarrow=False, xanchor="left", yanchor="bottom", font=dict(color="#B04040", size=11),
+                           row=1, col=1)
+        if n_eol is not None and n_eol <= n:
+            fig.add_vline(x=n_eol, line=dict(color="#B04040", width=1.5), row=1, col=1)
     fig.add_trace(go.Scatter(x=now["n"], y=now["kappa"], name="κ", line=dict(color="#AA4499", width=2), showlegend=False), 2, 1)
     fig.add_hline(y=kappa_thr, line=dict(color="#AA4499", dash="dash", width=1), row=2, col=1)
     fig.add_trace(go.Scatter(x=now["n"], y=now["slope z"], name="z", line=dict(color="#D55E00", width=2), showlegend=False), 3, 1)
@@ -6415,9 +6431,10 @@ def fig_detection_live(tr: pd.DataFrame, status: List[str], n: int, P: Palette, 
     for r in (1, 2, 3):
         fig.add_vline(x=n, line=dict(color=P.text, width=1, dash="dot"), row=r, col=1)
     fig.update_xaxes(range=[0, n_last * 1.02])
-    y_all = 100 * tr["SOH"].dropna()
+    y_all = 100 * pd.concat([tr["SOH"], removed["SOH"] if removed is not None and len(removed) else tr["SOH"]]).dropna()
     if len(y_all):
-        fig.update_yaxes(range=[float(y_all.min()) - 2, float(y_all.max()) + 2], row=1, col=1)
+        lo_y = min(float(y_all.min()), 100 * soh_eol if soh_eol is not None and np.isfinite(soh_eol) else 999)
+        fig.update_yaxes(range=[lo_y - 2, float(y_all.max()) + 2], row=1, col=1)
     fig.update_yaxes(title_text="SOH (%)", row=1, col=1)
     fig.update_yaxes(title_text="κ", row=2, col=1)
     fig.update_yaxes(title_text="z", row=3, col=1)
@@ -6429,8 +6446,18 @@ def detection_live_replay(tr: pd.DataFrame, common: Optional[Dict[float, List[st
                           kappa_thr: float, z_thr: float) -> None:
     """Replay one battery cycle by cycle with the detector's verdict colouring each point and the event log below."""
     st.markdown(f"##### :material/play_circle: Live detection replay · {cell_id}")
-    status = te.anomaly_cycle_status(tr, common)
-    ev = te.anomaly_events(tr, common, kappa_thr, z_thr)
+    raw = CT_RAW[CT_RAW["Cell_ID"] == cell_id]
+    c_bol_c = float(raw["C_bol_Ah"].iloc[0]) if len(raw) and "C_bol_Ah" in raw else np.nan
+    soh_eol_c = te.soh_eol_for(c_bol_c, eol_ah) if np.isfinite(c_bol_c) else None
+    removed = raw.loc[~raw["n"].isin(tr["n"]) & raw["SOH"].notna(), ["n", "SOH"]].sort_values("n")
+    status = te.anomaly_cycle_status(tr, common, soh_eol=soh_eol_c)
+    ev = te.anomaly_events(tr, common, kappa_thr, z_thr, soh_eol=soh_eol_c, eol_label=(f"{float(eol_ah):.2f} Ah" if float(eol_ah) > 1.0
+                                                                                  else f"{100 * float(eol_ah):.0f} % of initial capacity"))
+    n_eol = te.eol_cycle_from_replay(tr, soh_eol_c)
+    if len(removed):
+        st.caption(f"{len(removed)} of {len(raw)} cycles are shown as hollow circles: removed by the data cleaning "
+                   "(the cycle where capacity recovers after a rest, plus the two transient cycles after it, and invalid "
+                   "measurements), so they never trigger or hide an alarm.")
     ns = tr["n"].astype(int).tolist()
     key_n, key_p = f"an2_n_{cell_id}", "an2_play"
     st.session_state.setdefault(key_n, ns[min(3, len(ns) - 1)])
@@ -6464,12 +6491,16 @@ def detection_live_replay(tr: pd.DataFrame, common: Optional[Dict[float, List[st
         k1, k2, k3 = st.columns([1, 1, 2])
         k1.metric("Cycle", f"{n} / {ns[-1]}")
         k2.metric("SOH now", f"{100 * float(tr['SOH'].iloc[i]):.1f} %")
+        past = n_eol is not None and n >= n_eol
         k3.markdown(f"<div style='padding:10px 14px;border-radius:8px;background:{col}22;border-left:6px solid {col}'>"
-                    f"<b>Detector now:</b> {verdict}</div>", unsafe_allow_html=True)
+                    f"<b>Detector now:</b> {verdict}"
+                    + (f" · <b>past end of life</b> (since cycle {n_eol:.0f})" if past and verdict != "Past end of life" else "")
+                    + "</div>", unsafe_allow_html=True)
         st.progress(min(1.0, (n - ns[0]) / max(ns[-1] - ns[0], 1)),
                     text=f"{'▶ streaming' if st.session_state.get(key_p) else '⏸ paused'} · nothing after the cursor is "
                          "visible to the detector")
-        show(fig_detection_live(tr, status, n, P, cell_id, kappa_thr, z_thr), key="an2_live", export=False)
+        show(fig_detection_live(tr, status, n, P, cell_id, kappa_thr, z_thr, removed, soh_eol_c, n_eol), key="an2_live",
+             export=False)
         seen = ev[ev["cycle"] <= n].sort_values("cycle", ascending=False)
         st.markdown(f"**What happened to {cell_id}** (up to cycle {n})")
         if seen.empty:

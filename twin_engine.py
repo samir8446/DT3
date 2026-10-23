@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.27.0"
+ENGINE_VERSION = "5.28.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10450,7 +10450,8 @@ def anomaly_common_cause(scan: Dict[str, pd.DataFrame], campaign: Dict[str, str]
 
 
 def anomaly_events(tr: pd.DataFrame, common: Optional[Dict[float, List[str]]] = None, kappa_thr: float = 1.8,
-                   z_thr: float = 3.0, regen_jump: float = 0.01) -> pd.DataFrame:
+                   z_thr: float = 3.0, regen_jump: float = 0.01, soh_eol: Optional[float] = None,
+                   eol_label: str = "") -> pd.DataFrame:
     """Dated plain-language events of one replay (two indicators, regeneration, indicator readiness)."""
     ev = []
     n, y = tr["n"], tr["SOH"]
@@ -10481,6 +10482,12 @@ def anomaly_events(tr: pd.DataFrame, common: Optional[Dict[float, List[str]]] = 
         if np.isfinite(yy[i]) and np.isfinite(prev) and yy[i] - prev > regen_jump:
             ev.append((float(n.iloc[i]), "DATA", "info", f"Capacity recovered by {100 * (yy[i] - prev):.1f} SOH points "
                                                           "after a rest (regeneration): normal behaviour, not a fault."))
+    n_eol = eol_cycle_from_replay(tr, soh_eol)
+    if n_eol is not None:
+        y_eol = float(tr["SOH"].rolling(3, min_periods=1).median().loc[tr["n"] == n_eol].iloc[0])
+        ev.append((n_eol, "EOL", "eol", f"End of life reached: SOH {100 * y_eol:.1f} % fell below the end-of-life "
+                                        f"threshold {100 * soh_eol:.1f} %{(' (' + eol_label + ')') if eol_label else ''}: "
+                                        "plan the replacement."))
     out = pd.DataFrame(ev, columns=["cycle", "indicator", "kind", "what happened"]).sort_values(["cycle", "indicator"])
     return out.reset_index(drop=True)
 
@@ -10516,11 +10523,21 @@ def anomaly_validation_common(restarts: int = 6, progress: ProgressFn = None, **
 # 54. MISSION 3 · PER-CYCLE DETECTION STATUS (for the live detection replay)
 # =============================================================================
 DETECTION_STATUS = ("Normal", "Regeneration (normal)", "FLEET alarm: ages faster than the fleet",
-                    "OWN alarm: fade steeper than its own past", "Common test event", "FLEET + OWN alarm")
+                    "OWN alarm: fade steeper than its own past", "Common test event", "FLEET + OWN alarm",
+                    "Past end of life")
+
+
+def eol_cycle_from_replay(tr: pd.DataFrame, soh_eol: Optional[float]) -> Optional[float]:
+    """First cycle at which the (3-cycle median) SOH is at or below the end-of-life threshold, using only the past."""
+    if soh_eol is None or not np.isfinite(soh_eol):
+        return None
+    y = tr["SOH"].rolling(3, min_periods=1).median().to_numpy(float)
+    hit = np.nonzero(np.isfinite(y) & (y <= soh_eol))[0]
+    return float(tr["n"].iloc[hit[0]]) if len(hit) else None
 
 
 def anomaly_cycle_status(tr: pd.DataFrame, common: Optional[Dict[float, List[str]]] = None,
-                         regen_jump: float = 0.01) -> List[str]:
+                         regen_jump: float = 0.01, soh_eol: Optional[float] = None) -> List[str]:
     """What the detector concluded at every cycle of a replay (causal: each label uses data up to that cycle only;
     an OWN alarm run is 'common' when its onset was shared by another battery of the same campaign)."""
     n = tr["n"].to_numpy(float)
@@ -10528,6 +10545,7 @@ def anomaly_cycle_status(tr: pd.DataFrame, common: Optional[Dict[float, List[str
     f = tr["fleet alarm"].fillna(False).astype(bool).to_numpy()
     o = tr["own alarm"].fillna(False).astype(bool).to_numpy()
     out, onset = [], None
+    n_eol = eol_cycle_from_replay(tr, soh_eol)
     for i in range(len(n)):
         if o[i] and (i == 0 or not o[i - 1]):
             onset = n[i]
@@ -10542,6 +10560,8 @@ def anomaly_cycle_status(tr: pd.DataFrame, common: Optional[Dict[float, List[str
             out.append(DETECTION_STATUS[3])
         elif f[i]:
             out.append(DETECTION_STATUS[2])
+        elif n_eol is not None and n[i] >= n_eol:
+            out.append(DETECTION_STATUS[6])
         elif regen:
             out.append(DETECTION_STATUS[1])
         else:

@@ -1,9 +1,20 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.27.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.28.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## End of life in the detection; removed cycles shown (v5.28.0)
+
+1. Engine: eol_cycle_from_replay (first cycle whose 3-cycle median SOH is at or below the end-of-life threshold, causal);
+   anomaly_events adds an EOL event ("End of life reached ... plan the replacement"); anomaly_cycle_status adds "Past
+   end of life" (alarms keep priority). (A first version reused the name eol_crossing, which already existed and is
+   used by the assessment: caught by 3 failing tests, renamed.)
+2. Live detection replay: dashed end-of-life line and a marker at the crossing; verdict box says "past end of life";
+   cycles removed by the data cleaning (the regeneration cycle after a rest + the 2 transient cycles after it, and
+   invalid measurements) are shown as hollow circles with an explanation, instead of gaps.
+3. 40 tests pass; AppTest of the replay at the end of life; all 7 pages.
 
 ## Faster live twin (result backup) and live detection replay (v5.27.0)
 

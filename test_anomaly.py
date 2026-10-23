@@ -68,3 +68,16 @@ def test_cycle_status_labels_the_knee_and_regeneration():
     first_alarm = tr.attrs["first_own_alarm"]
     assert all(s_ != "OWN alarm: fade steeper than its own past"
                for s_, n in zip(stt, tr["n"]) if n < first_alarm)          # causal: nothing before the alarm
+
+
+def test_end_of_life_is_reported_once_and_causally():
+    cds, re, truth = te.anomaly_cohort2(0)
+    tr = te.anomaly_replay2(None, cds["C4"])
+    thr = float(tr["SOH"].iloc[len(tr) // 2])                     # a threshold the battery crosses mid-life
+    ev = te.anomaly_events(tr, soh_eol=thr, eol_label="test")
+    eol = ev[ev["kind"] == "eol"]
+    assert len(eol) == 1
+    n_eol = eol["cycle"].iloc[0]
+    stt = te.anomaly_cycle_status(tr, soh_eol=thr)
+    before = [s_ for s_, n in zip(stt, tr["n"]) if n < n_eol]
+    assert "Past end of life" not in before and "Past end of life" in stt
