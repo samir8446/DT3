@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.26.0"
+ENGINE_VERSION = "5.27.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10510,3 +10510,40 @@ def anomaly_validation_common(restarts: int = 6, progress: ProgressFn = None, **
         rows.append({"battery": c, "OWN onsets": ", ".join(f"{o:.0f}" for o in ons) or "—", "expected": expect,
                      "classified": got, "correct": got == expect})
     return pd.DataFrame(rows)
+
+
+# =============================================================================
+# 54. MISSION 3 · PER-CYCLE DETECTION STATUS (for the live detection replay)
+# =============================================================================
+DETECTION_STATUS = ("Normal", "Regeneration (normal)", "FLEET alarm: ages faster than the fleet",
+                    "OWN alarm: fade steeper than its own past", "Common test event", "FLEET + OWN alarm")
+
+
+def anomaly_cycle_status(tr: pd.DataFrame, common: Optional[Dict[float, List[str]]] = None,
+                         regen_jump: float = 0.01) -> List[str]:
+    """What the detector concluded at every cycle of a replay (causal: each label uses data up to that cycle only;
+    an OWN alarm run is 'common' when its onset was shared by another battery of the same campaign)."""
+    n = tr["n"].to_numpy(float)
+    y = tr["SOH"].to_numpy(float)
+    f = tr["fleet alarm"].fillna(False).astype(bool).to_numpy()
+    o = tr["own alarm"].fillna(False).astype(bool).to_numpy()
+    out, onset = [], None
+    for i in range(len(n)):
+        if o[i] and (i == 0 or not o[i - 1]):
+            onset = n[i]
+        is_common = bool(o[i] and (common or {}).get(onset))
+        prev = np.nanmedian(y[max(0, i - 3):i]) if i >= 3 else np.nan
+        regen = bool(np.isfinite(y[i]) and np.isfinite(prev) and y[i] - prev > regen_jump)
+        if o[i] and is_common:
+            out.append(DETECTION_STATUS[4])
+        elif o[i] and f[i]:
+            out.append(DETECTION_STATUS[5])
+        elif o[i]:
+            out.append(DETECTION_STATUS[3])
+        elif f[i]:
+            out.append(DETECTION_STATUS[2])
+        elif regen:
+            out.append(DETECTION_STATUS[1])
+        else:
+            out.append(DETECTION_STATUS[0])
+    return out

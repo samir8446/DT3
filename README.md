@@ -1,9 +1,24 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.26.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.27.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Faster live twin (result backup) and live detection replay (v5.27.0)
+
+1. Live twin: "Retrain every" now defaults to never (the update study's best and cheapest setting: measured-capacity
+   anchor without retraining); 5-50 still selectable.
+2. Result backup (backed() in app.py): heavy results (live replays, frozen streams, multi-model frames, anomaly scan,
+   shared physics, hybrid) are saved to results/cache/, keyed by engine version + a fingerprint of the input CONTENT
+   (not paths) + settings; a new session reloads them. Demo: Live twin 26 s first time, 2 s in a new session.
+   Sidebar "Result backup": download all saved results as a zip; upload the files to results/cache/ on GitHub so the
+   app starts warm after restarts. A new engine version rebuilds them.
+3. Operations: live detection replay (play / step / back / reset / speed): SOH points appear cycle by cycle coloured by
+   the detector's verdict at that cycle (normal, regeneration, FLEET, OWN, common test event, FLEET + OWN), the
+   indicators grow below, a verdict box shows the current state, and "What happened" lists the events up to the
+   cursor. Engine section 54: anomaly_cycle_status (causal per-cycle labels).
+4. 39 tests pass; AppTest: live twin (first and new session), live detection replay, all 7 pages.
 
 ## Live anomaly detection, common-cause events, new page order (v5.26.0)
 

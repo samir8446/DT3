@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.26.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.27.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.26.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.26.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.27.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.27.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -462,8 +462,14 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - FLEET min history 12; common-cause classification (validated 11/11); plain-language event log; live panel in the
   Live twin; page order: Models -> Model updating (new page) -> Live twin -> Operations -> Study results.
 
+## 5am. Speed and live detection (v5.27.0, 2026-10-23)
+- Live twin retrain default never; result backup on disk (results/cache/, content-keyed, engine-versioned; zip export
+  in the sidebar; commit to GitHub for a warm start). Live twin 26 s -> 2 s in a new session.
+- Operations: live detection replay with per-cycle verdict colours and the growing "What happened" log.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.26.0 (twin_engine.py, app.py, tests/test_anomaly.py); CI green; app shows v5.26.0.
+1. USER: upload v5.27.0 (twin_engine.py, app.py, tests/test_anomaly.py); CI green; app shows v5.27.0. Warm the
+   batteries to demo, download the result backup zip (sidebar), upload its files to results/cache/ on GitHub.
 2. USER: Live twin on B0045, B0006, B0005 (live anomaly detection on): check the event log; Operations scan:
    B0005/B0006/B0007 OWN alarms should now read "common event"; B0034 FLEET false alarm gone.
 3. Then: integrated twin view (forecast by Mission 2 frozen models + explanation + anomalies + what-if).

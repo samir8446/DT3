@@ -57,3 +57,14 @@ def test_event_log_reports_regeneration_and_alarms():
     assert (ev["indicator"] == "DATA").any()                       # regeneration jumps are reported as normal
     assert ((ev["indicator"] == "OWN") & (ev["kind"] == "alarm")).any()   # the knee
     assert ev["cycle"].is_monotonic_increasing
+
+
+def test_cycle_status_labels_the_knee_and_regeneration():
+    cds, re, truth = te.anomaly_cohort2(0)
+    tr = te.anomaly_replay2(None, cds["R2"])
+    stt = te.anomaly_cycle_status(tr)
+    assert len(stt) == len(tr) and set(stt) <= set(te.DETECTION_STATUS)
+    assert "Regeneration (normal)" in stt and "OWN alarm: fade steeper than its own past" in stt
+    first_alarm = tr.attrs["first_own_alarm"]
+    assert all(s_ != "OWN alarm: fade steeper than its own past"
+               for s_, n in zip(stt, tr["n"]) if n < first_alarm)          # causal: nothing before the alarm

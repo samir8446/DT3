@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.26.0"
+REQUIRED_ENGINE = "5.27.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -2304,9 +2304,94 @@ def est_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, model:
                                   list(train_cells) or None, list(test_cells) or None, normalise)
 
 
+
+# ---- Result backup on disk (v5.27): heavy results survive new sessions; export as a zip, commit to results/cache/ ----
+CACHE_DIR = RESULTS_DIR / "cache"
+
+
+def _fingerprint(h: Any, obj: Any) -> None:
+    import hashlib  # noqa: F401
+    if isinstance(obj, pd.DataFrame):
+        h.update(("DF" + "|".join(map(str, obj.columns))).encode())
+        h.update(pd.util.hash_pandas_object(obj, index=True).values.tobytes())
+    elif isinstance(obj, pd.Series):
+        h.update(pd.util.hash_pandas_object(obj, index=True).values.tobytes())
+    elif isinstance(obj, np.ndarray):
+        h.update(obj.tobytes())
+    elif isinstance(obj, dict):
+        for k_ in sorted(obj, key=str):
+            h.update(str(k_).encode()); _fingerprint(h, obj[k_])
+    elif isinstance(obj, (list, tuple)):
+        h.update(b"(")
+        for v_ in obj:
+            _fingerprint(h, v_)
+        h.update(b")")
+    elif obj is None or isinstance(obj, (str, int, float, bool, np.integer, np.floating)):
+        h.update(repr(obj).encode())
+    else:
+        import pickle
+        try:
+            h.update(pickle.dumps(obj, protocol=4))
+        except Exception:
+            h.update(repr(obj).encode())
+
+
+def backed(name: str, compute: Callable[[], Any], *parts: Any) -> Any:
+    """Load the result of `compute` from the disk backup if the same engine version already computed it from the same
+    inputs (content, not paths); otherwise compute it and save it."""
+    import hashlib
+    import pickle
+    h = hashlib.sha1()
+    h.update(f"{name}|{te.ENGINE_VERSION}".encode())
+    for p_ in parts:
+        _fingerprint(h, p_)
+    path = CACHE_DIR / f"{name}__{te.ENGINE_VERSION}__{h.hexdigest()[:20]}.pkl"
+    if path.exists():
+        try:
+            with open(path, "rb") as f_:
+                return pickle.load(f_)
+        except Exception:
+            pass
+    val = compute()
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        with open(tmp, "wb") as f_:
+            pickle.dump(val, f_, protocol=4)
+        tmp.replace(path)
+    except Exception:
+        pass
+    return val
+
+
+def cache_backup_panel() -> None:
+    files = sorted(CACHE_DIR.glob(f"*__{te.ENGINE_VERSION}__*.pkl")) if CACHE_DIR.exists() else []
+    with st.expander(f"Result backup · {len(files)} saved result(s)", icon=":material/backup:"):
+        st.caption("Heavy results (live replays, frozen models, anomaly scan, shared physics, hybrid) are saved here and "
+                   "reload instantly. To keep them after the app restarts, download the zip and upload its files to "
+                   "the folder results/cache/ of the GitHub repository. A new app version rebuilds them.")
+        if files:
+            import io
+            import zipfile
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for f_ in files:
+                    z.write(f_, arcname=f_.name)
+            st.download_button("Download the result backup (zip)", buf.getvalue(),
+                               file_name=f"result_cache__v{te.ENGINE_VERSION}.zip", mime="application/zip",
+                               key="cache_zip", use_container_width=True)
+            st.caption(f"{sum(f_.stat().st_size for f_ in files) / 1e6:.1f} MB")
+
+
 @st.cache_data(show_spinner=False, max_entries=8)
 def replay_cached(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str,
                   soh_eol: float, level: float, cap_every: int = 10) -> Tuple[te.EKFResult, pd.DataFrame]:
+    return backed("replay", lambda: _replay_compute(_cell_df, _ct, _imp, cell, soh_eol, level, cap_every),
+                  _cell_df, _ct[_ct["Cell_ID"] == cell], _imp, cell, soh_eol, level, cap_every)
+
+
+def _replay_compute(_cell_df: pd.DataFrame, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], cell: str,
+                    soh_eol: float, level: float, cap_every: int) -> Tuple[te.EKFResult, pd.DataFrame]:
     r = te.run_dual_twin(_cell_df, _ct, _imp, cell, te.TwinParameters(),
                          te.twin_config_for(_ct, cell, te.DualTwinConfig(capacity_every=cap_every)))
     n_max = int(r.per_cycle["n"].max() * 1.6)
@@ -2327,14 +2412,18 @@ def live_cached(_ekf: te.EKFResult, _ct: pd.DataFrame, _imp: Optional[pd.DataFra
                 soh_eol: float, level: float, cap_every: int, models: Tuple[str, ...],
                 frozen_cfg: Optional[Tuple[Any, ...]] = None, _extra: Optional[Dict[str, Any]] = None
                 ) -> Tuple[Dict[int, Any], pd.DataFrame]:
-    return te.live_multi_model(_ct, cell, _ekf, soh_eol, level, models, imp=_imp, extra=_extra)
+    return backed("live", lambda: te.live_multi_model(_ct, cell, _ekf, soh_eol, level, models, imp=_imp, extra=_extra),
+                  _ct, _imp, cell, _ekf.per_cycle if hasattr(_ekf, "per_cycle") else _ekf, soh_eol, level, cap_every,
+                  models, frozen_cfg, _extra)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def frozen_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str, train: Tuple[str, ...],
                   fkey: str, mkey: str, soh_eol: float, refit: int, anchor: str, eol_ah: float
                   ) -> Tuple[Dict[int, Any], pd.DataFrame]:
-    return te.frozen_stream(_ct, _imp, cell, list(train), fkey, mkey, soh_eol, refit, anchor, eol_ah=eol_ah)
+    return backed("frozen", lambda: te.frozen_stream(_ct, _imp, cell, list(train), fkey, mkey, soh_eol, refit, anchor,
+                                                     eol_ah=eol_ah),
+                  _ct, _imp, cell, train, fkey, mkey, soh_eol, refit, anchor, eol_ah)
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -2571,6 +2660,7 @@ with st.sidebar:
     publication = st.toggle("Publication style", value=False,
                             help="White background, serif type and black axes, for export into papers.")
     debug = st.toggle("Show tracebacks on errors", value=False)
+    cache_backup_panel()
 
 P = resolve_palette(theme_choice, publication)
 inject_css(P)
@@ -3484,7 +3574,7 @@ def view_replay() -> None:
                                     f"({te.FROZEN_SOURCE}). It is retrained on the group's other batteries plus this "
                                     "battery's history up to now, and its forecast is re-anchored every cycle to the "
                                     "current SOH.")
-            refit = f2.select_slider("Retrain every (cycles)", [5, 10, 20, 50, 0], value=10, key="rp_fz_refit",
+            refit = f2.select_slider("Retrain every (cycles)", [5, 10, 20, 50, 0], value=0, key="rp_fz_refit",
                                      format_func=lambda v: "never" if v == 0 else str(v), disabled=not use_fz)
             anchor = f3.radio("Re-anchor every cycle to", list(te.FROZEN_ANCHORS), key="rp_fz_anchor", horizontal=True,
                               format_func=lambda k_: te.FROZEN_ANCHORS[k_].split(" (")[0], disabled=not use_fz,
@@ -3509,7 +3599,8 @@ def view_replay() -> None:
              "Live ensemble: weights every model by its recent 5-cycle-ahead error.")
     fz_frames = None
     if use_fz:
-        with st.spinner(f"Streaming the frozen {grp_c} model (retrains as it goes; runs once)…"):
+        with st.spinner(f"Streaming the frozen {grp_c} model (" + ("trained once" if int(refit) == 0 else
+                                                                    f"retrained every {int(refit)} cycles") + "; saved, so it runs only once)…"):
             try:
                 fz_frames, _fz_track = frozen_cached(ct, imp, DATA_KEY, cell, tuple(train_c), fz[0], fz[1],
                                                      float(soh_eol), int(refit), anchor, float(eol_ah))
@@ -5944,7 +6035,9 @@ MECH_KEYS = {"LLI by SEI growth": "SEI", "LLI by lithium plating": "plating", "L
 @st.cache_data(show_spinner=False, max_entries=8)
 def nasa_physics_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...],
                         restarts: int, version: int, fit_with: str) -> Dict[str, Any]:
-    return te.nasa_physics_fit(_ct, _imp, list(cells), restarts=restarts, version=version, fit_with=fit_with)
+    return backed("physics", lambda: te.nasa_physics_fit(_ct, _imp, list(cells), restarts=restarts, version=version,
+                                                         fit_with=fit_with),
+                  _ct, _imp, cells, restarts, version, fit_with)
 
 
 NP_VERSIONS = {"Version 3: learned SEI exponent + plating triggered by lost graphite (recommended)": 3,
@@ -6076,7 +6169,9 @@ HYB_UNEXPL_COLOR = "#9AA3AD"
 @st.cache_data(show_spinner=False, max_entries=8)
 def hybrid_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...], restarts: int,
                   fit_with: str, lam: float, version: int = 3) -> Dict[str, Any]:
-    return te.nasa_hybrid_fit(_ct, _imp, list(cells), fit_with=fit_with, restarts=restarts, lam=lam, version=version)
+    return backed("hybrid", lambda: te.nasa_hybrid_fit(_ct, _imp, list(cells), fit_with=fit_with, restarts=restarts,
+                                                       lam=lam, version=version),
+                  _ct, _imp, cells, restarts, fit_with, lam, version)
 
 
 @st.cache_data(show_spinner=False)
@@ -6256,7 +6351,9 @@ def anomaly_validation2_cached(kappa_thr: float, z_thr: float) -> pd.DataFrame:
 @st.cache_data(show_spinner=False, max_entries=8)
 def anomaly_scan2_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...],
                          kappa_thr: float, z_thr: float) -> Dict[str, pd.DataFrame]:
-    return te.nasa_anomaly_scan2(_ct, _imp, list(cells), restarts=6, kappa_thr=kappa_thr, z_thr=z_thr)
+    return backed("anomaly", lambda: te.nasa_anomaly_scan2(_ct, _imp, list(cells), restarts=6, kappa_thr=kappa_thr,
+                                                           z_thr=z_thr),
+                  _ct, _imp, cells, kappa_thr, z_thr)
 
 
 def fig_anomaly2(tr: pd.DataFrame, P: Palette, cell: str, kappa_thr: float, z_thr: float,
@@ -6286,6 +6383,111 @@ def fig_anomaly2(tr: pd.DataFrame, P: Palette, cell: str, kappa_thr: float, z_th
     if n_max is not None:
         fig.update_xaxes(range=[0, n_max])
     return style_fig(fig, P, height, f"Anomaly detection replay · {cell}")
+
+
+
+DETECTION_COLORS = {"Normal": "#9AA3AD", "Regeneration (normal)": "#56B4E9",
+                    "FLEET alarm: ages faster than the fleet": "#AA4499",
+                    "OWN alarm: fade steeper than its own past": "#D55E00", "Common test event": "#E69F00",
+                    "FLEET + OWN alarm": "#CC0000"}
+
+
+def fig_detection_live(tr: pd.DataFrame, status: List[str], n: int, P: Palette, cell: str, kappa_thr: float,
+                       z_thr: float) -> go.Figure:
+    n_last = float(tr["n"].max())
+    now = tr[tr["n"] <= n]
+    st_now = status[:len(now)]
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.56, 0.22, 0.22],
+                        subplot_titles=(f"{cell} · state of health, coloured by what the detector concluded at each cycle",
+                                        "FLEET · ageing speed κ vs the fleet", "OWN · fade slope vs its own past (z)"))
+    for lab, col in DETECTION_COLORS.items():
+        m = [s_ == lab for s_ in st_now]
+        if any(m):
+            sub = now[m]
+            fig.add_trace(go.Scatter(x=sub["n"], y=100 * sub["SOH"], mode="markers", name=lab,
+                                     marker=dict(color=col, size=9 if lab != "Normal" else 6,
+                                                 line=dict(width=0.5, color=P.plot_bg) if lab != "Normal" else None),
+                                     hovertemplate="cycle %{x}: %{y:.1f} %<extra>" + lab + "</extra>"), 1, 1)
+    fig.add_trace(go.Scatter(x=now["n"], y=now["kappa"], name="κ", line=dict(color="#AA4499", width=2), showlegend=False), 2, 1)
+    fig.add_hline(y=kappa_thr, line=dict(color="#AA4499", dash="dash", width=1), row=2, col=1)
+    fig.add_trace(go.Scatter(x=now["n"], y=now["slope z"], name="z", line=dict(color="#D55E00", width=2), showlegend=False), 3, 1)
+    fig.add_hline(y=z_thr, line=dict(color="#D55E00", dash="dash", width=1), row=3, col=1)
+    for r in (1, 2, 3):
+        fig.add_vline(x=n, line=dict(color=P.text, width=1, dash="dot"), row=r, col=1)
+    fig.update_xaxes(range=[0, n_last * 1.02])
+    y_all = 100 * tr["SOH"].dropna()
+    if len(y_all):
+        fig.update_yaxes(range=[float(y_all.min()) - 2, float(y_all.max()) + 2], row=1, col=1)
+    fig.update_yaxes(title_text="SOH (%)", row=1, col=1)
+    fig.update_yaxes(title_text="κ", row=2, col=1)
+    fig.update_yaxes(title_text="z", row=3, col=1)
+    fig.update_xaxes(title_text="Discharge cycle n", row=3, col=1)
+    return style_fig(fig, P, 640, f"Live detection replay · {cell} · cycle {n}")
+
+
+def detection_live_replay(tr: pd.DataFrame, common: Optional[Dict[float, List[str]]], cell_id: str,
+                          kappa_thr: float, z_thr: float) -> None:
+    """Replay one battery cycle by cycle with the detector's verdict colouring each point and the event log below."""
+    st.markdown(f"##### :material/play_circle: Live detection replay · {cell_id}")
+    status = te.anomaly_cycle_status(tr, common)
+    ev = te.anomaly_events(tr, common, kappa_thr, z_thr)
+    ns = tr["n"].astype(int).tolist()
+    key_n, key_p = f"an2_n_{cell_id}", "an2_play"
+    st.session_state.setdefault(key_n, ns[min(3, len(ns) - 1)])
+    st.session_state.setdefault(key_p, False)
+    c = st.columns([1.0, 0.8, 0.8, 0.8, 1.3, 1.3])
+    playing = bool(st.session_state[key_p])
+    if c[0].button("Pause" if playing else "Play", key="an2_toggle", type="primary",
+                   icon=":material/pause:" if playing else ":material/play_arrow:"):
+        st.session_state[key_p] = not playing
+        if not playing and st.session_state[key_n] >= ns[-1]:
+            st.session_state[key_n] = ns[0]
+    if c[1].button("Step", key="an2_step", icon=":material/skip_next:"):
+        st.session_state[key_n] = min(ns[-1], st.session_state[key_n] + 1)
+    if c[2].button("Back", key="an2_back", icon=":material/skip_previous:"):
+        st.session_state[key_n] = max(ns[0], st.session_state[key_n] - 1)
+    if c[3].button("Reset", key="an2_reset", icon=":material/replay:"):
+        st.session_state[key_n], st.session_state[key_p] = ns[0], False
+    speed = c[4].select_slider("Cycles per frame", [1, 2, 3, 5], value=2, key="an2_speed")
+    interval = c[5].select_slider("Frame interval (s)", [0.4, 0.7, 1.0], value=0.7, key="an2_int")
+
+    def frame() -> None:
+        if st.session_state.get(key_p):
+            nxt = st.session_state[key_n] + int(speed)
+            if nxt >= ns[-1]:
+                nxt, st.session_state[key_p] = ns[-1], False
+            st.session_state[key_n] = nxt
+        n = min(ns, key=lambda v: abs(v - int(st.session_state[key_n])))
+        i = ns.index(n)
+        verdict = status[i]
+        col = DETECTION_COLORS.get(verdict, "#9AA3AD")
+        k1, k2, k3 = st.columns([1, 1, 2])
+        k1.metric("Cycle", f"{n} / {ns[-1]}")
+        k2.metric("SOH now", f"{100 * float(tr['SOH'].iloc[i]):.1f} %")
+        k3.markdown(f"<div style='padding:10px 14px;border-radius:8px;background:{col}22;border-left:6px solid {col}'>"
+                    f"<b>Detector now:</b> {verdict}</div>", unsafe_allow_html=True)
+        st.progress(min(1.0, (n - ns[0]) / max(ns[-1] - ns[0], 1)),
+                    text=f"{'▶ streaming' if st.session_state.get(key_p) else '⏸ paused'} · nothing after the cursor is "
+                         "visible to the detector")
+        show(fig_detection_live(tr, status, n, P, cell_id, kappa_thr, z_thr), key="an2_live", export=False)
+        seen = ev[ev["cycle"] <= n].sort_values("cycle", ascending=False)
+        st.markdown(f"**What happened to {cell_id}** (up to cycle {n})")
+        if seen.empty:
+            st.caption("No event yet: the battery behaves as expected so far.")
+        else:
+            with st.container(height=min(300, 50 + 44 * len(seen)), border=True):
+                st.markdown("  \n".join(
+                    f"{EVENT_STYLE.get(r.kind, ('gray', ':material/info:'))[1]} :{EVENT_STYLE.get(r.kind, ('gray', ''))[0]}"
+                    f"[**cycle {r.cycle:.0f} · {r.indicator}**] — {r[3]}" for r in seen.itertuples(index=False)))
+
+    frag = getattr(st, "fragment", None)
+    if frag is not None:
+        try:
+            frag(run_every=f"{interval}s" if st.session_state.get(key_p) else None)(frame)()
+            return
+        except TypeError:
+            pass
+    frame()
 
 
 def anomaly_section() -> None:
@@ -6357,17 +6559,9 @@ def anomaly_section() -> None:
     flagged = list(dict.fromkeys(ff["battery"].tolist() + fo["battery"].tolist()))
     pick = st.selectbox("Battery to replay", list(scan), key="an2_cell",
                         index=list(scan).index(flagged[0]) if flagged else 0)
-    show(fig_anomaly2(scan[pick], P, pick, float(kappa_thr), float(z_thr)), key="an2_fig", data=scan[pick])
     campaign = {c: str(groups.loc[c, "Group"]) if c in groups.index else c for c in scan}
     cc = te.anomaly_common_cause(scan, campaign)
-    ev = te.anomaly_events(scan[pick], cc.get(pick), float(kappa_thr), float(z_thr))
-    st.markdown(f"**What happened to {pick}**")
-    if ev.empty:
-        st.caption("No event: the battery behaved as expected.")
-    else:
-        st.markdown("  \n".join(
-            f"{EVENT_STYLE.get(r.kind, ('gray', ':material/info:'))[1]} :{EVENT_STYLE.get(r.kind, ('gray', ''))[0]}"
-            f"[**cycle {r.cycle:.0f} · {r.indicator}**] — {r[3]}" for r in ev.itertuples(index=False)))
+    detection_live_replay(scan[pick], cc.get(pick), pick, float(kappa_thr), float(z_thr))
     download("Download the anomaly scan (CSV)",
              pd.concat([tr.assign(battery=c) for c, tr in scan.items()], ignore_index=True)
              .assign(**{"app version": te.ENGINE_VERSION, "kappa threshold": kappa_thr, "z threshold": z_thr})
