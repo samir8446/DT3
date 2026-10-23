@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.25.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.26.0 · 2026-10-14
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.25.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.25.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.26.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.26.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
@@ -449,12 +449,24 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - Validation WITH regeneration: 11/11 correct (knees by OWN after 27-35 cycles; 2.5x-fast batteries by FLEET at
   cycle 12; healthy quiet). v5.24 detector: 8/8 false alarms on the same cohort. Not yet run on NASA.
 
+## 5ak. Two-indicator scan on NASA (v5.25.0; kappa 1.8, z 3.0)
+- FLEET: B0045 cycle 13, B0041 cycle 55 (record starts at 44: first possible), B0006 cycle 54 = the hybrid's
+  unexplained batteries; B0018 (kappa 1.70) and B0005 (1.51) just below; FALSE: B0034 at cycle 13 (early kappa swing,
+  ends 0.96). Pulsed batteries kappa 0.30-0.45 (age slower than the fleet physics).
+- OWN: B0005, B0006, B0007 all at cycles 73-74 = one COMMON test event (tested together), not three faults; B0033
+  130, B0036 90 (3 episodes). OWN needs ~70 cycles (2 x 30 + cleaning): never evaluated on Hot, Pulsed, Cold (<= 72).
+- PROPOSED: FLEET min history 8 -> 12 cycles; OWN common-cause classification (>= 2 batteries of the same campaign
+  within +-5 cycles -> common event), with a validation case. Then the integrated twin view.
+
+## 5al. Live anomaly detection and common causes (v5.26.0, 2026-10-23)
+- FLEET min history 12; common-cause classification (validated 11/11); plain-language event log; live panel in the
+  Live twin; page order: Models -> Model updating (new page) -> Live twin -> Operations -> Study results.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.25.0 (twin_engine.py, app.py, tests/test_anomaly.py); CI green; app shows v5.25.0.
-2. USER: Operations & control -> anomaly detection: run the check, then "Scan the NASA batteries" (thresholds 1.8
-   and 3.0). Send the CSV + replays of B0006, B0045, B0041 and any battery flagged by OWN.
-3. Then: assemble the option-B twin view (forecast by Mission 2 frozen models, explanation by the hybrid, the two
-   anomaly indicators, what-if within identifiable conditions).
+1. USER: upload v5.26.0 (twin_engine.py, app.py, tests/test_anomaly.py); CI green; app shows v5.26.0.
+2. USER: Live twin on B0045, B0006, B0005 (live anomaly detection on): check the event log; Operations scan:
+   B0005/B0006/B0007 OWN alarms should now read "common event"; B0034 FLEET false alarm gone.
+3. Then: integrated twin view (forecast by Mission 2 frozen models + explanation + anomalies + what-if).
 4. Writing: Mission 2 chapter; physics phase chapter; Mission 3 chapter.
 
 ## 7. Open data checks

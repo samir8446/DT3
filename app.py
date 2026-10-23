@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.25.0"
+REQUIRED_ENGINE = "5.26.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -84,9 +84,10 @@ DATA_DIR = APP_DIR / "data"
 RESULTS_DIR = APP_DIR / "results"
 MASTER_NAME, IMP_NAME = "battery_master_data.parquet", "impedance_ground_truth.parquet"
 POLICIES = ["Twin-Aware", "Fixed 1 A", "Fixed 2 A", "Fixed 4 A"]
-VIEWS = [":material/home: Home", ":material/monitoring: Diagnostics", ":material/play_circle: Live twin",
-         ":material/psychology: Models & forecasting", ":material/tune: Operations & control",
-         ":material/fact_check: Study results"]
+V_HOME, V_DATA = ":material/home: Home", ":material/monitoring: Diagnostics"
+V_MODELS, V_UPDATE = ":material/psychology: Models & forecasting", ":material/update: Model updating"
+V_LIVE, V_OPS, V_STUDY = ":material/play_circle: Live twin", ":material/tune: Operations & control", ":material/fact_check: Study results"
+VIEWS = [V_HOME, V_DATA, V_MODELS, V_UPDATE, V_LIVE, V_OPS, V_STUDY]   # v5.26 order: models, updating, live, ops, results
 SANS = "IBM Plex Sans, Segoe UI, Helvetica Neue, Arial, sans-serif"
 SERIF = "'STIX Two Text', 'Times New Roman', Times, serif"
 
@@ -3402,6 +3403,59 @@ def view_study() -> None:
                  key="st_rep_dl")
 
 
+
+EVENT_STYLE = {"alarm": ("red", ":material/warning:"), "common": ("orange", ":material/groups:"),
+               "cleared": ("green", ":material/check_circle:"), "info": ("gray", ":material/info:")}
+
+
+def live_anomaly_prepare(cell_id: str) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], str]:
+    """Replay of this battery with both indicators, its common-cause classification and its event log (the fleet scan
+    runs once and is cached). Returns (replay, events, note)."""
+    cells_an = tuple(sorted({c for g in te.NASA_PHYSICS_GROUPS for c in te.protocol_cells(CT_RAW, g)}))
+    if cell_id not in cells_an:
+        return None, None, ("Live anomaly detection needs a battery of the constant-condition groups ("
+                            + ", ".join(te.NASA_PHYSICS_GROUPS) + ").")
+    with st.spinner("Preparing live anomaly detection for the whole fleet (runs once, then cached)…"):
+        scan = anomaly_scan2_cached(CT_RAW, imp, DATA_KEY_RAW, cells_an, 1.8, 3.0)
+    groups = te.condition_groups(CT_RAW)
+    campaign = {c: str(groups.loc[c, "Group"]) if c in groups.index else c for c in scan}
+    cc = te.anomaly_common_cause(scan, campaign)
+    return scan[cell_id], te.anomaly_events(scan[cell_id], cc.get(cell_id)), ""
+
+
+def live_anomaly_panel(tr: pd.DataFrame, ev: pd.DataFrame, n: int, n_max: float) -> None:
+    """What the twin knows about anomalies up to cycle n: indicator status, events so far, and the indicators."""
+    now = tr[tr["n"] <= n]
+    st.markdown("##### :material/monitor_heart: Live anomaly detection")
+    c1, c2 = st.columns(2)
+    k_now = now["kappa"].dropna()
+    f_on = bool(now["fleet alarm"].iloc[-1]) if len(now) else False
+    c1.metric("FLEET · ageing speed vs the fleet", f"{k_now.iloc[-1]:.2f}×" if len(k_now) else "warming up",
+              delta="ALARM" if f_on else ("normal" if len(k_now) else None),
+              delta_color="inverse" if f_on else "off")
+    z_now = now["slope z"].dropna()
+    o_on = bool(now["own alarm"].iloc[-1]) if len(now) else False
+    need = int(tr.loc[tr["slope z"].notna(), "n"].min()) if tr["slope z"].notna().any() else None
+    c2.metric("OWN · fade slope vs its own past (z)", f"{z_now.iloc[-1]:.1f}" if len(z_now) else
+              ("not enough history yet" if need is None or n < need else "—"),
+              delta="ALARM" if o_on else (f"active from cycle {need}" if need and n < need else
+                                          "normal" if len(z_now) else "needs ~70 cycles"),
+              delta_color="inverse" if o_on else "off")
+    seen = ev[ev["cycle"] <= n].sort_values("cycle", ascending=False)
+    if seen.empty:
+        st.caption("No event yet: the battery behaves as expected so far.")
+    else:
+        lines = []
+        for r in seen.itertuples(index=False):
+            col, ic = EVENT_STYLE.get(r.kind, ("gray", ":material/info:"))
+            lab = {"alarm": "alarm", "common": "common event", "cleared": "back to normal", "info": "note"}[r.kind]
+            lines.append(f"{ic} :{col}[**cycle {r.cycle:.0f} · {r.indicator} {lab}**] — {r[3]}")
+        with st.container(height=min(260, 48 + 46 * len(lines)), border=True):
+            st.markdown("  \n".join(lines))
+    show(fig_anomaly2(now, P, f"{cell} (up to cycle {n})", 1.8, 3.0, height=430, n_max=n_max), key="rp_anom",
+         export=False)
+
+
 def view_replay() -> None:
     recommendations("live")
     section(f"Live twin replay · {cell}")
@@ -3502,6 +3556,18 @@ def view_replay() -> None:
     eol_true = te.first_crossing(good["n"].to_numpy(), good["SOH"].to_numpy(), soh_eol, smooth=5)
     n_max = int(max(pc["n"].max() * 1.35, (eol_true or 0) * 1.1))
     frag = getattr(st, "fragment", None)
+    live_an = st.toggle("Live anomaly detection", value=True, key="rp_an",
+                        help="Two indicators run as the battery is replayed: FLEET (ages faster than the fleet's physics) "
+                             "and OWN (fade steeper than in its own past); every change is logged in plain words. The "
+                             "fleet scan runs once (about a minute), then it is instant.")
+    an_tr = an_ev = None
+    if live_an:
+        try:
+            an_tr, an_ev, an_note = live_anomaly_prepare(cell)
+            if an_note:
+                st.info(an_note)
+        except Exception as exc:
+            report_error("Live anomaly detection unavailable", exc, debug)
 
     def frame() -> None:
         if st.session_state.get(key_p):
@@ -3547,6 +3613,8 @@ def view_replay() -> None:
                                   "sub": f"cycle {n} · twin estimate"}], big=False)
         show(fig_live_main(ct_cell, pc, fr, n, soh_eol, P, reveal, n_max, show_models, acc_map), key="rp_main",
              export=False)
+        if an_tr is not None and an_ev is not None:
+            live_anomaly_panel(an_tr, an_ev, n, n_max)
         live_accuracy_cards(sk, fr, show_models, reveal, eol_true)
         show(fig_live_track(track, n, eol_true, P, n_max, show_models), key="rp_track", export=False)
         if len(sk):
@@ -3587,8 +3655,6 @@ def view_replay() -> None:
     pinn_equations_panel()
     methods_panel()
     ablation_section()
-    update_frequency_section()
-    frozen_update_section()
     st.caption("Harsh operation (cold plating, knees, high temperature) breaks any single physics law. The live "
                "ensemble moves its weight, cycle by cycle, to the models that are currently predicting well: watch "
                "the weight panel shift when the fade accelerates. "
@@ -3740,10 +3806,10 @@ GLOSSARY = {
 
 def sidebar_guide() -> None:
     ss = st.session_state
-    steps = [("Data loaded", True, VIEWS[1]), ("Half-cell modes fitted", bool(ss.get("hc")), VIEWS[1]),
-             ("Live twin opened", bool(ss.get("ekf")), VIEWS[2]), ("Ladder models compared", bool(ss.get("ladder")), VIEWS[3]),
-             ("M3 optimisation run", bool(ss.get("om") or ss.get("dp")), VIEWS[4]),
-             ("Cohort study run", bool(ss.get("study")), VIEWS[5])]
+    steps = [("Data loaded", True, V_DATA), ("Half-cell modes fitted", bool(ss.get("hc")), V_DATA),
+             ("Live twin opened", bool(ss.get("ekf")), V_LIVE), ("Ladder models compared", bool(ss.get("ladder")), V_MODELS),
+             ("M3 optimisation run", bool(ss.get("om") or ss.get("dp")), V_OPS),
+             ("Cohort study run", bool(ss.get("study")), V_STUDY)]
     done = sum(ok for _, ok, _ in steps)
     with st.sidebar:
         st.markdown(f'<div class="bt-guide"><div class="bt-guide-h">Study progress · {done}/{len(steps)}</div>'
@@ -3762,6 +3828,12 @@ def sidebar_guide() -> None:
         with st.expander("Glossary", icon=":material/menu_book:"):
             for k_, v in GLOSSARY.items():
                 st.markdown(f"**{k_}**: {v}")
+
+
+def view_update() -> None:
+    """Mission 2 · how the twin's models should be updated (moved from the Live twin page in v5.26)."""
+    update_frequency_section()
+    frozen_update_section()
 
 
 def view_home() -> None:
@@ -3793,11 +3865,12 @@ def view_home() -> None:
     chips = "".join(f'<div class="bt-mchip bt-m-{v.split()[0]}"><b>{m}</b> {html.escape(v)}</div>' for m, v in status.items())
     st.markdown(f'<div class="bt-mstrip">{chips}</div>', unsafe_allow_html=True)
     section("Where to start")
-    cards = [("Diagnostics", VIEWS[1], "See one battery in 3D, its health, ageing, mechanisms and stress."),
-             ("Live twin", VIEWS[2], "Replay a battery cycle by cycle and watch the models learn and forecast."),
-             ("Models & forecasting", VIEWS[3], "Climb the learning ladder from baselines to first principles."),
-             ("Operations & control", VIEWS[4], "Optimise operation and replacement for a calibrated battery."),
-             ("Study results", VIEWS[5], "Run the cohort study and get the answers to the three Missions.")]
+    cards = [("Diagnostics", V_DATA, "See one battery in 3D, its health, ageing, mechanisms and stress."),
+             ("Models & forecasting", V_MODELS, "Climb the learning ladder from baselines to first principles."),
+             ("Model updating", V_UPDATE, "How often the twin's models must update, and how."),
+             ("Live twin", V_LIVE, "Replay a battery cycle by cycle: the models learn, forecast and detect anomalies live."),
+             ("Operations & control", V_OPS, "Optimise operation and replacement for a calibrated battery."),
+             ("Study results", V_STUDY, "Run the cohort study and get the answers to the three Missions.")]
     cols = st.columns(len(cards))
     for c_, (t, v, d) in zip(cols, cards):
         with c_:
@@ -6186,7 +6259,8 @@ def anomaly_scan2_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: s
     return te.nasa_anomaly_scan2(_ct, _imp, list(cells), restarts=6, kappa_thr=kappa_thr, z_thr=z_thr)
 
 
-def fig_anomaly2(tr: pd.DataFrame, P: Palette, cell: str, kappa_thr: float, z_thr: float) -> go.Figure:
+def fig_anomaly2(tr: pd.DataFrame, P: Palette, cell: str, kappa_thr: float, z_thr: float,
+                 height: int = 620, n_max: Optional[float] = None) -> go.Figure:
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.07, row_heights=[0.44, 0.28, 0.28],
                         subplot_titles=("Measured SOH",
                                         "FLEET indicator: ageing speed κ vs the fleet's physics",
@@ -6209,7 +6283,9 @@ def fig_anomaly2(tr: pd.DataFrame, P: Palette, cell: str, kappa_thr: float, z_th
     fig.update_yaxes(title_text="κ", row=2, col=1)
     fig.update_yaxes(title_text="z", row=3, col=1)
     fig.update_xaxes(title_text="Discharge cycle n", row=3, col=1)
-    return style_fig(fig, P, 620, f"Anomaly detection replay · {cell}")
+    if n_max is not None:
+        fig.update_xaxes(range=[0, n_max])
+    return style_fig(fig, P, height, f"Anomaly detection replay · {cell}")
 
 
 def anomaly_section() -> None:
@@ -6265,6 +6341,9 @@ def anomaly_section() -> None:
     groups = te.condition_groups(CT_RAW)
     summ = te.anomaly_summary2(scan)
     summ.insert(1, "group", summ["battery"].map(lambda c: str(groups.loc[c, "Group"]) if c in groups.index else ""))
+    _cc = te.anomaly_common_cause(scan, {c: str(groups.loc[c, "Group"]) if c in groups.index else c for c in scan})
+    summ["OWN alarm type"] = summ["battery"].map(lambda c: ("common event with " + ", ".join(sorted({p for v in _cc[c].values() for p in v})))
+                                                 if any(_cc[c].values()) else ("individual" if _cc[c] else ""))
     ff = summ.loc[summ["first FLEET alarm (cycle)"].notna(), ["battery", "first FLEET alarm (cycle)"]]
     fo = summ.loc[summ["first OWN alarm (cycle)"].notna(), ["battery", "first OWN alarm (cycle)"]]
     card("Anomaly scan on NASA", [
@@ -6279,6 +6358,16 @@ def anomaly_section() -> None:
     pick = st.selectbox("Battery to replay", list(scan), key="an2_cell",
                         index=list(scan).index(flagged[0]) if flagged else 0)
     show(fig_anomaly2(scan[pick], P, pick, float(kappa_thr), float(z_thr)), key="an2_fig", data=scan[pick])
+    campaign = {c: str(groups.loc[c, "Group"]) if c in groups.index else c for c in scan}
+    cc = te.anomaly_common_cause(scan, campaign)
+    ev = te.anomaly_events(scan[pick], cc.get(pick), float(kappa_thr), float(z_thr))
+    st.markdown(f"**What happened to {pick}**")
+    if ev.empty:
+        st.caption("No event: the battery behaved as expected.")
+    else:
+        st.markdown("  \n".join(
+            f"{EVENT_STYLE.get(r.kind, ('gray', ':material/info:'))[1]} :{EVENT_STYLE.get(r.kind, ('gray', ''))[0]}"
+            f"[**cycle {r.cycle:.0f} · {r.indicator}**] — {r[3]}" for r in ev.itertuples(index=False)))
     download("Download the anomaly scan (CSV)",
              pd.concat([tr.assign(battery=c) for c, tr in scan.items()], ignore_index=True)
              .assign(**{"app version": te.ENGINE_VERSION, "kappa threshold": kappa_thr, "z threshold": z_thr})
@@ -6630,8 +6719,9 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # Dispatch: only the active view runs
 # =============================================================================
 sidebar_guide()
-_VIEW_FN: Dict[str, Callable[[], None]] = {VIEWS[0]: view_home, VIEWS[1]: view_data, VIEWS[2]: view_replay,
-                                           VIEWS[3]: view_models, VIEWS[4]: view_ops, VIEWS[5]: view_study}
+_VIEW_FN: Dict[str, Callable[[], None]] = {V_HOME: view_home, V_DATA: view_data, V_MODELS: view_models,
+                                           V_UPDATE: view_update, V_LIVE: view_replay, V_OPS: view_ops,
+                                           V_STUDY: view_study}
 try:
     _VIEW_FN.get(view, view_data)()
 except Exception as exc:

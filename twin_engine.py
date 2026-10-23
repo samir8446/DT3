@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.25.0"
+ENGINE_VERSION = "5.26.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10289,7 +10289,8 @@ def anomaly_validation(restarts: int = 6, progress: ProgressFn = None, **kw) -> 
 #           throughput), z = (slope_prev - slope_recent) / sqrt(se_prev^2 + se_recent^2), se from the Theil-Sen
 #           95 % interval; alarm when z > z_thr for m_slope consecutive cycles. A W-cycle window spans a full
 #           regeneration period: a jump shifts the level, hardly the robust slope.
-ANOMALY2_DEFAULTS = {"W": 30, "z_thr": 3.0, "m_slope": 3, "kappa_thr": 1.8, "m_kappa": 5, "min_hist": 8}
+ANOMALY2_DEFAULTS = {"W": 30, "z_thr": 3.0, "m_slope": 3, "kappa_thr": 1.8, "m_kappa": 5, "min_hist": 12}
+# v5.26: min_hist 8 -> 12 (NASA: B0034 false FLEET alarm at cycle 13 from an early kappa swing; it ended at 0.96)
 
 
 def _theil_sen(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
@@ -10299,7 +10300,7 @@ def _theil_sen(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
 
 
 def anomaly_replay2(p: Optional[Dict[str, float]], cd: Dict[str, Any], W: int = 30, z_thr: float = 3.0,
-                    m_slope: int = 3, kappa_thr: float = 1.8, m_kappa: int = 5, min_hist: int = 8,
+                    m_slope: int = 3, kappa_thr: float = 1.8, m_kappa: int = 5, min_hist: int = 12,
                     version: int = 2) -> pd.DataFrame:
     """Causal replay with the two indicators (see the section header). One row per cycle; first alarms in attrs."""
     mech = _nasa_spec(version)[3]
@@ -10409,3 +10410,103 @@ def anomaly_cohort2(seed: int = 0):
 def anomaly_validation2(restarts: int = 6, progress: ProgressFn = None, **kw) -> pd.DataFrame:
     cds, re, truth = anomaly_cohort2(0)
     return anomaly_summary2(anomaly_scan2_cds(cds, re, restarts, 0, progress, **kw), truth)
+
+
+
+# =============================================================================
+# 53. MISSION 3 · WHAT HAPPENED: common-cause events and a plain-language event log
+# =============================================================================
+# NASA (v5.25): B0005, B0006, B0007, tested together, raised the OWN alarm at cycles 73-74: one common event of the
+# test, not three battery faults. An OWN alarm onset shared by at least one other battery of the same campaign
+# within +-window cycles is classified COMMON (test schedule, temperature or equipment), otherwise INDIVIDUAL (a change
+# of this battery, e.g. a knee). anomaly_events turns one replay into dated, plain-language events.
+COMMON_WINDOW = 5
+
+
+def _onsets(flags: pd.Series, n: pd.Series) -> List[float]:
+    f = flags.fillna(False).astype(bool).to_numpy()
+    nn = n.to_numpy(float)
+    return [float(nn[i]) for i in range(len(f)) if f[i] and (i == 0 or not f[i - 1])]
+
+
+def _clears(flags: pd.Series, n: pd.Series) -> List[float]:
+    f = flags.fillna(False).astype(bool).to_numpy()
+    nn = n.to_numpy(float)
+    return [float(nn[i]) for i in range(1, len(f)) if (not f[i]) and f[i - 1]]
+
+
+def anomaly_common_cause(scan: Dict[str, pd.DataFrame], campaign: Dict[str, str],
+                         window: int = COMMON_WINDOW) -> Dict[str, Dict[float, List[str]]]:
+    """For every battery and every OWN alarm onset: the other batteries of the same campaign whose OWN alarm started
+    within +-window cycles (empty list = individual)."""
+    ons = {c: _onsets(tr["own alarm"], tr["n"]) for c, tr in scan.items()}
+    out: Dict[str, Dict[float, List[str]]] = {}
+    for c, lst in ons.items():
+        out[c] = {}
+        for o in lst:
+            out[c][o] = sorted(p for p, pl in ons.items() if p != c and campaign.get(p) == campaign.get(c)
+                               and any(abs(q - o) <= window for q in pl))
+    return out
+
+
+def anomaly_events(tr: pd.DataFrame, common: Optional[Dict[float, List[str]]] = None, kappa_thr: float = 1.8,
+                   z_thr: float = 3.0, regen_jump: float = 0.01) -> pd.DataFrame:
+    """Dated plain-language events of one replay (two indicators, regeneration, indicator readiness)."""
+    ev = []
+    n, y = tr["n"], tr["SOH"]
+    for o in _onsets(tr["fleet alarm"], n):
+        k = float(tr.loc[tr["n"] == o, "kappa"].iloc[0])
+        ev.append((o, "FLEET", "alarm", f"Ages {k:.1f}x faster than the fleet's physics predicts for its conditions "
+                                        f"(threshold {kappa_thr:g}): abnormal ageing of this battery."))
+    for o in _clears(tr["fleet alarm"], n):
+        ev.append((o, "FLEET", "cleared", "Ageing speed back below the fleet threshold."))
+    for o in _onsets(tr["own alarm"], n):
+        z = float(tr.loc[tr["n"] == o, "slope z"].iloc[0])
+        peers = (common or {}).get(o, [])
+        if peers:
+            ev.append((o, "OWN", "common", f"Fade became steeper (z = {z:.1f}) at the same time as {', '.join(peers)}: "
+                                           "likely a common event of the test (schedule, temperature or equipment), not "
+                                           "a fault of this battery."))
+        else:
+            ev.append((o, "OWN", "alarm", f"Fade became significantly steeper than in the previous window (z = {z:.1f}): "
+                                          "a change in this battery's behaviour, as at the start of a knee."))
+    for o in _clears(tr["own alarm"], n):
+        ev.append((o, "OWN", "cleared", "Fade slope back in line with the previous window."))
+    zr = tr.loc[tr["slope z"].notna(), "n"]
+    if len(zr):
+        ev.append((float(zr.iloc[0]), "OWN", "info", "Enough history: the comparison with the battery's own past starts."))
+    yy = y.to_numpy(float)
+    for i in range(3, len(yy)):
+        prev = np.nanmedian(yy[i - 3:i])
+        if np.isfinite(yy[i]) and np.isfinite(prev) and yy[i] - prev > regen_jump:
+            ev.append((float(n.iloc[i]), "DATA", "info", f"Capacity recovered by {100 * (yy[i] - prev):.1f} SOH points "
+                                                          "after a rest (regeneration): normal behaviour, not a fault."))
+    out = pd.DataFrame(ev, columns=["cycle", "indicator", "kind", "what happened"]).sort_values(["cycle", "indicator"])
+    return out.reset_index(drop=True)
+
+
+def anomaly_cohort_common(seed: int = 0):
+    """anomaly_cohort2 plus a COMMON test event: R1, R3, R4 (one campaign) all fade faster from cycle 95."""
+    cds, re, truth = anomaly_cohort2(seed)
+    for c in ("R1", "R3", "R4"):
+        cd = cds[c]
+        cd["soh"] = cd["soh"] - 0.0025 * np.clip(cd["n"] - 95, 0, None)
+    campaign = {c: c[0] for c in cds}                         # H / R / C campaigns
+    return cds, re, truth, campaign
+
+
+def anomaly_validation_common(restarts: int = 6, progress: ProgressFn = None, **kw) -> pd.DataFrame:
+    """Common-cause classification on known truth: R1, R3, R4 share an event (should be COMMON); the knees R2, C2, H3
+    are individual (should be INDIVIDUAL)."""
+    cds, re, truth, campaign = anomaly_cohort_common(0)
+    scan = anomaly_scan2_cds(cds, re, restarts, 0, progress, **kw)
+    cc = anomaly_common_cause(scan, campaign)
+    rows = []
+    for c in cds:
+        ons = cc[c]
+        kinds = ["common" if v else "individual" for v in ons.values()]
+        expect = "common" if c in ("R1", "R3", "R4") else "individual" if c in HYBRID_KNEE_CELLS else "none"
+        got = ("common" if "common" in kinds else "individual") if kinds else "none"
+        rows.append({"battery": c, "OWN onsets": ", ".join(f"{o:.0f}" for o in ons) or "—", "expected": expect,
+                     "classified": got, "correct": got == expect})
+    return pd.DataFrame(rows)

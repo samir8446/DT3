@@ -1,9 +1,25 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.25.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.26.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Live anomaly detection, common-cause events, new page order (v5.26.0)
+
+1. FLEET indicator needs 12 cycles of history (was 8): removes the NASA B0034 false alarm (early kappa swing); the
+   2.5x-fast validation batteries are still caught (cycle 16).
+2. Engine section 53: anomaly_common_cause (an OWN alarm shared by another battery of the same campaign within +-5
+   cycles = COMMON event of the test, else INDIVIDUAL) and anomaly_events (dated plain-language events: FLEET alarm /
+   cleared, OWN individual / common / cleared, OWN indicator active, capacity regeneration after a rest = normal).
+   Validation: R1, R3, R4 sharing a test event -> common; knees R2, C2, H3 -> individual; 11/11 correct.
+3. Live twin: "Live anomaly detection" toggle (on by default): both indicators run with the replay cursor, status of
+   each indicator, event log of everything that happened up to the cursor, and the indicator chart up to the cursor.
+4. Operations & control: OWN alarm type (individual / common with ...) per battery and "What happened" log for the
+   replayed battery.
+5. Page order: Home, Diagnostics, Models & forecasting, Model updating (new page: the update studies, moved from the
+   Live twin), Live twin, Operations & control, Study results. Pages referenced by name (V_*), not by position.
+6. 38 tests pass; AppTest of the Live twin panel, Model updating page, Operations; all 7 pages.
 
 ## Mission 3 · anomaly detection with two indicators, robust to regeneration (v5.25.0)
 

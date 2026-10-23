@@ -43,3 +43,17 @@ def test_two_indicators_are_causal():
     b = te.anomaly_replay2(None, bad)
     za, zb = a["slope z"].to_numpy()[:90], b["slope z"].to_numpy()[:90]
     assert np.allclose(np.nan_to_num(za), np.nan_to_num(zb))
+
+
+def test_common_cause_classification():
+    v = te.anomaly_validation_common(restarts=3)
+    assert v["correct"].all(), v.to_string()
+
+
+def test_event_log_reports_regeneration_and_alarms():
+    cds, re, truth = te.anomaly_cohort2(0)
+    tr = te.anomaly_replay2(None, cds["R2"])
+    ev = te.anomaly_events(tr)
+    assert (ev["indicator"] == "DATA").any()                       # regeneration jumps are reported as normal
+    assert ((ev["indicator"] == "OWN") & (ev["kind"] == "alarm")).any()   # the knee
+    assert ev["cycle"].is_monotonic_increasing
