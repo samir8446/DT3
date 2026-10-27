@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.30.0"
+REQUIRED_ENGINE = "5.30.1"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -6951,6 +6951,11 @@ TWIN_PARTS = {"main": "Explanation (physics version 2)", "check": "Explanation c
               "scan": "Anomaly detection", "fleet": "Fleet-wide parts"}
 
 
+def _twin_eol_relative() -> None:
+    """Switch the control bar's end of life to 80 % of initial capacity (runs before the widgets are drawn)."""
+    st.session_state["eol_kind"] = "% of initial capacity"     # its number input defaults to 80 %
+
+
 def _twin_eol_label() -> str:
     return f"{float(eol_ah):.2f} Ah" if float(eol_ah) > 1.0 else f"{100 * float(eol_ah):.0f} % of initial capacity"
 
@@ -7057,12 +7062,12 @@ def fig_twin(n: int, meas: pd.DataFrame, removed: pd.DataFrame, future: Optional
         fut, med, lo, hi = frame
         keep = fut <= x_max
         fig.add_trace(go.Scatter(x=np.r_[fut[keep], fut[keep][::-1]], y=100 * np.r_[hi[keep], lo[keep][::-1]],
-                                 fill="toself", fillcolor="rgba(213,94,0,0.15)", line=dict(width=0),
+                                 fill="toself", fillcolor="rgba(213,94,0,0.15)", line=dict(width=0), mode="lines",
                                  name="Forecast band", hoverinfo="skip"), 1, 1)
-        fig.add_trace(go.Scatter(x=fut[keep], y=100 * med[keep], name="Forecast (frozen model, from today)",
+        fig.add_trace(go.Scatter(x=fut[keep], y=100 * med[keep], name="Forecast (frozen model, from today)", mode="lines",
                                  line=dict(color="#D55E00", width=2.4, dash="dash")), 1, 1)
         e, e_lo, e_hi = snap["EOL forecast"], snap["EOL early"], snap["EOL late"]
-        if np.isfinite(e):
+        if np.isfinite(e) and not np.isfinite(snap["EOL reached at"]):
             fig.add_trace(go.Scatter(
                 x=[e], y=[100 * soh_eol_c], mode="markers", name="Forecast end of life",
                 marker=dict(symbol="diamond", size=12, color="#D55E00", line=dict(color=P.plot_bg, width=1)),
@@ -7070,9 +7075,22 @@ def fig_twin(n: int, meas: pd.DataFrame, removed: pd.DataFrame, future: Optional
                              array=[max((e_hi if np.isfinite(e_hi) else x_max) - e, 0)],
                              arrayminus=[max(e - (e_lo if np.isfinite(e_lo) else e), 0)]),
                 hovertemplate="end of life forecast: cycle %{x:.0f}<extra></extra>"), 1, 1)
-    fig.add_hline(y=100 * soh_eol_c, line=dict(color="#6B1E1E", dash="dash", width=1.2), row=1, col=1)
-    fig.add_annotation(x=0, y=100 * soh_eol_c, xref="x", yref="y", text=f"end of life {100 * soh_eol_c:.1f} %",
-                       showarrow=False, xanchor="left", yanchor="bottom", font=dict(color="#B04040", size=11))
+    if np.isfinite(soh_eol_c):
+        fig.add_hline(y=100 * soh_eol_c, line=dict(color="#6B1E1E", dash="dash", width=1.2), row=1, col=1)
+        fig.add_annotation(x=0, y=100 * soh_eol_c, xref="x", yref="y", text=f"end of life {100 * soh_eol_c:.1f} %",
+                           showarrow=False, xanchor="left", yanchor="bottom", font=dict(color="#B04040", size=11))
+    y_ok = 100 * meas["SOH"].to_numpy(float)                 # axis from the valid cycles: invalid ones (0 %, 120 %)
+    if len(y_ok):                                           # would squash the curve; they stay hollow, off-axis
+        lo_y, hi_y = float(np.nanmin(y_ok)), float(np.nanmax(y_ok))
+        if np.isfinite(soh_eol_c):
+            lo_y = min(lo_y, 100 * soh_eol_c)
+        if frame is not None:
+            fut, med, lo, hi = frame
+            k_ = fut <= x_max
+            if k_.any():
+                lo_y = min(lo_y, max(float(np.nanmin(100 * lo[k_])), lo_y - 15))
+                hi_y = max(hi_y, min(float(np.nanmax(100 * hi[k_])), hi_y + 5))
+        fig.update_yaxes(range=[lo_y - 2, hi_y + 2], row=1, col=1)
     if traj is not None and len(traj):
         tr = traj[traj["n"] <= n]
         for m in te.MECHANISMS:
@@ -7216,6 +7234,14 @@ def view_twin() -> None:
     raw = CT_RAW[CT_RAW["Cell_ID"] == cell].sort_values("n")
     c_bol_c = float(raw["C_bol_Ah"].iloc[0]) if len(raw) and "C_bol_Ah" in raw else float("nan")
     soh_eol_c = te.soh_eol_for(c_bol_c, eol_ah) if np.isfinite(c_bol_c) else float(soh_eol)
+    if np.isfinite(soh_eol_c) and soh_eol_c >= 0.98:
+        st.warning(f"The end of life ({_twin_eol_label()}) is at or above {cell}'s initial capacity "
+                   f"({c_bol_c:.2f} Ah), so with this setting the battery would count as dead from its first cycles. "
+                   "End of life is left undefined here (no threshold, no end-of-life forecast). Cold batteries hold "
+                   "much less capacity: use a percentage of the initial capacity.", icon=":material/battery_alert:")
+        st.button("Use 80 % of initial capacity", key="itw_eol_rel", on_click=_twin_eol_relative,
+                  icon=":material/percent:")
+        soh_eol_c = float("nan")
     meas = ct_cell.loc[~ct_cell["outlier"], ["n", "SOH"]].dropna().sort_values("n")
     if len(meas) < 6:
         st.info("This battery has too few valid cycles for the integrated twin.")
@@ -7243,7 +7269,10 @@ def view_twin() -> None:
     k[0].metric("Today", f"cycle {n}", delta=f"of {ns[-1]} recorded", delta_color="off")
     k[1].metric("Measured SOH", fmt(100 * snap["SOH measured"], ".1f", "%"))
     e, e_lo, e_hi = snap["EOL forecast"], snap["EOL early"], snap["EOL late"]
-    if np.isfinite(snap["EOL reached at"]):
+    if not np.isfinite(soh_eol_c):
+        k[2].metric("End of life", "undefined", delta="see the warning above", delta_color="off")
+        k[3].metric("Remaining", "—")
+    elif np.isfinite(snap["EOL reached at"]):
         k[2].metric("End of life", f"reached at {snap['EOL reached at']:.0f}")
         k[3].metric("Remaining", "0 cycles")
     elif np.isfinite(e):
@@ -7269,14 +7298,20 @@ def view_twin() -> None:
                 + (f" · detector: {html.escape(snap['detector'])}" if snap["detector"] else "") + "</div>",
                 unsafe_allow_html=True)
 
+    bw = snap.get("band half-width (points)", float("nan"))
+    if np.isfinite(bw) and bw > 5:
+        st.caption(f"This model's forecast band is wide (±{bw:.0f} SOH points already one cycle ahead), so the status "
+                   "uses the median forecast; the band's early edge is reported, not acted on.")
     frame = None
     if frames and np.isfinite(snap["forecast from"]):
         frame = frames[int(snap["forecast from"])]
     x_last = float(raw["n"].max()) if len(raw) else float(ns[-1])
     x_max = x_last * 1.08
+    if np.isfinite(snap["forecast horizon"]):              # at least ~35 % of the record ahead of today
+        x_max = max(x_max, min(snap["forecast horizon"], n + max(15.0, 0.35 * x_last)))
     if np.isfinite(e_hi):
         x_max = max(x_max, min(e_hi * 1.05, x_last * 2.0))
-    elif np.isfinite(e):
+    elif np.isfinite(e) and not np.isfinite(snap["EOL reached at"]):
         x_max = max(x_max, min(e * 1.1, x_last * 2.0))
     status_list = te.anomaly_cycle_status(an, common, soh_eol=soh_eol_c) if an is not None else None
     future = meas[meas["n"] > n] if reveal else None

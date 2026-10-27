@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.30.0 · 2026-10-27
+# STATUS · handover for a new conversation · engine/app v5.30.1 · 2026-10-27
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,11 +9,11 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.30.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.30.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.30.1"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.30.1"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
-  tests/test_integrated_twin.py (9, v5.30.0)
+  tests/test_integrated_twin.py (9, v5.30.1)
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
 - battery-twin.zip: complete local package (INSTALL.bat one-click Windows installer -> %USERPROFILE%\battery-twin-app,
   Desktop shortcut "Battery Digital Twin"; setup/run scripts for Windows and Mac; .streamlit/config.toml upload 1 GB)
@@ -512,13 +512,33 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   without frozen model / explanation; Models hybrid button; all pages; harness md_check 0 leaks.
 - Expect on NASA: first build a few minutes (hybrid v2 + v3, 30 starts each, + anomaly scan); then seconds.
 
+## 5ar. Integrated twin on NASA (v5.30.0; B0005, B0029, B0045; EOL 1.40 Ah) and fixes (v5.30.1)
+- B0005 (Reference, frozen MLP): measured EOL at cycle 126. From cycle 65 on, the median EOL forecast stayed within
+  ~5 cycles: mean |error| 4.9 cycles over cycles 65-125 (65-84: 4.3, bias -2.6; 85-104: 6.8; 105-125: 3.7). One
+  battery: a hint, not a result (no claim on one battery); score the group before reporting.
+- B0005 detector: regeneration at 24; common test event 74-100 (onset 74, as expected with B0006/B0007); past EOL
+  from 126. Explanation at the end: SEI + LAM with ~19 % not explained (gap 1, room temperature late in life);
+  v2 vs v3 split gap 11 points.
+- B0029 (Hot, frozen DT): Normal throughout; EOL beyond the forecast horizon (cycle 56). v2 vs v3 split gap 34 points
+  (model-form uncertainty, as in 5ae).
+- B0045 (Cold, frozen GP): with 1.40 Ah the threshold is 158 % of its 0.89 Ah initial capacity -> "end of life" at
+  cycle 2 and a meaningless EOL forecast (n+1). Explanation: plating 46 % + 37 % not explained (gap 2, early cold
+  loss) as expected. FLEET alarm confirmed at cycle 21 here; STATUS 5ak lists 13 -> CHECK against the Operations
+  event log (same scan settings; possibly 13 = first kappa exceedance, 21 = after 5 consecutive cycles with the
+  invalid cycle 20 removed).
+- Fixes v5.30.1: (1) Watch uses the MEDIAN forecast EOL (the MLP band is ~+-15 points one cycle ahead, so its early
+  edge kept B0005 on Watch for 60 cycles); the early edge is reported in the reason; wide-band note shown. (2) EOL
+  threshold >= 98 % of initial capacity -> end of life undefined for this battery, warning + button "Use 80 % of
+  initial capacity". (3) No forecast-EOL marker after EOL is reached. (4) SOH axis from valid cycles (invalid
+  0 % / 120 % points no longer squash the chart). (5) Forecast shown ~35 % of the record ahead of today (B0029 showed
+  3 cycles). (6) Forecast line and band drawn as lines (Plotly added markers to short traces).
+- The white vertical line at ~cycle 24 in the B0045 screenshot is most likely the hover cursor, not data.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.30.0 (twin_engine.py, app.py, tests/test_integrated_twin.py) in one commit; CI green; app shows
-   v5.30.0. Reboot the app.
-2. USER: Integrated twin page on NASA: press "Build the integrated twin" (first time a few minutes), then download
-   the result backup and upload it to results/cache/. Check B0005 (Reference), B0029 (Hot), B0045 (Cold): forecast,
-   status over life (B0045 FLEET at 13; B0005-07 common event at 73-74), explanation split, what-if table (expected
-   on NASA: temperature and current "limited", Ea and a_I at bounds). Send screenshots + timeline CSVs.
+1. USER: upload v5.30.1 (twin_engine.py, app.py, tests/test_integrated_twin.py); CI green; reboot; app shows v5.30.1.
+2. USER: Integrated twin: Reference group with 1.40 Ah (B0005, B0006, B0007, B0018); Cold and Hot with 80 % of
+   initial capacity. Send timeline CSVs per group (EOL forecast error per battery, Watch timing before EOL). Check
+   B0045's FLEET onset in Operations (13 or 21?).
 3. Writing (after the twin is finished, user decision): Mission 2 chapter, physics-phase chapter, Mission 3 chapter.
 4. Optional: Mixed assessment run for PINN all inputs; PyBaMM benchmark.
 

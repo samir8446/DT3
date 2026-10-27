@@ -1,9 +1,18 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.30.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.30.1)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Integrated twin fixes after the first NASA run (v5.30.1)
+
+1. Status Watch uses the median forecast end of life (a wide band's early edge kept B0005 on Watch for 60 cycles).
+2. End of life at or above a battery's initial capacity (Cold with 1.40 Ah: 158 %) is left undefined, with a warning
+   and a one-click switch to 80 % of initial capacity.
+3. Chart: no forecast end-of-life marker after end of life; SOH axis from valid cycles; forecast shown ahead of today;
+   forecast line and band without markers.
+4. Tests updated (9 pass); AppTest of the page with the warning and the switch.
 
 ## Integrated twin page (v5.30.0)
 

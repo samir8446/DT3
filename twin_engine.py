@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.30.0"
+ENGINE_VERSION = "5.30.1"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10650,6 +10650,7 @@ def anomaly_cycle_status(tr: pd.DataFrame, common: Optional[Dict[float, List[str
 # =============================================================================
 # 55. MISSION 3 · INTEGRATED TWIN: one battery, each task from the model proven best at it (option B)
 # =============================================================================
+#   status       Watch = common test event, or the MEDIAN forecast end of life within the watch window (v5.30.1)
 #   forecast     the group's Mission 2 frozen model, re-anchored every cycle to the measured capacity (frozen_stream;
 #                update study: anchoring matters, retraining barely does)
 #   anomalies    FLEET + OWN indicators, common-cause classification, end-of-life event (sections 52-54)
@@ -10715,7 +10716,7 @@ def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFram
     detector alarm, common test event or forecast end of life (early edge of the band) within watch_cycles."""
     out: Dict[str, Any] = {"cycle": float(n), "SOH measured": np.nan, "forecast from": np.nan, "EOL forecast": np.nan,
                            "EOL early": np.nan, "EOL late": np.nan, "remaining cycles": np.nan, "EOL reached at": np.nan,
-                           "forecast horizon": np.nan, "detector": None, "status": INTEGRATED_STATUS[0], "reason": "", "shares": None,
+                           "forecast horizon": np.nan, "band half-width (points)": np.nan, "detector": None, "status": INTEGRATED_STATUS[0], "reason": "", "shares": None,
                            "shares check": None, "split gap (points)": np.nan, "dominant": None,
                            "explanation causal": False}
     if measured is not None and len(measured):
@@ -10731,6 +10732,7 @@ def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFram
             fut, med, lo, hi = frames[k]
             out["forecast from"] = float(k)
             out["forecast horizon"] = float(fut[-1]) if len(fut) else np.nan
+            out["band half-width (points)"] = 50 * float(hi[0] - lo[0]) if len(fut) else np.nan
             out["EOL forecast"] = _first_below(fut, med, soh_eol)
             out["EOL early"] = _first_below(fut, lo, soh_eol)
             out["EOL late"] = _first_below(fut, hi, soh_eol)
@@ -10760,10 +10762,15 @@ def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFram
     elif verdict == DETECTION_STATUS[4]:
         out["status"] = INTEGRATED_STATUS[1]
         out["reason"] = "common test event: fade steepened at the same time in other batteries of the campaign"
-    elif np.isfinite(out["EOL early"]) and out["EOL early"] - float(n) <= watch_cycles:
+    elif np.isfinite(out["EOL forecast"]) and out["EOL forecast"] - float(n) <= watch_cycles:
         out["status"] = INTEGRATED_STATUS[1]
-        out["reason"] = (f"end of life possible within {watch_cycles} cycles (early edge of the forecast band at "
-                         f"cycle {out['EOL early']:.0f})")
+        out["reason"] = f"end of life forecast within {watch_cycles} cycles (cycle {out['EOL forecast']:.0f})"
+    elif np.isfinite(out["EOL early"]) and out["EOL early"] - float(n) <= watch_cycles:
+        # v5.30.1: the band's early edge no longer sets Watch (NASA B0005: the frozen MLP's band is about +-15 points
+        # already one cycle ahead, so its early edge sat 1-6 cycles ahead for 60 cycles); it is reported instead
+        out["reason"] = (f"no alarm; forecast end of life at cycle {out['EOL forecast']:.0f}" if np.isfinite(out["EOL forecast"])
+                         else "no alarm; end of life beyond the forecast horizon")
+        out["reason"] += f" (the band's early edge reaches it at cycle {out['EOL early']:.0f})"
     elif not frames:
         out["reason"] = "no forecast for this battery"
     elif not np.isfinite(out["forecast from"]):

@@ -61,6 +61,14 @@ def test_snapshot_status_levels():
     assert eol["status"] == "End of life reached"
     near = te.integrated_snapshot(55, 0.8, meas, fr, watch_cycles=30)
     assert near["status"] == "Watch" and np.isfinite(near["EOL early"])
+    # v5.30.1: a wide band's early edge alone does not set Watch (median end of life far away)
+    wide = _frames(30, 100, width=0.15)
+    w = te.integrated_snapshot(40, 0.8, meas, wide, watch_cycles=10)
+    assert w["EOL early"] - 40 <= 10 and w["EOL forecast"] - 40 > 10
+    assert w["status"] == "Normal" and "early edge" in w["reason"] and w["band half-width (points)"] == pytest.approx(15)
+    # end of life undefined (threshold above the initial capacity): never "End of life reached"
+    u = te.integrated_snapshot(100, float("nan"), meas, fr)
+    assert u["status"] != "End of life reached" and np.isnan(u["EOL forecast"])
     far = te.integrated_snapshot(31, 0.5, meas, fr, watch_cycles=10)
     assert far["status"] == "Normal"
     an = pd.DataFrame({"n": meas["n"], "SOH": meas["SOH"], "kappa": 1.0, "fleet alarm": meas["n"] >= 40,
@@ -141,7 +149,7 @@ def test_hybrid_portable_pickles(demo):
 def test_app_requires_this_engine():
     app = (ROOT / "app.py").read_text(encoding="utf-8")
     req = re.search(r'REQUIRED_ENGINE = "([^"]+)"', app).group(1)
-    assert req == te.ENGINE_VERSION == "5.30.0"
+    assert req == te.ENGINE_VERSION == "5.30.1"
     for f in ("integrated_snapshot", "integrated_timeline", "whatif_projection", "whatif_identifiability",
               "hybrid_portable"):
         assert f in app and hasattr(te, f)
