@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.29.0"
+ENGINE_VERSION = "5.30.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10645,3 +10645,290 @@ def anomaly_cycle_status(tr: pd.DataFrame, common: Optional[Dict[float, List[str
         else:
             out.append(DETECTION_STATUS[0])
     return out
+
+
+# =============================================================================
+# 55. MISSION 3 · INTEGRATED TWIN: one battery, each task from the model proven best at it (option B)
+# =============================================================================
+#   forecast     the group's Mission 2 frozen model, re-anchored every cycle to the measured capacity (frozen_stream;
+#                update study: anchoring matters, retraining barely does)
+#   anomalies    FLEET + OWN indicators, common-cause classification, end-of-life event (sections 52-54)
+#   explanation  frozen hybrid (shared physics + bounded network). Version 2 gives the main split, version 3 is the
+#                model-form check: the warm SEI vs LAM proportion depends on the physics version (STATUS 5ae), plating
+#                only and dominant in the cold does not.
+#   what-if      shared-physics sensitivities, only for conditions NASA varied and only at values NASA tested; a
+#                sensitivity at the edge of its allowed range is reported as "limited", never as a measured effect.
+# The forecast and the detector at cycle n use only data up to n (tested). The explanation is fitted on every
+# battery's whole record: it explains what happened, it does not predict; snapshots carry that flag.
+INTEGRATED_STATUS = ("Normal", "Watch", "Alarm", "End of life reached")
+FROZEN_SCORES: Dict[str, float] = {"Reference": 4.47, "Hot": 0.95, "Cold": 2.77, "Mixed conditions": 0.44,
+                                   "Pulsed load": 0.95}     # mean test RMSE (SOH points), origin 30 % (STATUS 5h)
+WHATIF_CONDITIONS: Dict[str, Dict[str, Any]] = {
+    "T_C": {"label": "Cell temperature during discharge (°C)", "params": ("Ea",), "cold_params": ("k_pl",),
+            "round": 1.0, "per": "group"},
+    "I_dis": {"label": "Discharge current (A)", "params": ("a_I",), "round": 0.1, "per": "group"},
+    "V_cut": {"label": "Discharge cut-off voltage (V)", "params": ("a_V",), "round": 0.1, "per": "battery"},
+}
+WHATIF_FIXED = {"Charge current (A)": "NASA charged every battery the same way (CC 1.5 A to 4.2 V, then CV): its effect "
+                                      "cannot be learned from these data, so the physics has no charge-current term."}
+
+
+def hybrid_portable(h: Dict[str, Any]) -> Dict[str, Any]:
+    """The hybrid result without its network function (a closure Python cannot pickle, so Streamlit's cache and the
+    disk backup could not store the hybrid). Tables, trajectories, shares and the what-if do not need it."""
+    return {k: v for k, v in h.items() if k != "predict"}
+
+
+def _first_below(x: np.ndarray, y: np.ndarray, thr: float) -> float:
+    idx = np.nonzero(np.asarray(y, float) < thr)[0]
+    return float(np.asarray(x, float)[idx[0]]) if len(idx) else np.nan
+
+
+def _shares_from_traj(tr: Optional[pd.DataFrame], n: float) -> Optional[Dict[str, float]]:
+    """Shares of the capacity loss up to cycle n (hybrid trajectory rows with cycle <= n): the three mechanisms and the
+    part the physics does not explain, plus the loss itself (fractions of initial capacity)."""
+    if tr is None or not len(tr):
+        return None
+    now = tr[tr["n"] <= n]
+    if not len(now):
+        return None
+    r = now.iloc[-1]
+    parts = np.clip(np.array([float(r[m]) for m in MECHANISMS]), 0.0, None)
+    unexpl = max(float(r[HYBRID_UNEXPLAINED]), 0.0)
+    tot = float(parts.sum() + unexpl)
+    out = {m: (float(parts[j] / tot) if tot > 0 else np.nan) for j, m in enumerate(MECHANISMS)}
+    out[HYBRID_UNEXPLAINED] = unexpl / tot if tot > 0 else np.nan
+    out["loss modelled"] = 1.0 - float(r["SOH (model)"])
+    out["cycle"] = float(r["n"])
+    return out
+
+
+def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFrame] = None,
+                        frames: Optional[Dict[int, Tuple[np.ndarray, ...]]] = None,
+                        anomaly: Optional[pd.DataFrame] = None, common: Optional[Dict[float, List[str]]] = None,
+                        traj_main: Optional[pd.DataFrame] = None, traj_check: Optional[pd.DataFrame] = None,
+                        watch_cycles: int = 20) -> Dict[str, Any]:
+    """What the integrated twin says about one battery at cycle n ("today").
+    measured: valid cycles (columns n, SOH); frames: frozen_stream frames; anomaly: anomaly_replay2 of this battery,
+    common: its common-cause onsets; traj_main / traj_check: hybrid_trajectory of the main (v2) and check (v3) physics.
+    Forecast and detector use only cycles <= n. The status is the most severe of: end of life reached (measured),
+    detector alarm, common test event or forecast end of life (early edge of the band) within watch_cycles."""
+    out: Dict[str, Any] = {"cycle": float(n), "SOH measured": np.nan, "forecast from": np.nan, "EOL forecast": np.nan,
+                           "EOL early": np.nan, "EOL late": np.nan, "remaining cycles": np.nan, "EOL reached at": np.nan,
+                           "forecast horizon": np.nan, "detector": None, "status": INTEGRATED_STATUS[0], "reason": "", "shares": None,
+                           "shares check": None, "split gap (points)": np.nan, "dominant": None,
+                           "explanation causal": False}
+    if measured is not None and len(measured):
+        m = measured[measured["n"] <= n].sort_values("n")
+        if len(m):
+            out["SOH measured"] = float(m["SOH"].iloc[-1])
+            e = eol_cycle_from_replay(m[["n", "SOH"]].reset_index(drop=True), soh_eol)
+            out["EOL reached at"] = float(e) if e is not None else np.nan
+    if frames:
+        ks = [k for k in frames if k <= n]
+        if ks:
+            k = max(ks)
+            fut, med, lo, hi = frames[k]
+            out["forecast from"] = float(k)
+            out["forecast horizon"] = float(fut[-1]) if len(fut) else np.nan
+            out["EOL forecast"] = _first_below(fut, med, soh_eol)
+            out["EOL early"] = _first_below(fut, lo, soh_eol)
+            out["EOL late"] = _first_below(fut, hi, soh_eol)
+            if np.isfinite(out["EOL forecast"]):
+                out["remaining cycles"] = out["EOL forecast"] - float(n)
+    verdict = None
+    if anomaly is not None and len(anomaly):
+        labels = anomaly_cycle_status(anomaly, common, soh_eol=soh_eol)
+        idx = np.nonzero(anomaly["n"].to_numpy(float) <= n)[0]
+        if len(idx):
+            verdict = labels[int(idx[-1])]
+    out["detector"] = verdict
+    sh = _shares_from_traj(traj_main, n)
+    sh2 = _shares_from_traj(traj_check, n)
+    out["shares"], out["shares check"] = sh, sh2
+    if sh:
+        mech = {m: sh[m] for m in MECHANISMS}
+        out["dominant"] = max(mech, key=lambda m_: mech[m_] if np.isfinite(mech[m_]) else -1)
+    if sh and sh2:
+        out["split gap (points)"] = 100 * max(abs(sh[m] - sh2[m]) for m in (MECHANISMS[0], MECHANISMS[2]))
+    # status, most severe first
+    if np.isfinite(out["EOL reached at"]):
+        out["status"] = INTEGRATED_STATUS[3]
+        out["reason"] = f"measured SOH fell below the end-of-life threshold at cycle {out['EOL reached at']:.0f}"
+    elif verdict in (DETECTION_STATUS[2], DETECTION_STATUS[3], DETECTION_STATUS[5]):
+        out["status"], out["reason"] = INTEGRATED_STATUS[2], verdict
+    elif verdict == DETECTION_STATUS[4]:
+        out["status"] = INTEGRATED_STATUS[1]
+        out["reason"] = "common test event: fade steepened at the same time in other batteries of the campaign"
+    elif np.isfinite(out["EOL early"]) and out["EOL early"] - float(n) <= watch_cycles:
+        out["status"] = INTEGRATED_STATUS[1]
+        out["reason"] = (f"end of life possible within {watch_cycles} cycles (early edge of the forecast band at "
+                         f"cycle {out['EOL early']:.0f})")
+    elif not frames:
+        out["reason"] = "no forecast for this battery"
+    elif not np.isfinite(out["forecast from"]):
+        out["reason"] = f"the forecast starts at cycle {min(frames):.0f} (30 % of the record)"
+    else:
+        out["reason"] = "no alarm; end of life not expected within the watch window"
+    return out
+
+
+def integrated_timeline(soh_eol: float, measured: pd.DataFrame, frames: Optional[Dict[int, Tuple[np.ndarray, ...]]],
+                        anomaly: Optional[pd.DataFrame] = None, common: Optional[Dict[float, List[str]]] = None,
+                        traj_main: Optional[pd.DataFrame] = None, traj_check: Optional[pd.DataFrame] = None,
+                        watch_cycles: int = 20) -> pd.DataFrame:
+    """integrated_snapshot at every measured cycle, as a flat table (for the report and the tests)."""
+    rows = []
+    for n in measured.sort_values("n")["n"].to_numpy(float):
+        s = integrated_snapshot(n, soh_eol, measured, frames, anomaly, common, traj_main, traj_check, watch_cycles)
+        r = {k: v for k, v in s.items() if k not in ("shares", "shares check")}
+        for tag, sh in (("", s["shares"]), (" [check]", s["shares check"])):
+            for m in (*MECHANISMS, HYBRID_UNEXPLAINED):
+                r[f"{m}{tag} (%)"] = 100 * sh[m] if sh else np.nan
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def _params_at_bound(params: Dict[str, float], version: int, tol: float = 1e-3) -> List[str]:
+    names, logs, bounds, _ = _nasa_spec(version)
+    out = []
+    for k in names:
+        if k not in bounds or k not in params:
+            continue
+        tr = (lambda v: math.log(v)) if k in logs else (lambda v: v)
+        v = tr(float(params[k]))
+        if abs(v - tr(bounds[k][0])) < tol or abs(v - tr(bounds[k][1])) < tol:
+            out.append(k)
+    return out
+
+
+def whatif_tested(h: Dict[str, Any], groups: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    """Condition values NASA tested among the batteries the physics was fitted to. Temperature and current: group
+    medians (they are set per campaign); cut-off: per battery. Values are rounded (see WHATIF_CONDITIONS)."""
+    rows = []
+    for c, cd in h["data"].items():
+        g = str(groups.loc[c, "Group"]) if groups is not None and c in groups.index else c
+        rows.append({"battery": c, "group": g, "T_C": cd["T_C"], "I_dis": cd["I_dis"], "V_cut": cd["V_cut"]})
+    tab = pd.DataFrame(rows)
+    for key, spec in WHATIF_CONDITIONS.items():
+        raw = tab.groupby("group")[key].transform("median") if spec["per"] == "group" else tab[key]
+        tab[f"{key} tested"] = (np.round(raw / spec["round"]) * spec["round"]).round(3)
+    vals = {k: sorted(tab[f"{k} tested"].dropna().unique().tolist()) for k in WHATIF_CONDITIONS}
+    sets = {tuple(r) for r in tab[[f"{k} tested" for k in WHATIF_CONDITIONS]].itertuples(index=False, name=None)}
+    return {"values": vals, "sets": sets, "by_battery": tab.set_index("battery")}
+
+
+def whatif_identifiability(h: Dict[str, Any], groups: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Per operating condition: can the twin answer a what-if about it, and why (not)?
+    identified: varies among the fitted batteries and its sensitivity was determined; limited: varies, but its
+    sensitivity sits at the edge of the allowed range (the data could not determine it, e.g. a condition tied to
+    the group); not identifiable: does not vary in the data (or is not in the physics)."""
+    version = h.get("version", 2)
+    tested = whatif_tested(h, groups)
+    at_b = set(_params_at_bound(h["params"], version))
+    rows = []
+    for key, spec in WHATIF_CONDITIONS.items():
+        vals = tested["values"][key]
+        params = list(spec["params"])
+        if key == "T_C" and any(v < T_COLD_C for v in vals):
+            params += list(spec.get("cold_params", ()))
+        stuck = [p for p in params if p in at_b]
+        if len(vals) < 2:
+            status, why = "not identifiable", "does not vary among the batteries the physics was fitted to"
+        elif stuck:
+            status = "limited"
+            why = (", ".join(f"{p} = {float(h['params'][p]):.3g}" for p in stuck)
+                   + " at the edge of the allowed range: the data could not determine this sensitivity (the "
+                     "condition changes together with others between groups). The what-if shows the effect at that "
+                     "edge, not a measured effect.")
+        else:
+            status, why = "identified", "varies among the tested batteries and its sensitivity was determined by the fit"
+        rows.append({"condition": spec["label"], "key": key, "tested values": ", ".join(f"{v:g}" for v in vals),
+                     "physics parameters": ", ".join(params), "status": status, "why": why})
+    for lab, why in WHATIF_FIXED.items():
+        rows.append({"condition": lab, "key": None, "tested values": "1.5 (all batteries)", "physics parameters": "—",
+                     "status": "not identifiable", "why": why})
+    return pd.DataFrame(rows)
+
+
+def _whatif_cd(cd: Dict[str, Any], a: np.ndarray, T_C: Optional[float] = None, I_dis: Optional[float] = None,
+               V_cut: Optional[float] = None) -> Dict[str, Any]:
+    """Battery data with the throughput grid a and (optionally) other conditions, coded as in _nasa_conditions."""
+    out = dict(cd)
+    out["a"] = np.asarray(a, float)
+    if T_C is not None:
+        Tk = float(T_C) + 273.15
+        out.update({"x_t": 1 / 298.15 - 1 / Tk, "cold": max(0.0, T_COLD_C - float(T_C)) / 10, "T_C": float(T_C)})
+    if I_dis is not None:
+        out.update({"x_i": math.log(max(float(I_dis), 0.1) / 2.0), "I_dis": float(I_dis)})
+    if V_cut is not None:
+        out.update({"depth": max(0.0, 2.7 - float(V_cut)) / 0.7, "V_cut": float(V_cut)})
+    return out
+
+
+def whatif_projection(h: Dict[str, Any], cell: str, soh_eol: float, T_C: Optional[float] = None,
+                      I_dis: Optional[float] = None, V_cut: Optional[float] = None,
+                      groups: Optional[pd.DataFrame] = None, extend: float = 2.0, enforce: bool = True
+                      ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    """This battery under other operating conditions, by the shared physics of the hybrid h.
+    Only conditions that vary in the data, only at tested values (enforce=True raises ValueError otherwise); None =
+    the battery's own value. Returns per cycle: physics SOH own / changed, the mechanisms of both, and over the recorded
+    cycles the measured SOH plus the physics' change ("measured, with the condition effect"); and a summary (loss at
+    the last recorded cycle, physics end of life, whether NASA tested this combination). Cycles are this battery's
+    own (its charge throughput per cycle), extended to `extend` times its record. The physics is used for the
+    difference between conditions: its absolute level is optimistic on NASA (STATUS 5ac)."""
+    if cell not in h["data"]:
+        raise ValueError(f"{cell} is not among the batteries the physics was fitted to")
+    cd = h["data"][cell]
+    version = h.get("version", 2)
+    mech = _nasa_spec(version)[3]
+    tested = whatif_tested(h, groups)
+    own = tested["by_battery"].loc[cell]
+    ident = whatif_identifiability(h, groups).set_index("key")
+    chosen = {"T_C": T_C, "I_dis": I_dis, "V_cut": V_cut}
+    for key, val in chosen.items():
+        if val is None:
+            continue
+        spec = WHATIF_CONDITIONS[key]
+        if enforce and ident.loc[key, "status"] == "not identifiable":
+            raise ValueError(f"{spec['label']}: not identifiable from these data, so no what-if")
+        if enforce and not any(abs(float(val) - v) <= spec["round"] / 2 + 1e-9 for v in tested["values"][key]):
+            raise ValueError(f"{spec['label']} = {val:g} was not tested (tested: "
+                             f"{', '.join(f'{v:g}' for v in tested['values'][key])})")
+        if abs(float(val) - float(own[f"{key} tested"])) <= spec["round"] / 2 + 1e-9:
+            chosen[key] = None                          # its own tested value: keep the battery's exact condition
+    n_rec, a_rec = np.asarray(cd["n"], float), np.asarray(cd["a"], float)
+    slope = float(np.polyfit(n_rec, a_rec, 1)[0]) if len(n_rec) >= 2 else 0.0
+    n_grid = np.arange(n_rec[0], max(n_rec[-1] * extend, n_rec[-1] + 10) + 1, dtype=float)
+    a_grid = np.where(n_grid <= n_rec[-1], np.interp(n_grid, n_rec, a_rec), a_rec[-1] + slope * (n_grid - n_rec[-1]))
+    res = {}
+    for tag, cdx in (("own", _whatif_cd(cd, a_grid)), ("changed", _whatif_cd(cd, a_grid, **chosen))):
+        s, pl, m = mech(h["params"], cdx)
+        res[tag] = (s, pl, m, (1 - s - pl) * (1 - m))
+    out = pd.DataFrame({"n": n_grid, "physics SOH, own conditions": res["own"][3],
+                        "physics SOH, changed conditions": res["changed"][3]})
+    for j, mname in enumerate(MECHANISMS):
+        out[f"{mname}, own"] = res["own"][j]
+        out[f"{mname}, changed"] = res["changed"][j]
+    rec = n_grid <= n_rec[-1]
+    meas = np.interp(n_grid[rec], n_rec, np.asarray(cd["soh"], float))
+    out["measured SOH"] = np.nan
+    out.loc[rec, "measured SOH"] = meas
+    out["measured, with the condition effect"] = np.nan
+    out.loc[rec, "measured, with the condition effect"] = meas + (res["changed"][3][rec] - res["own"][3][rec])
+    i_last = int(np.nonzero(rec)[0][-1])
+    loss_own = 1 - float(res["own"][3][i_last])
+    loss_chg = 1 - float(res["changed"][3][i_last])
+    eol_own = _first_below(n_grid, res["own"][3], soh_eol)
+    eol_chg = _first_below(n_grid, res["changed"][3], soh_eol)
+    combo = tuple(float(own[f"{k} tested"]) if chosen[k] is None else
+                  float(min(tested["values"][k], key=lambda v: abs(v - float(chosen[k])))) for k in WHATIF_CONDITIONS)
+    summ = {"cycle": float(n_rec[-1]), "loss own (%)": 100 * loss_own, "loss changed (%)": 100 * loss_chg,
+            "loss ratio": loss_chg / loss_own if loss_own > 0 else np.nan,
+            "physics EOL own": eol_own, "physics EOL changed": eol_chg,
+            "life ratio": (eol_chg / eol_own) if np.isfinite(eol_own) and np.isfinite(eol_chg) else np.nan,
+            "combination tested": combo in tested["sets"], "combination": combo,
+            "changed": {k: v for k, v in chosen.items() if v is not None},
+            "limited": [k for k, v in chosen.items() if v is not None and ident.loc[k, "status"] == "limited"],
+            "version": version}
+    return out, summ

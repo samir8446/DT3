@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.29.0 · 2026-10-14
+# STATUS · handover for a new conversation · engine/app v5.30.0 · 2026-10-27
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,10 +9,11 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.29.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.29.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.30.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.30.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
-  tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0
+  tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
+  tests/test_integrated_twin.py (9, v5.30.0)
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
 - battery-twin.zip: complete local package (INSTALL.bat one-click Windows installer -> %USERPROFILE%\battery-twin-app,
   Desktop shortcut "Battery Digital Twin"; setup/run scripts for Windows and Mac; .streamlit/config.toml upload 1 GB)
@@ -478,13 +479,48 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   pinn:PINN-full-ablation = same without physics. Demo: 0.68 vs fleet 1.04 vs no-physics 1.26. Caveat stated to the
   user: physics is not guaranteed to win (helped Hot/Mixed, hurt Cold); more inputs with 4-6 batteries risk overfit.
 
+## 5ap. PINN with all inputs on NASA (v5.29.0; origin 30 %; assessment CSVs Reference 5, Hot 4, Cold 5)
+- RMSE (SOH pts) Reference / Hot / Cold: PINN all inputs 5.15 / 0.97 / 9.09; its no-physics twin 6.04 / 1.45 / 7.81;
+  PINN v1 5.61 / 0.98 / 8.44; v1 no-physics 6.32 / 0.93 / 4.79; fleet shape 4.34 / 3.21 / 3.20; Mission 2 frozen
+  4.47 (MLP) / 0.95 (DT) / 2.77 (GP).
+- vs PINN v1: Reference 3 better, 1 worse (B0006 9.2 vs 2.9), 1 tie; Hot identical on every battery; Cold worse
+  (B0045 unchanged 16.0, bias -13.6). Physics vs own twin: Hot helps (3/4); Reference 2-2; Cold hurts.
+- The 19 extra inputs make the no-physics network WORSE (Hot 0.93 -> 1.45, Cold 4.79 -> 7.81; B0045 2.3 -> 11.7):
+  constant per battery, so with 3-4 training batteries they act as a battery fingerprint (overfitting).
+- Single-run caveat: v1 ablation 0.93 in Hot vs seed study 1.43 (5p); single ablation runs scatter up to ~0.9.
+- PINN v1 reproduces within run-to-run noise (Hot 0.98 vs 0.97; Cold 8.44 vs 8.39; B0047 9.27 vs 9.02).
+- DECISION: frozen forecasters unchanged (Reference MLP, Hot DT, Cold GP). Reportable negative result. Mixed/Pulsed
+  runs not needed (optional: Mixed, the one group where PINN v1 won).
+
+## 5aq. Integrated twin page (v5.30.0, 2026-10-27)
+- New page "Integrated twin" (after Live twin): per battery, a "Today" cycle; status (Normal / Watch / Alarm / End of
+  life reached, with reason); measured SOH coloured by the detector (removed cycles hollow); frozen-model forecast
+  from today with band and end-of-life estimate; where the capacity went (hybrid v2, unexplained part grey); event log;
+  explanation table v2 (main) vs v3 (check) with the model-form gap; what-if; CSV timeline (one snapshot per cycle).
+- Settings shared with other pages (results reused): frozen model trained once, re-anchored to measured capacity;
+  hybrid Re, 30 starts, penalty 0.3 (Models defaults); anomaly kappa 1.8, z 3.0. Fleet parts built once per session by
+  a button and saved in the result backup.
+- Watch = common test event, or early edge of the forecast band reaches end of life within the watch window (20).
+- What-if guardrails (engine-enforced): only conditions that vary in the data, only tested values (T and I = group
+  medians, cut-off per battery, rounded); sensitivity at a bound -> "limited" (shown, flagged); untested combination
+  flagged; charge current never. Output as differences (physics alone optimistic on NASA).
+- BUG FIXED: since results went through st.cache_data/backed(), "Fit the hybrid to the NASA batteries" (Models) failed
+  ("Can't pickle local object _hybrid_net_fit.<locals>.<lambda>"); reproduced on v5.29.0. hybrid_portable() drops the
+  network closure (unused by tables, trajectories, what-if); the hybrid is now cached and backed up.
+- Engine change purely additive (section 55 + version line): PINN v1 and Mission 2 code byte-identical.
+- Checks: 9 new tests; AppTest (Streamlit 1.66.1) on the page: build, cursor, reveal, what-if, re-render, batteries
+  without frozen model / explanation; Models hybrid button; all pages; harness md_check 0 leaks.
+- Expect on NASA: first build a few minutes (hybrid v2 + v3, 30 starts each, + anomaly scan); then seconds.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.29.0 (twin_engine.py, app.py, tests/test_pinn_full.py); CI green; app shows v5.29.0.
-2. USER: accuracy assessment, "Best 2 per level", levels: "Level 4 · PINN (original inputs) + ablation" and
-   "Level 4 · PINN all inputs + ablation", origin 30 %, Reference, Hot, Cold (and Mixed, Pulsed). Send the CSVs.
-   Judge: does all-inputs beat PINN v1? beat its no-physics twin (physics adds value)? beat the Mission 2 frozen
-   models (Reference 4.47, Hot 0.95, Cold 2.77)? If yes in a group, it becomes that group's frozen forecaster.
-3. Integrated twin view; writing (Mission 2, physics phase, Mission 3 chapters).
+1. USER: upload v5.30.0 (twin_engine.py, app.py, tests/test_integrated_twin.py) in one commit; CI green; app shows
+   v5.30.0. Reboot the app.
+2. USER: Integrated twin page on NASA: press "Build the integrated twin" (first time a few minutes), then download
+   the result backup and upload it to results/cache/. Check B0005 (Reference), B0029 (Hot), B0045 (Cold): forecast,
+   status over life (B0045 FLEET at 13; B0005-07 common event at 73-74), explanation split, what-if table (expected
+   on NASA: temperature and current "limited", Ea and a_I at bounds). Send screenshots + timeline CSVs.
+3. Writing (after the twin is finished, user decision): Mission 2 chapter, physics-phase chapter, Mission 3 chapter.
+4. Optional: Mixed assessment run for PINN all inputs; PyBaMM benchmark.
 
 ## 7. Open data checks
 B0042-B0044 ambient (~22 C in data vs 4 C in README); only B0049-B0052 have crashed logging (B0053-B0056 belong to

@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.29.0"
+REQUIRED_ENGINE = "5.30.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay", "pinn_state_raw")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay", "pinn_state_raw", "hybrid_portable", "integrated_snapshot", "integrated_timeline", "whatif_identifiability", "whatif_tested", "whatif_projection")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -87,7 +87,8 @@ POLICIES = ["Twin-Aware", "Fixed 1 A", "Fixed 2 A", "Fixed 4 A"]
 V_HOME, V_DATA = ":material/home: Home", ":material/monitoring: Diagnostics"
 V_MODELS, V_UPDATE = ":material/psychology: Models & forecasting", ":material/update: Model updating"
 V_LIVE, V_OPS, V_STUDY = ":material/play_circle: Live twin", ":material/tune: Operations & control", ":material/fact_check: Study results"
-VIEWS = [V_HOME, V_DATA, V_MODELS, V_UPDATE, V_LIVE, V_OPS, V_STUDY]   # v5.26 order: models, updating, live, ops, results
+V_TWIN = ":material/hub: Integrated twin"
+VIEWS = [V_HOME, V_DATA, V_MODELS, V_UPDATE, V_LIVE, V_TWIN, V_OPS, V_STUDY]   # v5.30: integrated twin after the live twin
 SANS = "IBM Plex Sans, Segoe UI, Helvetica Neue, Arial, sans-serif"
 SERIF = "'STIX Two Text', 'Times New Roman', Times, serif"
 
@@ -3961,6 +3962,7 @@ def view_home() -> None:
              ("Models & forecasting", V_MODELS, "Climb the learning ladder from baselines to first principles."),
              ("Model updating", V_UPDATE, "How often the twin's models must update, and how."),
              ("Live twin", V_LIVE, "Replay a battery cycle by cycle: the models learn, forecast and detect anomalies live."),
+             ("Integrated twin", V_TWIN, "One battery, one view: forecast, anomalies, why it ages, and what-if."),
              ("Operations & control", V_OPS, "Optimise operation and replacement for a calibrated battery."),
              ("Study results", V_STUDY, "Run the cohort study and get the answers to the three Missions.")]
     cols = st.columns(len(cards))
@@ -6166,8 +6168,8 @@ HYB_UNEXPL_COLOR = "#9AA3AD"
 @st.cache_data(show_spinner=False, max_entries=8)
 def hybrid_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...], restarts: int,
                   fit_with: str, lam: float, version: int = 3) -> Dict[str, Any]:
-    return backed("hybrid", lambda: te.nasa_hybrid_fit(_ct, _imp, list(cells), fit_with=fit_with, restarts=restarts,
-                                                       lam=lam, version=version),
+    return backed("hybrid", lambda: te.hybrid_portable(te.nasa_hybrid_fit(_ct, _imp, list(cells), fit_with=fit_with,
+                                                                          restarts=restarts, lam=lam, version=version)),
                   _ct, _imp, cells, restarts, fit_with, lam, version)
 
 
@@ -6941,11 +6943,400 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 
 
 # =============================================================================
+# View: integrated twin (Mission 3, option B: one twin, each task from the model proven best at it)
+# =============================================================================
+TWIN_STATUS_COLORS = {"Normal": "#009E73", "Watch": "#E69F00", "Alarm": "#CC0000", "End of life reached": "#6B1E1E"}
+TWIN_HYB = dict(restarts=30, fit_with="Re", lam=0.3)        # the Models view's defaults: both views share one result
+TWIN_PARTS = {"main": "Explanation (physics version 2)", "check": "Explanation check (physics version 3)",
+              "scan": "Anomaly detection", "fleet": "Fleet-wide parts"}
+
+
+def _twin_eol_label() -> str:
+    return f"{float(eol_ah):.2f} Ah" if float(eol_ah) > 1.0 else f"{100 * float(eol_ah):.0f} % of initial capacity"
+
+
+def twin_fleet_parts(build: bool) -> Optional[Dict[str, Any]]:
+    """Fleet-wide parts of the integrated twin, built once per session and shared by every battery: the explanation
+    (hybrid with physics version 2 = main split, version 3 = model-form check) and the anomaly scan. Both are saved
+    in the result backup, so a warm start reloads them in seconds."""
+    cells_an = tuple(sorted({c for g in te.NASA_PHYSICS_GROUPS for c in te.protocol_cells(CT_RAW, g)}))
+    key = (DATA_KEY_RAW, cells_an)
+    saved = st.session_state.get("itw_fleet")
+    if saved and saved.get("key") == key:
+        return saved
+    if not build:
+        return None
+    out: Dict[str, Any] = {"key": key, "cells": cells_an, "errors": {}, "main": None, "check": None, "scan": None,
+                           "common": {}}
+    if len(cells_an) < 3:
+        out["errors"]["fleet"] = (f"Explanation and anomaly detection need at least 3 batteries of the constant-condition "
+                                  f"groups ({', '.join(te.NASA_PHYSICS_GROUPS)}); this dataset has {len(cells_an)}.")
+        st.session_state["itw_fleet"] = out
+        return out
+    status_box = getattr(st, "status", None)
+    box = status_box("Building the twin's fleet-wide parts (once per session)…", expanded=True) if status_box \
+        else st.container()
+    with box:
+        for ver, name in ((2, "main"), (3, "check")):
+            st.write(f"Explanation · hybrid with physics version {ver} ({len(cells_an)} batteries, "
+                     f"{TWIN_HYB['restarts']} starts)…")
+            try:
+                out[name] = hybrid_cached(CT_RAW, imp, DATA_KEY_RAW, cells_an, TWIN_HYB["restarts"],
+                                          TWIN_HYB["fit_with"], TWIN_HYB["lam"], ver)
+            except Exception as exc:
+                out["errors"][name] = str(exc)
+        st.write("Anomaly detection · replaying every battery with the FLEET and OWN indicators…")
+        try:
+            scan = anomaly_scan2_cached(CT_RAW, imp, DATA_KEY_RAW, cells_an, 1.8, 3.0)
+            groups = te.condition_groups(CT_RAW)
+            campaign = {c: str(groups.loc[c, "Group"]) if c in groups.index else c for c in scan}
+            out["scan"], out["common"] = scan, te.anomaly_common_cause(scan, campaign)
+        except Exception as exc:
+            out["errors"]["scan"] = str(exc)
+        if status_box:
+            try:
+                box.update(label="Fleet-wide parts ready", state="complete", expanded=False)
+            except Exception:
+                pass
+    st.session_state["itw_fleet"] = out
+    return out
+
+
+def twin_battery_parts(c: str) -> Dict[str, Any]:
+    """This battery's forecast stream: the group's frozen model, trained once at 30 % of the record and re-anchored
+    every cycle to the measured capacity (the Mission 2 update-study choice; same settings as the Live twin's
+    default, so both views share the saved result)."""
+    grp_c, fz, train_c = frozen_context(c)
+    out: Dict[str, Any] = {"group": grp_c, "fz": fz, "train": train_c, "frames": None, "track": None,
+                           "why_not": frozen_unavailable_reason(c, grp_c, fz, train_c), "error": None}
+    if out["why_not"]:
+        return out
+    try:
+        with st.spinner(f"Streaming {c} through the frozen {grp_c} model (saved, so it runs only once)…"):
+            out["frames"], out["track"] = frozen_cached(ct, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1],
+                                                        float(soh_eol), 0, "capacity", float(eol_ah))
+    except Exception as exc:
+        out["error"] = str(exc)
+    return out
+
+
+def fig_twin(n: int, meas: pd.DataFrame, removed: pd.DataFrame, future: Optional[pd.DataFrame],
+             status: Optional[List[str]], an_n: Optional[np.ndarray], frame: Optional[Tuple[np.ndarray, ...]],
+             snap: Dict[str, Any], traj: Optional[pd.DataFrame], P: Palette, c: str, soh_eol_c: float,
+             x_max: float) -> go.Figure:
+    """Top: measured SOH up to today (coloured by the detector), today's forecast with its band and end-of-life
+    estimate. Bottom: where the capacity went (explanation), up to today."""
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.62, 0.38],
+                        subplot_titles=(f"{c} · state of health: measured up to today, forecast from today",
+                                        "Where the capacity went (hybrid explanation, % of initial capacity)"))
+    now = meas[meas["n"] <= n]
+    if status is not None and an_n is not None and len(now):
+        lab = dict(zip(an_n, status))
+        st_now = [lab.get(float(v), "Normal") for v in now["n"]]
+        for name, col in DETECTION_COLORS.items():
+            sel = [s_ == name for s_ in st_now]
+            if any(sel):
+                sub = now[sel]
+                fig.add_trace(go.Scatter(x=sub["n"], y=100 * sub["SOH"], mode="markers", name=name,
+                                         marker=dict(color=col, size=8 if name != "Normal" else 6),
+                                         hovertemplate="cycle %{x}: %{y:.1f} %<extra>" + name + "</extra>"), 1, 1)
+    elif len(now):
+        fig.add_trace(go.Scatter(x=now["n"], y=100 * now["SOH"], mode="markers", name="Measured SOH",
+                                 marker=dict(color=P.measured, size=6)), 1, 1)
+    rm = removed[removed["n"] <= n] if removed is not None and len(removed) else None
+    if rm is not None and len(rm):
+        fig.add_trace(go.Scatter(x=rm["n"], y=100 * rm["SOH"], mode="markers", name="Removed by data cleaning",
+                                 marker=dict(color="rgba(0,0,0,0)", size=7, line=dict(color="#9AA3AD", width=1.2)),
+                                 hovertemplate="cycle %{x}: %{y:.1f} % (recovery after a rest or invalid; not used)"
+                                               "<extra></extra>"), 1, 1)
+    if future is not None and len(future):
+        fig.add_trace(go.Scatter(x=future["n"], y=100 * future["SOH"], mode="markers",
+                                 name="Measured later (not seen by the twin)",
+                                 marker=dict(color="rgba(0,0,0,0)", size=6, line=dict(color=P.muted, width=1))), 1, 1)
+    if frame is not None:
+        fut, med, lo, hi = frame
+        keep = fut <= x_max
+        fig.add_trace(go.Scatter(x=np.r_[fut[keep], fut[keep][::-1]], y=100 * np.r_[hi[keep], lo[keep][::-1]],
+                                 fill="toself", fillcolor="rgba(213,94,0,0.15)", line=dict(width=0),
+                                 name="Forecast band", hoverinfo="skip"), 1, 1)
+        fig.add_trace(go.Scatter(x=fut[keep], y=100 * med[keep], name="Forecast (frozen model, from today)",
+                                 line=dict(color="#D55E00", width=2.4, dash="dash")), 1, 1)
+        e, e_lo, e_hi = snap["EOL forecast"], snap["EOL early"], snap["EOL late"]
+        if np.isfinite(e):
+            fig.add_trace(go.Scatter(
+                x=[e], y=[100 * soh_eol_c], mode="markers", name="Forecast end of life",
+                marker=dict(symbol="diamond", size=12, color="#D55E00", line=dict(color=P.plot_bg, width=1)),
+                error_x=dict(type="data", symmetric=False, color="#D55E00", thickness=2.5, width=7,
+                             array=[max((e_hi if np.isfinite(e_hi) else x_max) - e, 0)],
+                             arrayminus=[max(e - (e_lo if np.isfinite(e_lo) else e), 0)]),
+                hovertemplate="end of life forecast: cycle %{x:.0f}<extra></extra>"), 1, 1)
+    fig.add_hline(y=100 * soh_eol_c, line=dict(color="#6B1E1E", dash="dash", width=1.2), row=1, col=1)
+    fig.add_annotation(x=0, y=100 * soh_eol_c, xref="x", yref="y", text=f"end of life {100 * soh_eol_c:.1f} %",
+                       showarrow=False, xanchor="left", yanchor="bottom", font=dict(color="#B04040", size=11))
+    if traj is not None and len(traj):
+        tr = traj[traj["n"] <= n]
+        for m in te.MECHANISMS:
+            fig.add_trace(go.Scatter(x=tr["n"], y=100 * tr[m].clip(lower=0), name=m, stackgroup="mech", mode="lines",
+                                     line=dict(width=0.6, color=MECH_COLORS[MECH_KEYS[m]])), 2, 1)
+        fig.add_trace(go.Scatter(x=tr["n"], y=100 * tr[te.HYBRID_UNEXPLAINED].clip(lower=0),
+                                 name="Not explained by the physics", stackgroup="mech", mode="lines",
+                                 line=dict(width=0.6, color=HYB_UNEXPL_COLOR)), 2, 1)
+        fig.add_trace(go.Scatter(x=tr["n"], y=100 * (1 - tr["SOH observed"]), name="Measured capacity loss",
+                                 mode="markers", marker=dict(color=P.text, size=3), showlegend=False), 2, 1)
+    for r in (1, 2):
+        fig.add_vline(x=n, line=dict(color=P.text, width=1, dash="dot"), row=r, col=1)
+    fig.add_annotation(x=n, y=0.98, xref="x", yref="y domain", text=" today", showarrow=False, xanchor="left",
+                       yanchor="top", font=dict(color=P.muted, size=11))
+    fig.update_xaxes(range=[0, x_max])
+    fig.update_yaxes(title_text="SOH (%)", row=1, col=1)
+    fig.update_yaxes(title_text="Lost (%)", rangemode="tozero", row=2, col=1)
+    fig.update_xaxes(title_text="Discharge cycle n", row=2, col=1)
+    return style_fig(fig, P, 720, f"Integrated twin · {c} · cycle {n}", hovermode="closest")
+
+
+def fig_twin_whatif(d: pd.DataFrame, summ: Dict[str, Any], P: Palette, c: str, soh_eol_c: float) -> go.Figure:
+    ends = [summ["cycle"]] + [v for v in (summ["physics EOL own"], summ["physics EOL changed"]) if np.isfinite(v)]
+    d = d[d["n"] <= max(ends) * 1.12]                  # stop shortly after end of life: below it the physics means little
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=d["n"], y=100 * d["measured SOH"], mode="markers", name="Measured (own conditions)",
+                             marker=dict(color=P.measured, size=4)))
+    fig.add_trace(go.Scatter(x=d["n"], y=100 * d["measured, with the condition effect"], mode="lines",
+                             name="Measured, with the physics' condition effect", line=dict(color="#0072B2", width=2)))
+    fig.add_trace(go.Scatter(x=d["n"], y=100 * d["physics SOH, own conditions"], name="Physics, own conditions",
+                             line=dict(color=P.text, width=1.4, dash="dash")))
+    fig.add_trace(go.Scatter(x=d["n"], y=100 * d["physics SOH, changed conditions"], name="Physics, changed conditions",
+                             line=dict(color="#0072B2", width=1.6, dash="dash")))
+    fig.add_hline(y=100 * soh_eol_c, line=dict(color="#6B1E1E", dash="dash", width=1.1))
+    fig.add_vline(x=summ["cycle"], line=dict(color=P.muted, width=1, dash="dot"))
+    fig.update_xaxes(title_text="Discharge cycle n (this battery's charge throughput per cycle)")
+    fig.update_yaxes(title_text="SOH (%)")
+    return style_fig(fig, P, 460, f"What-if for {c}: the same battery under the changed conditions")
+
+
+def twin_model_card(grp_c: Optional[str], fz: Optional[Tuple[str, str]], fleet: Optional[Dict[str, Any]]) -> None:
+    fc = (f"{te.PROTOCOL_MODELS[fz[0]][1]} (frozen {grp_c} model; test RMSE "
+          f"{te.FROZEN_SCORES.get(grp_c, float('nan')):.2f} SOH pts at 30 % of life)") if fz else "none for this group"
+    rows = [("Forecast SOH and end of life", fc, "Trained once at 30 % of the record, re-anchored every cycle to the "
+             "measured capacity (Mission 2 update study: anchoring matters, retraining barely does)."),
+            ("Anomalies", "FLEET (ageing speed vs the fleet) + OWN (fade slope vs its own past), common-cause check, "
+             "end-of-life event", "Validated 11/11 on simulated knees and regeneration; causal."),
+            ("Explanation", "Hybrid: shared physics (frozen) + bounded network; physics version 2 = split, version 3 = "
+             "model-form check", "Fitted on every battery's whole record: it explains, it does not predict."),
+            ("What-if", "Shared-physics sensitivities", "Only conditions NASA varied, only at tested values; a "
+             "sensitivity at its range limit is flagged as limited.")]
+    show_table(pd.DataFrame(rows, columns=["Task", "Model", "How it is used"]).set_index("Task"))
+
+
+def twin_whatif(fleet: Dict[str, Any], c: str, soh_eol_c: float) -> None:
+    section("What-if · only the conditions NASA varied, only at the values NASA tested")
+    h = fleet.get("main")
+    if h is None or c not in h["data"]:
+        placeholder(f"The what-if needs the hybrid explanation of {c}; it covers the constant-condition groups "
+                    f"({', '.join(te.NASA_PHYSICS_GROUPS)}).")
+        return
+    groups = te.condition_groups(CT_RAW)
+    ident = te.whatif_identifiability(h, groups)
+    tested = te.whatif_tested(h, groups)
+    own = tested["by_battery"].loc[c]
+    st.markdown("The shared physics of the explanation (version 2) holds each mechanism's sensitivity to the operating "
+                "conditions. Here the battery's record is replayed under other conditions. Only conditions that vary "
+                "among the NASA batteries can be changed, and only to values NASA tested, so the twin never "
+                "extrapolates outside its evidence.")
+    show_table(ident.drop(columns=["key"]).set_index("condition"),
+               note="limited: the fit pushed the sensitivity to the edge of its allowed range, so the data could not "
+                    "determine it; the effect shown is that edge, not a measured effect.")
+    cols = st.columns(len(te.WHATIF_CONDITIONS))
+    pick: Dict[str, Optional[float]] = {}
+    status_of = dict(zip(ident["key"], ident["status"]))
+    for col, (key, spec) in zip(cols, te.WHATIF_CONDITIONS.items()):
+        vals = tested["values"][key]
+        own_v = float(own[f"{key} tested"])
+        ok = status_of.get(key) != "not identifiable" and len(vals) >= 2
+        v = col.selectbox(spec["label"], vals, index=vals.index(own_v) if own_v in vals else 0, key=f"itw_wi_{key}",
+                          disabled=not ok, format_func=lambda x, o=own_v: f"{x:g}" + ("  (own)" if x == o else ""),
+                          help=None if ok else "Not identifiable from these data: kept at the battery's own value.")
+        pick[key] = None if (not ok or v == own_v) else float(v)
+    if not any(v is not None for v in pick.values()):
+        placeholder("Choose a different tested value for at least one condition to see its effect on this battery.")
+        return
+    try:
+        d, s = te.whatif_projection(h, c, soh_eol_c, groups=groups, **pick)
+    except ValueError as exc:
+        st.warning(str(exc))
+        return
+    k = st.columns(4)
+    k[0].metric("Capacity lost by the last recorded cycle", f"{s['loss changed (%)']:.1f} %",
+                delta=f"{s['loss changed (%)'] - s['loss own (%)']:+.1f} points vs own conditions", delta_color="inverse")
+    k[1].metric("Loss ratio (changed / own)", fmt(s["loss ratio"], ".2f", "×"))
+    k[2].metric("Physics end of life, changed", fmt(s["physics EOL changed"], ".0f", "cycles"),
+                delta=(f"own {s['physics EOL own']:.0f}" if np.isfinite(s["physics EOL own"]) else "own: beyond range"),
+                delta_color="off")
+    k[3].metric("Life ratio (changed / own)", fmt(s["life ratio"], ".2f", "×"))
+    notes = []
+    if s["limited"]:
+        notes.append("Limited condition(s) changed (" + ", ".join(te.WHATIF_CONDITIONS[k_]["label"] for k_ in s["limited"])
+                     + "): the effect comes from a sensitivity at its range limit, not from evidence.")
+    if not s["combination tested"]:
+        notes.append("NASA never tested this combination of conditions together: each effect is from tested values, "
+                     "their combination assumes the effects simply multiply.")
+    notes.append("Read the difference, not the level: the physics alone is optimistic on NASA (it ages batteries too "
+                 "slowly late in life), so its end-of-life cycles are later than the measured ones.")
+    for t_ in notes:
+        st.caption(t_)
+    show(fig_twin_whatif(d, s, P, c, soh_eol_c), key="itw_wi_fig", data=d)
+
+
+def view_twin() -> None:
+    section(f"Integrated twin · {cell}")
+    st.markdown("One view of the battery as the twin sees it **today**: its health and end-of-life forecast, whether "
+                "it behaves abnormally, why it has lost capacity, and how other operating conditions would change "
+                "that. Each task comes from the model that proved best at it (Mission 3, option B). Move *today* "
+                "to replay the battery's life: the forecast and the detector see nothing after it.")
+    grp_c, fz, _ = frozen_context(cell)
+    fleet = twin_fleet_parts(build=False)
+    with st.expander("Which model does what", icon=":material/account_tree:"):
+        twin_model_card(grp_c, fz, fleet)
+    if fleet is None:
+        if st.button("Build the integrated twin", key="itw_build", type="primary", icon=":material/hub:",
+                     help="Fits the explanation (two physics versions) and replays the anomaly detector for the whole "
+                          "fleet once per session; saved in the result backup. Later batteries open in seconds."):
+            fleet = twin_fleet_parts(build=True)
+        else:
+            placeholder("Press 'Build the integrated twin'. The first build fits the explanation for the whole fleet "
+                        "(a few minutes on NASA, seconds with the result backup); every battery then opens quickly.")
+            return
+    for part, msg in (fleet.get("errors") or {}).items():
+        st.warning(f"{TWIN_PARTS.get(part, part)} unavailable: {msg}")
+    bp = twin_battery_parts(cell)
+    if bp["why_not"]:
+        st.info(f"Forecast unavailable: {bp['why_not']}", icon=":material/info:")
+    if bp["error"]:
+        st.warning(f"Forecast failed: {bp['error']}")
+
+    raw = CT_RAW[CT_RAW["Cell_ID"] == cell].sort_values("n")
+    c_bol_c = float(raw["C_bol_Ah"].iloc[0]) if len(raw) and "C_bol_Ah" in raw else float("nan")
+    soh_eol_c = te.soh_eol_for(c_bol_c, eol_ah) if np.isfinite(c_bol_c) else float(soh_eol)
+    meas = ct_cell.loc[~ct_cell["outlier"], ["n", "SOH"]].dropna().sort_values("n")
+    if len(meas) < 6:
+        st.info("This battery has too few valid cycles for the integrated twin.")
+        return
+    an = fleet["scan"].get(cell) if fleet.get("scan") else None
+    common = (fleet.get("common") or {}).get(cell)
+    used_n = set(an["n"].astype(float)) if an is not None else set(meas["n"].astype(float))
+    removed = raw.loc[~raw["n"].astype(float).isin(used_n) & raw["SOH"].notna(), ["n", "SOH"]]
+    t_main = te.hybrid_trajectory(fleet["main"], cell) if fleet.get("main") and cell in fleet["main"]["data"] else None
+    t_check = te.hybrid_trajectory(fleet["check"], cell) if fleet.get("check") and cell in fleet["check"]["data"] else None
+    frames = bp["frames"]
+
+    ns = meas["n"].astype(int).tolist()
+    c1, c2, c3 = st.columns([3.2, 1.2, 1.2], vertical_alignment="bottom")
+    n = int(c1.select_slider("Today (discharge cycle)", options=ns, value=ns[-1], key=f"itw_n_{cell}",
+                             help="Everything up to this cycle is known to the twin; the forecast starts here."))
+    reveal = c2.toggle("Show later measurements", value=False, key="itw_reveal",
+                       help="Measurements after today, which the twin has not seen: to judge the forecast.")
+    watch = int(c3.select_slider("Watch window (cycles)", [10, 20, 30, 50], value=20, key="itw_watch",
+                                 help="Status 'Watch' when the early edge of the forecast band reaches end of life "
+                                      "within this many cycles."))
+    snap = te.integrated_snapshot(n, soh_eol_c, meas, frames, an, common, t_main, t_check, watch)
+
+    k = st.columns(5)
+    k[0].metric("Today", f"cycle {n}", delta=f"of {ns[-1]} recorded", delta_color="off")
+    k[1].metric("Measured SOH", fmt(100 * snap["SOH measured"], ".1f", "%"))
+    e, e_lo, e_hi = snap["EOL forecast"], snap["EOL early"], snap["EOL late"]
+    if np.isfinite(snap["EOL reached at"]):
+        k[2].metric("End of life", f"reached at {snap['EOL reached at']:.0f}")
+        k[3].metric("Remaining", "0 cycles")
+    elif np.isfinite(e):
+        band = (f"band {e_lo:.0f}–{e_hi:.0f}" if np.isfinite(e_lo) and np.isfinite(e_hi) else
+                f"band from {e_lo:.0f}" if np.isfinite(e_lo) else None)
+        k[2].metric("End of life (forecast)", f"cycle {e:.0f}", delta=band, delta_color="off")
+        k[3].metric("Remaining (forecast)", f"{snap['remaining cycles']:.0f} cycles")
+    else:
+        hz = snap["forecast horizon"]
+        k[2].metric("End of life (forecast)", "beyond horizon" if np.isfinite(hz) else "—",
+                    delta=(f"after cycle {hz:.0f}" if np.isfinite(hz) else None), delta_color="off")
+        k[3].metric("Remaining (forecast)", f"> {hz - n:.0f} cycles" if np.isfinite(hz) else "—")
+    sh = snap["shares"]
+    if sh:
+        dom = snap["dominant"]
+        k[4].metric("Main loss mechanism so far", MECH_KEYS.get(dom, dom) + f" {100 * sh[dom]:.0f} %",
+                    delta=f"{100 * sh[te.HYBRID_UNEXPLAINED]:.0f} % not explained by the physics", delta_color="off")
+    else:
+        k[4].metric("Main loss mechanism so far", "—")
+    col = TWIN_STATUS_COLORS.get(snap["status"], "#9AA3AD")
+    st.markdown(f"<div style='padding:10px 14px;border-radius:8px;background:{col}22;border-left:6px solid {col}'>"
+                f"<b>Status today: {html.escape(snap['status'])}</b> · {html.escape(snap['reason'])}"
+                + (f" · detector: {html.escape(snap['detector'])}" if snap["detector"] else "") + "</div>",
+                unsafe_allow_html=True)
+
+    frame = None
+    if frames and np.isfinite(snap["forecast from"]):
+        frame = frames[int(snap["forecast from"])]
+    x_last = float(raw["n"].max()) if len(raw) else float(ns[-1])
+    x_max = x_last * 1.08
+    if np.isfinite(e_hi):
+        x_max = max(x_max, min(e_hi * 1.05, x_last * 2.0))
+    elif np.isfinite(e):
+        x_max = max(x_max, min(e * 1.1, x_last * 2.0))
+    status_list = te.anomaly_cycle_status(an, common, soh_eol=soh_eol_c) if an is not None else None
+    future = meas[meas["n"] > n] if reveal else None
+    show(fig_twin(n, meas, removed, future, status_list, an["n"].to_numpy(float) if an is not None else None, frame,
+                  snap, t_main, P, cell, soh_eol_c, x_max), key="itw_fig", export=False)
+
+    left, right = st.columns([1.15, 1])
+    with left:
+        st.markdown(f"**What happened to {cell}** (up to cycle {n})")
+        if an is None:
+            st.caption("Anomaly detection covers the constant-condition groups (" + ", ".join(te.NASA_PHYSICS_GROUPS)
+                       + ").")
+        else:
+            ev = te.anomaly_events(an, common, 1.8, 3.0, soh_eol=soh_eol_c, eol_label=_twin_eol_label())
+            seen = ev[ev["cycle"] <= n].sort_values("cycle", ascending=False)
+            if seen.empty:
+                st.caption("No event yet: the battery behaves as expected so far.")
+            else:
+                with st.container(height=min(300, 50 + 44 * len(seen)), border=True):
+                    st.markdown("  \n".join(
+                        f"{EVENT_STYLE.get(r.kind, ('gray', ':material/info:'))[1]} "
+                        f":{EVENT_STYLE.get(r.kind, ('gray', ''))[0]}[**cycle {r.cycle:.0f} · {r.indicator}**] — {r[3]}"
+                        for r in seen.itertuples(index=False)))
+    with right:
+        st.markdown("**Why it lost capacity** (up to cycle {})".format(n))
+        if not sh:
+            st.caption("No explanation for this battery: the hybrid covers the constant-condition groups ("
+                       + ", ".join(te.NASA_PHYSICS_GROUPS) + ").")
+        else:
+            sh2 = snap["shares check"]
+            rows = [{"Part of the loss": MECH_KEYS.get(m, m) if m in MECH_KEYS else "not explained by the physics",
+                     "Physics v2 (main)": 100 * sh[m], "Physics v3 (check)": 100 * sh2[m] if sh2 else np.nan}
+                    for m in (*te.MECHANISMS, te.HYBRID_UNEXPLAINED)]
+            show_table(pd.DataFrame(rows).set_index("Part of the loss").style.format("{:.0f} %", na_rep="—"))
+            gap = snap["split gap (points)"]
+            lines = []
+            if np.isfinite(gap):
+                lines.append(f"SEI and LAM shares differ by up to {gap:.0f} points between the two physics versions"
+                             + (": the SEI vs LAM proportion is not determined by these data (model-form uncertainty)."
+                                if gap > 10 else ": the split is robust to the physics version."))
+            lines.append("Lithium plating appears only in the cold in both versions; there it dominates.")
+            lines.append("The explanation is fitted on the whole record of every battery: it explains the past, it is "
+                         "not part of the forecast.")
+            for t_ in lines:
+                st.caption(t_)
+
+    tl = te.integrated_timeline(soh_eol_c, meas, frames, an, common, t_main, t_check, watch)
+    download("Download this battery's twin timeline (CSV)",
+             tl.assign(battery=cell, group=grp_c, **{"app version": te.ENGINE_VERSION,
+                                                    "end of life": _twin_eol_label()}).to_csv(index=False).encode(),
+             f"integrated_twin_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="itw_csv")
+    twin_whatif(fleet, cell, soh_eol_c)
+
+
+# =============================================================================
 # Dispatch: only the active view runs
 # =============================================================================
 sidebar_guide()
 _VIEW_FN: Dict[str, Callable[[], None]] = {V_HOME: view_home, V_DATA: view_data, V_MODELS: view_models,
-                                           V_UPDATE: view_update, V_LIVE: view_replay, V_OPS: view_ops,
+                                           V_UPDATE: view_update, V_LIVE: view_replay, V_TWIN: view_twin, V_OPS: view_ops,
                                            V_STUDY: view_study}
 try:
     _VIEW_FN.get(view, view_data)()

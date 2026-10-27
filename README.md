@@ -1,9 +1,21 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.29.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.30.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Integrated twin page (v5.30.0)
+
+1. New page "Integrated twin" (Mission 3, option B): one battery, one "Today" cycle; status with reason; forecast
+   (frozen model, re-anchored to measured capacity) with band and end of life; detector verdict per cycle and event
+   log; where the capacity went (hybrid v2) with the v3 model-form check; what-if limited to conditions NASA varied
+   and values NASA tested; CSV timeline. Engine section 55: integrated_snapshot, integrated_timeline,
+   whatif_tested, whatif_identifiability, whatif_projection, hybrid_portable, FROZEN_SCORES.
+2. Fix: the hybrid result held a closure that cannot be pickled, so st.cache_data / the result backup raised and the
+   Models button "Fit the hybrid to the NASA batteries" failed. The cached hybrid now omits it (hybrid_portable).
+3. tests/test_integrated_twin.py (9): snapshot causal, status levels, timeline shares, what-if refuses untested
+   or non-identifiable conditions, limited flag, hybrid picklable, version guard. AppTest of the page and all pages.
 
 ## PINN with all inputs (v5.29.0)
 
