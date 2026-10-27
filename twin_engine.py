@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.28.0"
+ENGINE_VERSION = "5.29.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -8217,6 +8217,62 @@ def _pinn_battery(ct: pd.DataFrame, c: str, n_max: Optional[int] = None) -> Opti
             "ah_cycle": float(np.median(da[da > 0])) if (da > 0).any() else 2.0}
 
 
+# Full-input PINN (v5.29): besides throughput and the conditions, the network gets the battery's measured state at its
+# origin, as constants (the Level-2 approach: future measurements are unknown): SOH and its trend, resistance and its
+# trend, CV-charge time and its trend, discharge time, CC-charge time, mean discharge voltage, energy efficiency,
+# temperature rise and its trend, cell temperature, C-rate, charge current, cut-off voltage, the voltage-curve feature
+# dQ(V), and EIS Re and Rct. Same physics equations as PINN v1.
+PINN_FULL_FEATURES = ("soh_now", "soh_slope_ah", "r_rel", "r_slope", "tcv_rel", "tcv_slope", "tdis_rel", "tcc_rel",
+                      "vmean_rel", "eff_now", "dT_now", "dT_slope", "T_mean", "c_rate", "I_ch", "v_cut", "dq_logvar",
+                      "re_rel", "rct_rel")
+
+
+def pinn_state_raw(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell: str, k: int) -> np.ndarray:
+    """The battery's measured state at cycle k (cycles <= k only), in PINN_FULL_FEATURES order (NaN if missing)."""
+    g = ct[(ct["Cell_ID"] == cell) & (ct["n"] <= k)]
+    dc = clean_capacity(g)
+    if len(dc) < 6:
+        return np.full(len(PINN_FULL_FEATURES), np.nan)
+    c_bol = float(g["C_bol_Ah"].iloc[0]) if "C_bol_Ah" in g and np.isfinite(g["C_bol_Ah"].iloc[0]) else 2.0
+    f = dict(state_features(dc, k, c_bol))
+    h = dc.sort_values("n")
+
+    def rel(col: str) -> float:
+        if col not in h or h[col].notna().sum() < 6:
+            return np.nan
+        b0 = float(h[col].head(3).median())
+        return float(h[col].tail(5).median()) / b0 if b0 and np.isfinite(b0) else np.nan
+    f["tdis_rel"], f["tcc_rel"] = rel("t_dis_s"), rel("t_cc_s")
+    f["T_mean"] = float(h["T_mean_C"].tail(5).median()) if "T_mean_C" in h else np.nan
+    f["I_ch"] = float(h["I_ch_A"].median()) if "I_ch_A" in h and h["I_ch_A"].notna().any() else np.nan
+    for col, key in (("Re_ohm", "re_rel"), ("Rct_ohm", "rct_rel")):
+        f[key] = np.nan
+        if imp is not None and col in imp:
+            e = imp[(imp["Cell_ID"] == cell) & imp[col].notna() & (imp[col] > 0)]
+            ci = g["Cycle_Index"].max() if "Cycle_Index" in g else None
+            if ci is not None and len(e):
+                e = e[e["Cycle_Index"] <= ci].sort_values("Cycle_Index")
+                if len(e) >= 2:
+                    f[key] = float(e[col].tail(2).median()) / float(e[col].head(2).median())
+    return np.array([float(f.get(k_, np.nan)) if f.get(k_) is not None else np.nan for k_ in PINN_FULL_FEATURES])
+
+
+def _pinn_standardise_states(bats: List[Dict[str, Any]]) -> None:
+    """Turn each battery's raw state vector ('xs_raw') into standardised network inputs ('xs'), across the batteries of
+    this fit; missing values -> the median, clipped to +-3."""
+    if not any("xs_raw" in b for b in bats):
+        return
+    M = np.array([b.get("xs_raw", np.full(len(PINN_FULL_FEATURES), np.nan)) for b in bats], float)
+    med = np.nanmedian(np.where(np.isfinite(M), M, np.nan), axis=0)
+    med = np.where(np.isfinite(med), med, 0.0)
+    M = np.where(np.isfinite(M), M, med)
+    mu, sd = M.mean(axis=0), M.std(axis=0)
+    sd = np.where(sd > 1e-9, sd, 1.0)
+    Zs = np.clip((M - mu) / sd, -3, 3)
+    for b, z in zip(bats, Zs):
+        b["xs"] = z
+
+
 def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> Dict[str, Any]:
     """Fit one PINN on a list of batteries (each with its data and the end of its collocation range). Returns a
     predictor of SOH and mechanism states for any battery of the list at any throughput, and the learned physics."""
@@ -8225,23 +8281,25 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
     # speed: keep the work per iteration roughly constant as the number of batteries grows
     full_step = int(np.clip(round(nb / 6), 2, 6)) if p.get("adaptive", True) else 2
     n_col = int(np.clip(1600 // max(nb, 1), 20, 50)) if p.get("adaptive", True) else 50
+    _pinn_standardise_states(bats)                         # full-input PINN only: state vector at the origin
+    base = lambda b: [b["xT"], b["xC"], b["xI"]] + list(b.get("xs", []))
     Xd, Bd, Yd, Rd, Rm = [], [], [], [], []
     for i, b in enumerate(bats):
         step = 1 if b.get("cut") else full_step
         for j in range(0, len(b["a"]), step):
-            Xd.append([b["a"][j], b["xT"], b["xC"], b["xI"]]); Bd.append(i); Yd.append(b["soh"][j])
+            Xd.append([b["a"][j]] + base(b)); Bd.append(i); Yd.append(b["soh"][j])
             rv = b["r"][j] if b["r"] is not None and j < len(b["r"]) else np.nan
             Rd.append(0.0 if not np.isfinite(rv) else rv); Rm.append(0.0 if not np.isfinite(rv) else 1.0)
     Xd, Bd, Yd, Rd, Rm = map(np.array, (Xd, Bd, Yd, Rd, Rm))
     Xc, Bc = [], []
     for i, b in enumerate(bats):
         for a in np.linspace(0.0, max(b["a_end"], 0.05), n_col):
-            Xc.append([a, b["xT"], b["xC"], b["xI"]]); Bc.append(i)
+            Xc.append([a] + base(b)); Bc.append(i)
     Xc, Bc = np.array(Xc), np.array(Bc)
     OHd, OHc = np.eye(nb)[Bd], np.eye(nb)[Bc]
     H = int(p["hidden"])
     g_ = lambda *s_: Tensor(rng.normal(0, 1 / math.sqrt(s_[0]), size=s_))
-    W1, Wz, b1 = g_(4, H), g_(2, H), Tensor(np.zeros((1, H)))
+    W1, Wz, b1 = g_(Xd.shape[1], H), g_(2, H), Tensor(np.zeros((1, H)))
     W2, b2 = g_(H, H), Tensor(np.zeros((1, H)))
     W3, b3 = Tensor(rng.normal(0, 0.01, size=(H, 3))), Tensor(np.full((1, 3), -2.0))
     Z = Tensor(rng.normal(0, 0.05, size=(nb, 2)))
@@ -8301,7 +8359,7 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
 
     def predict(i: int, a: np.ndarray) -> Tuple[np.ndarray, List[np.ndarray]]:
         b = bats[i]
-        X = np.column_stack([a, np.full(len(a), b["xT"]), np.full(len(a), b["xC"]), np.full(len(a), b["xI"])])
+        X = np.column_stack([a] + [np.full(len(a), v) for v in base(b)])
         S, _ = states(X, np.eye(nb)[np.full(len(a), i)])
         return observe(S)[0].data[:, 0], [s_.data[:, 0] for s_ in S]
 
@@ -8353,6 +8411,12 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
     if tcut is None or len(full) < 2:
         raise ValueError("PINN: needs at least 2 training batteries and 8 valid cycles before the origin")
     tgt = _pinn_battery(ct, cell_id, n_max=n0)
+    full_inputs = bool(p.get("full_inputs", False))
+    if full_inputs:                                        # every battery's state at the SAME origin cycle n0
+        for c_, b_ in full.items():
+            b_["xs_raw"] = pinn_state_raw(ct, imp, c_, n0)
+        if tgt is not None:
+            tgt["xs_raw"] = pinn_state_raw(ct, imp, cell_id, n0)
     tgt["cut"] = n0
     tgt["a_end"] = float(tgt["a"][-1]) + (n_last - n0) * tgt["ah_cycle"] / PINN_A_SCALE
     # held-out forecasts for the band and the CV error
@@ -8362,6 +8426,9 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
     errs = []
     for k, fold in enumerate(folds):
         cuts = [x for x in (_pinn_cut(ct, c, share) for c in fold) if x is not None]
+        if full_inputs:
+            for b_, g_c, cut_c in cuts:
+                b_["xs_raw"] = pinn_state_raw(ct, imp, str(g_c["Cell_ID"].iloc[0]), cut_c)
         if not cuts:
             continue
         bl = [full[c] for c in cells if c not in fold] + [x[0] for x in cuts] + [tgt]
@@ -8412,7 +8479,9 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
 
 
 PINN_MODELS = {"PINN": "PINN · physics-informed (mechanism equations enforced)",
-               "PINN-ablation": "Same network without physics (ablation)"}
+               "PINN-ablation": "Same network without physics (ablation)",
+               "PINN-full": "PINN · all inputs (measured state + conditions, mechanism equations enforced)",
+               "PINN-full-ablation": "All-inputs network without physics (ablation)"}
 MODEL_SPECS.update({
     "PINN": ModelSpec("PINN", "Physics-informed network", "Mechanism states learned with the degradation equations enforced.",
                       (_P("hidden", "Hidden units", "int", 32, 8, 64), _P("iterations", "Training iterations", "int", 1500, 300, 4000),
@@ -8429,8 +8498,10 @@ def train_pinn_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
                      mode: str = "forecast", train_cells: Optional[Sequence[str]] = None, eol_ah: float = DEFAULT_EOL_AH,
                      model_params: Optional[Dict[str, Any]] = None, **kw: Any) -> "TrajectoryForecast":
     prm = dict(model_params or {})
-    if kind == "PINN-ablation":
+    if kind in ("PINN-ablation", "PINN-full-ablation"):
         prm["physics_weight"] = 0.0
+    if kind in ("PINN-full", "PINN-full-ablation"):
+        prm["full_inputs"] = True
     return train_pinn_level(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, **kw)
 
 
@@ -8460,8 +8531,15 @@ def tune_level_model(ct, imp, cell_id, n0, model_name, mode="forecast", train_ce
                         f"{method} search · error of held-out forecasts of training batteries", time.time() - t0)
 
 
-for _k, _lab in (("PINN", "PINN · physics-informed"), ("PINN-ablation", "PINN · same network without physics")):
+for _k, _lab in (("PINN", "PINN · physics-informed"), ("PINN-ablation", "PINN · same network without physics"),
+                 ("PINN-full", "PINN · all inputs"), ("PINN-full-ablation", "PINN · all inputs, without physics")):
     PROTOCOL_MODELS[f"pinn:{_k}"] = ("Physics-informed (PINN)", _lab)
+import dataclasses as _dc
+for _k, _base, _desc in (("PINN-full", "PINN", "Mechanism equations enforced; inputs: conditions + the battery's measured "
+                          "state at the origin (as the Level-2 models)."),
+                         ("PINN-full-ablation", "PINN-ablation", "The same all-inputs network without the physics.")):
+    if _base in MODEL_SPECS and _k not in MODEL_SPECS:
+        MODEL_SPECS[_k] = _dc.replace(MODEL_SPECS[_base], name=_k, blurb=_desc)
 _protocol_forecast_l3 = _protocol_forecast
 
 

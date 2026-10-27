@@ -1,9 +1,25 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.28.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.29.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## PINN with all inputs (v5.29.0)
+
+1. PINN v1 saw less than the Level 2/3 models (no cut-off voltage, CV-charge time, dQ(V), temperature rise; SOH and
+   resistance only as fitted targets). New "PINN · all inputs" (pinn:PINN-full): same physics equations as PINN v1;
+   network inputs = throughput + conditions + the battery's measured state at the origin as constants (the Level-2
+   approach): SOH and trend, resistance and trend, CV-charge time and trend, discharge time, CC-charge time, mean
+   voltage, energy efficiency, temperature rise and trend, cell temperature, C-rate, charge current, cut-off voltage,
+   dQ(V), EIS Re and Rct (pinn_state_raw, PINN_FULL_FEATURES; standardised across the batteries of each fit, missing
+   -> median). Every battery's state is taken at the SAME origin cycle n0. Plus its no-physics twin
+   (pinn:PINN-full-ablation). PINN v1 unchanged (fingerprint identical).
+2. Accuracy assessment: the physics-forecaster levels (shared physics v2/v3, hybrids, ageing speed) are removed and
+   replaced by "Level 4 · PINN (original inputs) + ablation" and "Level 4 · PINN all inputs + ablation". The shared
+   physics and hybrid sections (explanation, option B) stay. Models view: the PINN section defaults to all inputs.
+3. Demo (Reference, 30 %): PINN all inputs 0.68, fleet shape 1.04, without physics 1.26 SOH points (demo only).
+4. tests/test_pinn_full.py (state vector causal, forecasts causal, assessment); 44 tests pass; AppTest; all pages.
 
 ## End of life in the detection; removed cycles shown (v5.28.0)
 
