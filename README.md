@@ -1,9 +1,23 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.32.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.34.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Mission 3 in the app (v5.34.0)
+
+1. Operations & control: anomaly detection + Mission 3 (prices and assumptions; 1. Operation: tested current x
+   cut-off per battery and for all batteries x prices; 2. Maintenance: replacement study on the real lives with
+   price sweep). Everything runs in the platform; the Colab script of v5.33.0 is withdrawn.
+2. The pre-Mission-2 optimiser sections are no longer shown; Study results answers M3 from the new studies.
+
+## Mission 3 rebuilt, stage 2: operation (v5.33.0)
+
+1. Engine section 57: M3OperationEconomics, m3_condition_economics (measured per battery), m3_operation_options
+   (tested current x cut-off at the battery's temperature), m3_fade_scale, m3_operation_life, m3_operation_study.
+2. tests/test_m3_operation.py (4): measured economics, tested options only, own option reproduces the measured fade
+   (found and fixed: throughput = Ah moved per cycle), one battery priced once.
 
 ## Mission 3 rebuilt, stage 1: maintenance on the real lives (v5.32.0)
 

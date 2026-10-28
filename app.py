@@ -23,6 +23,7 @@ Design rules enforced in this file
 from __future__ import annotations
 
 import html
+import itertools
 import json
 import math
 import time
@@ -47,7 +48,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.32.0"
+REQUIRED_ENGINE = "5.34.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -3370,19 +3371,24 @@ def _study_answers(res: Dict[str, Any]) -> Dict[str, List[str]]:
         if len(rec):
             A["M2"].append(f"Update interval: the sparsest schedule within tolerance is every {int(rec.median())} "
                            f"cycle(s) (median over {len(rec)} batteries; range {int(rec.min())}–{int(rec.max())}).")
-    om = st.session_state.get("om")
-    dp = st.session_state.get("dp")
-    if dp:
-        A["M3"].append(f"Dynamic programming on the calibrated plant: long-run profit rate {dp['eval']['rate']:.4f} CU/h, "
-                       f"replacement at SOH {dp['eval']['threshold']:.3f}, P(sudden failure) "
-                       f"{100 * dp['eval']['p_failure']:.1f}%.")
-    if om:
-        b = te.integrated_optimum(om["study"]).get("best")
-        if b:
-            A["M3"].append(f"Best grid policy: {b['policy']}, replace at SOH {b['threshold']:.2f} → {b['rate']:.4f} CU/h.")
+    mt = st.session_state.get("m3_maint")
+    if mt:
+        sm = mt["summary"]
+        if "twin-informed" in sm.index:
+            A["M3"].append(f"Replacement on the real lives: the twin captures "
+                           f"{100 * sm.loc['twin-informed', 'share of perfect-knowledge gain']:.0f} % of the possible "
+                           f"gain over run-to-end-of-life ({int(sm.loc['twin-informed', 'unplanned'])} unplanned of "
+                           f"{int(sm.loc['twin-informed', 'batteries'])}); best fixed age "
+                           + (f"{100 * sm.loc['best fixed age', 'share of perfect-knowledge gain']:.0f} %."
+                              if "best fixed age" in sm.index else "n/a."))
+    ops = st.session_state.get("m3_ops")
+    if ops is not None and len(ops):
+        best = (ops.sort_values("profit rate (per hour)", ascending=False)
+                .groupby(["battery", "battery_cost_cycles", "buy_price_ratio", "soh_eol"]).head(1))
+        A["M3"].append(f"Operation: the battery's own current and cut-off is best in {100 * best['own'].mean():.0f} % "
+                       f"of battery × price settings ({best['battery'].nunique()} batteries).")
     if not A["M3"]:
-        A["M3"].append("Run the integrated optimisation and the DP in Operations & control (with the calibrated "
-                       "plant) to fill in this answer.")
+        A["M3"].append("Run the operation and replacement studies in Operations & control to fill in this answer.")
     return A
 
 
@@ -3432,7 +3438,8 @@ def view_study() -> None:
     A = _study_answers(res)
     status = {"M1": "answered" if A["M1"] else "open",
               "M2": "answered" if (res.get("update") is not None and len(res["update"])) else "partly answered",
-              "M3": "answered" if (st.session_state.get("dp") or st.session_state.get("om")) else "partly answered"}
+              "M3": "answered" if (st.session_state.get("m3_maint") and st.session_state.get("m3_ops") is not None)
+              else "partly answered"}
     chips = "".join(f'<div class="bt-mchip bt-m-{v.split()[0]}"><b>{m}</b> {html.escape(v)}</div>' for m, v in status.items())
     st.markdown(f'<div class="bt-mstrip">{chips}</div>', unsafe_allow_html=True)
     section("Mission 1 · Health, operating conditions and mechanisms")
@@ -3846,11 +3853,12 @@ def _reco_items(view: str) -> List[Tuple[str, str]]:
         items.append(("fact_check", "One battery is an anecdote: confirm the ranking with the **Same operating conditions** "
                                     "or **Across batteries** scheme and several test batteries."))
     elif view == "ops":
-        if not ss.get("ops_calib", True):
-            items.append(("tune", "Turn on **Calibrate the plant** so the optimisation plans for this real battery."))
-        if not ss.get("om"):
-            items.append(("insights", "Run the **integrated optimisation**, then **Solve DP** to see how close the simple policy is to optimal."))
-        items.append(("science", "Use the **what-if planner** to test a hotter or colder site before deploying."))
+        if ss.get("m3_ops") is None:
+            items.append(("tune", "Run the **operation study for every battery** to see which current and cut-off "
+                                  "pays best across prices."))
+        if not ss.get("m3_maint"):
+            items.append(("build", "Run the **replacement study**: does the twin beat a fixed replacement age on the "
+                                   "real NASA lives?"))
     elif view == "study":
         if not ss.get("study"):
             items.append(("science", "Press **Run cohort study**: it produces the evidence for your results chapter."))
@@ -3901,7 +3909,8 @@ def sidebar_guide() -> None:
     ss = st.session_state
     steps = [("Data loaded", True, V_DATA), ("Half-cell modes fitted", bool(ss.get("hc")), V_DATA),
              ("Live twin opened", bool(ss.get("ekf")), V_LIVE), ("Ladder models compared", bool(ss.get("ladder")), V_MODELS),
-             ("M3 optimisation run", bool(ss.get("om") or ss.get("dp")), V_OPS),
+             ("M3 operation and replacement studies run", bool(ss.get("m3_maint")) and ss.get("m3_ops") is not None,
+              V_OPS),
              ("Cohort study run", bool(ss.get("study")), V_STUDY)]
     done = sum(ok for _, ok, _ in steps)
     with st.sidebar:
@@ -6601,160 +6610,8 @@ def anomaly_section() -> None:
              .to_csv(index=False).encode(), f"anomaly_scan_NASA__v{te.ENGINE_VERSION}.csv", "text/csv", key="an2_csv")
 
 
-def view_ops() -> None:
-    recommendations("ops")
-    anomaly_section()
-    section("Twin-aware operating strategy")
-    st.markdown("The twin-aware policy predicts each available discharge current with the ECM and degradation "
-                "model, then picks the best objective value within the thermal and cold-weather limits. "
-                "The *plant* can differ from the policy's *model* to test robustness.")
-    c1, c2, c3, c4 = st.columns(4)
-    policy = c1.selectbox("Policy", POLICIES)
-    objective = c2.selectbox("Objective", ["cycle", "rate"], disabled=policy != "Twin-Aware",
-                             format_func=lambda o: "Per-cycle margin" if o == "cycle"
-                             else "Long-run profit rate (Dinkelbach)",
-                             help="Finding: no one-step objective optimises the lifetime profit rate; the "
-                                  "per-cycle margin scored best in tests. A DP policy is the principled fix.")
-    weight = c3.slider("Degradation penalty weight w", 0.25, 3.0, 1.0, 0.25, disabled=policy != "Twin-Aware")
-    replacement = c4.number_input("Replacement cost (CU)", 10.0, 2000.0, 150.0, 10.0)
-
-    with st.expander("Economic, environmental and model-error settings"):
-        p1, p2, p3, p4 = st.columns(4)
-        price = (p1.number_input("Revenue per Ah at 1 A", 0.0, 10.0, 0.80, 0.05),
-                 p2.number_input("Revenue per Ah at 2 A", 0.0, 10.0, 1.00, 0.05),
-                 p3.number_input("Revenue per Ah at 4 A", 0.0, 10.0, 1.25, 0.05))
-        e_price = p4.number_input("Charging energy price (CU/Wh)", 0.0, 0.5, 0.02, 0.005, format="%.3f",
-                                  help="EnergyCost in J_op = Revenue − EnergyCost; resistive losses make aged "
-                                       "cells more expensive to charge per delivered Ah.")
-        s1, s2, s3, s4 = st.columns(4)
-        t_max = s1.slider("Max cell temperature (°C)", 40, 60, 55)
-        cold_rule = s2.toggle("Cold-temperature derating", value=True)
-        cold_thr = s3.slider("Cold threshold (°C)", 0, 20, 10, disabled=not cold_rule)
-        soh_eol_ops = s4.slider("Replacement SOH (decision)", 0.60, 0.85, 0.70, 0.01,
-                                help="When the operator replaces the cell: a maintenance decision optimised in the "
-                                     "integrated study and the DP, not the physical end-of-life definition.")
-        e1, e2, e3, e4 = st.columns(4)
-        amb_mean = e1.slider("Mean ambient (°C)", 0, 35, 20)
-        amb_amp = e2.slider("Seasonal ambient amplitude (°C)", 0, 20, 16)
-        mismatch = e3.slider("Plant / model mismatch", 0.0, 0.6, 0.0, 0.05,
-                             help="Relative std of the perturbation applied to the plant's ageing, resistance, "
-                                  "thermal and OCV parameters; the policy keeps the nominal model.")
-        seed = e4.number_input("Mismatch draw (seed)", 0, 999, 0, 1, disabled=mismatch == 0)
-        ekf_saved = st.session_state.get("ekf")
-        use_twin = st.toggle("Initialise the model from the latest observer run", value=False,
-                             disabled=ekf_saved is None, help="Available after opening the Live twin for a battery.")
-        show_base = st.toggle("Overlay fixed-current baselines", value=True)
-
-    econ = te.Economics(price_per_Ah=tuple(price), replacement_cost=float(replacement), soh_eol=float(soh_eol_ops),
-                        degradation_weight=float(weight), T_max_C=float(t_max),
-                        cold_derate_below_C=float(cold_thr) if cold_rule else None, objective=objective,
-                        energy_price_per_Wh=float(e_price))
-    calib = st.toggle(f"Calibrate the plant on the selected battery ({cell})", value=True, key="ops_calib",
-                      help="Capacity, resistances and the battery's own fade rate from its data; activation energy, "
-                           "current exponent and cold multiplier from the cohort stress regression. Off = a generic "
-                           "18650 cell.")
-    if calib:
-        try:
-            phys, calib_tab = calibrated_plant_cached(ct, imp, DATA_KEY, cell)
-            with st.expander(f"Calibrated plant for {cell}", icon=":material/tune:"):
-                show_table(calib_tab.style.format({"Value": "{:.4g}"}))
-                st.caption("Mission 1–2 results feed Mission 3: the optimiser now plans for this battery's measured "
-                           "behaviour instead of a generic cell.")
-        except Exception as exc:
-            report_error("Plant calibration failed; using the generic cell", exc, debug)
-            phys = te.CellPhysics()
-    else:
-        phys = te.CellPhysics()
-    if use_twin and ekf_saved:
-        r = ekf_saved["res"]
-        phys = replace(phys, k_ah=float(r.params["k_ah"]), R_int0=float(r.r_int0), R_ct0=float(r.r_ct0))
-    plant = te.perturb_physics(phys, float(mismatch), np.random.default_rng(int(seed))) if mismatch > 0 else None
-    ops_cfg = dict(policy=policy, econ=asdict(econ), phys=asdict(phys), plant=asdict(plant) if plant else None,
-                   amb_mean=amb_mean, amb_amp=amb_amp, show_base=show_base)
-
-    if st.button("Run lifecycle simulation", type="primary", key="ops_go"):
-        with st.spinner("Simulating to end of life…"):
-            econ_run = econ
-            rho_path: List[float] = []
-            if policy == "Twin-Aware" and objective == "rate":
-                rho, rho_path = tune_rho_cached(asdict(econ), asdict(phys), float(amb_mean), float(amb_amp))
-                econ_run = replace(econ, rate_ref=rho)
-            pl = asdict(plant) if plant else None
-            df = run_policy(policy, asdict(econ_run), asdict(phys), float(amb_mean), float(amb_amp), pl)
-            base = {b: run_policy(b, asdict(econ), asdict(phys), float(amb_mean), float(amb_amp), pl)
-                    for b in POLICIES[1:] if show_base and b != policy}
-            st.session_state["ops"] = {"cfg": ops_cfg, "df": df, "base": base, "policy": policy,
-                                       "soh_eol": float(soh_eol_ops), "rho": rho_path}
-
-    saved = st.session_state.get("ops")
-    if saved:
-        if saved["cfg"] != ops_cfg:
-            st.warning("Settings changed since the last run; the results below use the previous settings.")
-        if saved["df"].empty:
-            st.warning("The simulation produced no cycles: the cell starts below the replacement SOH.")
-        else:
-            s = te.summarise_life(saved["df"])
-            k = st.columns(7)
-            k[0].metric("Cycles to replacement", s["cycles"])
-            k[1].metric("J_op = revenue − energy", fmt(s["J_op"], ".1f", "CU"))
-            k[2].metric("Energy cost", fmt(s["energy_cost"], ".1f", "CU"))
-            k[3].metric("Net lifetime profit", fmt(s["profit"], ".1f", "CU"),
-                        help="J_op minus the amortised replacement cost of the SOH consumed.")
-            k[4].metric("Profit rate", fmt(s["profit_per_h"], ".3f", "CU/h"))
-            k[5].metric("Round-trip energy efficiency", fmt(100 * s["energy_eff"], ".1f", "%"))
-            k[6].metric("Constraint violations", s["violations"])
-            if saved.get("rho"):
-                st.caption("Dinkelbach iterations ρ: " + " → ".join(f"{v:.4f}" for v in saved["rho"]))
-            show(fig_policy(saved["df"], saved["policy"], saved["base"], saved["soh_eol"], P), key="ops_fig",
-                 data=saved["df"])
-            rows = [{"Policy": saved["policy"], **s}] + \
-                   [{"Policy": n, **te.summarise_life(d)} for n, d in saved["base"].items()]
-            tbl = pd.DataFrame(rows).set_index("Policy")[["cycles", "Ah", "J_op", "energy_cost", "profit",
-                                                          "profit_per_h", "energy_eff", "mean_I", "violations"]]
-            tbl.columns = ["Cycles", "Throughput (Ah)", "J_op (CU)", "Energy cost (CU)", "Profit (CU)",
-                           "Profit rate (CU/h)", "Energy efficiency", "Mean current (A)", "Violations"]
-            show_table(tbl.style.format({"Throughput (Ah)": "{:.0f}", "J_op (CU)": "{:.1f}", "Energy cost (CU)": "{:.1f}",
-                                         "Profit (CU)": "{:.1f}", "Profit rate (CU/h)": "{:.3f}",
-                                         "Energy efficiency": "{:.1%}", "Mean current (A)": "{:.2f}"}, na_rep="—")
-                       .highlight_max(subset=["Profit rate (CU/h)"],
-                                      props="background-color: rgba(0,158,115,0.25); font-weight: 700;"))
-            st.caption("Compare policies with zero violations: a fixed policy that breaches the thermal or "
-                       "cold-derating limits can post a higher profit rate but is not an admissible competitor.")
-            manifest_button(saved["cfg"], "operations", DATA_KEY)
-
-    section("Robustness study: twin advantage under plant / model mismatch")
-    m1, m2 = st.columns(2)
-    levels = m1.multiselect("Mismatch levels", [0.0, 0.1, 0.2, 0.3, 0.4, 0.5], default=[0.0, 0.2, 0.4])
-    draws = m2.slider("Random plants per level", 1, 8, 3)
-    n_runs = len(POLICIES) * (1 + (len([x for x in levels if x > 0]) * draws))
-    if st.button(f"Run mismatch study (≈ {1.5 * n_runs:.0f} s)", key="mm_go", disabled=not levels):
-        bar = st.progress(0.0, text="Sampling plants…")
-        try:
-            ms = te.mismatch_study(econ, phys, levels=tuple(sorted(levels)), n_draws=int(draws),
-                                   ambient_mean_C=float(amb_mean), ambient_amp_C=float(amb_amp),
-                                   progress=lambda f, m: bar.progress(f, text=m))
-            st.session_state["mm"] = {"df": ms, "cfg": dict(ops_cfg, levels=levels, draws=draws)}
-        except Exception as exc:
-            report_error("Mismatch study failed", exc, debug)
-        finally:
-            bar.empty()
-    mm = st.session_state.get("mm")
-    if mm:
-        ms = mm["df"]
-        show(fig_mismatch(ms, P), key="mm_fig", data=ms)
-        tw = ms[ms["policy"] == "Twin-Aware"]
-        agg = tw.groupby("level").agg(draws=("draw", "nunique"), mean_adv=("advantage_pct", "mean"),
-                                      min_adv=("advantage_pct", "min"), max_adv=("advantage_pct", "max"),
-                                      twin_violations=("twin_violations", "sum"))
-        agg.columns = ["Plants", "Mean advantage (%)", "Worst (%)", "Best (%)", "Twin violations"]
-        show_table(agg.style.format({"Mean advantage (%)": "{:+.1f}", "Worst (%)": "{:+.1f}", "Best (%)": "{:+.1f}"}))
-        st.caption("Advantage = twin-aware profit rate relative to the best fixed-current policy that stays "
-                   "within limits on the same plant. Simulation evidence only: the plant family is synthetic.")
-        manifest_button(mm["cfg"], "mismatch", DATA_KEY)
-
-    integrated_section(econ, phys, plant, float(amb_mean), float(amb_amp), ops_cfg)
-    dp_section(econ, phys, plant, float(amb_mean), float(amb_amp))
-    scenario_section()
+def view_ops_legacy() -> None:   # pre-Mission-2 optimiser, set aside (STATUS 5aw); not shown
+    pass
 
 
 def dp_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional[te.CellPhysics], amb_mean: float,
@@ -7392,6 +7249,255 @@ def view_twin() -> None:
                                                     "watch uses": basis}).to_csv(index=False).encode(),
              f"integrated_twin_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="itw_csv")
     twin_whatif(fleet, cell, soh_eol_c)
+
+
+# =============================================================================
+# Mission 3 (rebuilt on the validated twin): operation (stage 2) and maintenance (stage 1), in Operations & control
+# =============================================================================
+M3_EOL_RULES = {"NASA convention: 1.4 Ah, or 80 % of initial capacity for batteries that start near or below it": "nasa",
+                "Control-bar end of life": "bar"}
+M3_GROUPS = ("Reference", "High current", "Hot", "Cold", "Pulsed load")   # constant conditions (Mixed excluded)
+
+
+def m3_soh_eol_for(c: str, rule: str) -> float:
+    """End of life of battery c as a fraction of its initial capacity. NASA convention: 1.4 Ah (30 % fade of the
+    rated 2 Ah), or 80 % of initial capacity when 1.4 Ah is within 2 % of (or above) its initial capacity (cold
+    batteries). NaN when the control-bar threshold is undefined for this battery."""
+    d = CT_RAW[CT_RAW["Cell_ID"] == c]
+    c_bol = float(d["C_bol_Ah"].iloc[0]) if len(d) and "C_bol_Ah" in d else float("nan")
+    if not np.isfinite(c_bol) or c_bol <= 0:
+        return float("nan")
+    if rule == "nasa":
+        s = te.DEFAULT_EOL_AH / c_bol
+        return float(s) if s < 0.98 else 0.80
+    s = te.soh_eol_for(c_bol, eol_ah)
+    return float(s) if np.isfinite(s) and s < 0.98 else float("nan")
+
+
+def m3_prices() -> Dict[str, Any]:
+    with st.expander("Prices and assumptions (NASA has no prices: results are swept over them)", expanded=False,
+                     icon=":material/payments:"):
+        c1, c2, c3, c4, c5 = st.columns(5)
+        p = dict(cost=float(c1.number_input("Battery cost (cycles of revenue)", 5.0, 500.0, 60.0, 5.0, key="m3_cost",
+                                            help="Replacement cost expressed as beginning-of-life cycles of net "
+                                                 "revenue of the battery's own operation.")),
+                 buy=float(c2.number_input("Energy buy / sell price", 0.0, 0.95, 0.4, 0.05, key="m3_buy",
+                                           help="Charging energy costs this fraction of the price the delivered "
+                                                "energy sells for (J_op = revenue − energy cost).")),
+                 k=float(c3.number_input("Unplanned replacement × cost", 1.0, 10.0, 3.0, 0.5, key="m3_k")),
+                 lead=int(c4.number_input("Lead time (cycles)", 0, 60, 10, 1, key="m3_lead",
+                                          help="Cycles between ordering a replacement and installing it.")),
+                 rule=M3_EOL_RULES[c5.selectbox("End of life", list(M3_EOL_RULES), key="m3_eol")])
+    return p
+
+
+def fig_m3_options(r: pd.DataFrame, P: Palette, c: str) -> go.Figure:
+    lab = [f"{i:g} A · {v:.1f} V" + (" (own)" if o else "") for i, v, o in zip(r["I_dis"], r["V_cut"], r["own"])]
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Profit rate (per hour)", "Cycles to end of life"))
+    col = ["#0072B2" if o else "#9AA3AD" for o in r["own"]]
+    fig.add_trace(go.Bar(x=lab, y=r["profit rate (per hour)"], marker_color=col, showlegend=False,
+                         hovertemplate="%{x}: %{y:.3f}<extra></extra>"), 1, 1)
+    fig.add_trace(go.Bar(x=lab, y=r["cycles to EOL"], marker_color=col, showlegend=False,
+                         hovertemplate="%{x}: %{y:.0f} cycles<extra></extra>"), 1, 2)
+    return style_fig(fig, P, 420, f"Operation options for {c} (tested combinations at its temperature)")
+
+
+def m3_operation_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
+    section("Mission 3 · 1. Operation: which current and cut-off?")
+    st.markdown("Aggressive operation earns more per hour but ages the battery faster. For the selected battery, "
+                "every discharge current and cut-off **NASA ran at its temperature** is compared. Energy in, energy "
+                "out and hours per cycle are **measured** on the batteries run that way; ageing comes from the "
+                "shared physics, scaled to this battery's measured fade. Temperature is the battery's environment, "
+                "not a control.")
+    h = fleet.get("main")
+    if h is None:
+        st.warning("The shared physics is not available: " + (fleet.get("errors") or {}).get("main", "not built"))
+        return
+    ident = te.whatif_identifiability(h, te.condition_groups(CT_RAW))
+    with st.expander("What NASA lets the twin vary (identifiability)", icon=":material/rule:"):
+        show_table(ident.drop(columns=["key"]).set_index("condition"))
+    eol_c = m3_soh_eol_for(cell, p["rule"])
+    if cell not in h["data"]:
+        placeholder(f"{cell} is not in the constant-condition groups ({', '.join(te.NASA_PHYSICS_GROUPS)}).")
+    elif not np.isfinite(eol_c):
+        st.info("End of life is undefined for this battery with the control-bar setting; choose the NASA convention "
+                "in Prices and assumptions.")
+    else:
+        e = te.M3OperationEconomics(buy_price_ratio=p["buy"], battery_cost_cycles=p["cost"], soh_eol=eol_c)
+        try:
+            r = te.m3_operation_study(h, ct, cell, e, te.condition_groups(CT_RAW))
+        except Exception as exc:
+            report_error("Operation study failed", exc, debug)
+            r = pd.DataFrame()
+        if len(r) < 2:
+            st.info(f"NASA ran only one current and cut-off at {cell}'s temperature: nothing to choose here.")
+        if len(r):
+            best = r.iloc[0]
+            k = st.columns(3)
+            k[0].metric("Best option", f"{best['I_dis']:g} A · {best['V_cut']:.1f} V",
+                        delta="own operation" if best["own"] else "differs from own", delta_color="off")
+            k[1].metric("Profit rate vs own", f"{best['vs own (per hour)']:+.3f} per hour")
+            k[2].metric("Fade scale k", f"{best['fade scale k']:.2f}",
+                        help="Measured fade / physics fade for this battery (the physics alone is optimistic).")
+            show(fig_m3_options(r, P, cell), key="m3_opt_fig", data=r)
+            cols = ["I_dis", "V_cut", "own", "tested on", "Wh out per cycle", "hours per cycle", "efficiency",
+                    "cycles to EOL", "J_op per hour", "profit rate (per hour)", "vs own (per hour)", "flags"]
+            show_table(r[cols].style.format({"Wh out per cycle": "{:.2f}", "hours per cycle": "{:.2f}",
+                                             "efficiency": "{:.3f}", "J_op per hour": "{:.3f}",
+                                             "profit rate (per hour)": "{:.3f}", "vs own (per hour)": "{:+.3f}"}))
+            if (r["flags"] != "none").any():
+                st.caption("Flagged options rest on a sensitivity at the edge of its range (see identifiability).")
+    if st.button("Run for every battery and price setting", key="m3_ops_all", icon=":material/table_chart:",
+                 help="All constant-condition batteries × battery cost 30/60/120 × buy price 0.2/0.4/0.6 × end of "
+                      "life 70/80 % (NASA rule for the battery's own threshold is shown separately)."):
+        rows, groups = [], te.condition_groups(CT_RAW)
+        bar = st.progress(0.0, text="Simulating operation options…")
+        cells = list(h["data"])
+        for j, c in enumerate(cells):
+            for cost, buy, eol in itertools.product((30, 60, 120), (0.2, 0.4, 0.6), (0.7, 0.8)):
+                try:
+                    r = te.m3_operation_study(h, ct, c, te.M3OperationEconomics(battery_cost_cycles=cost,
+                                                                               buy_price_ratio=buy, soh_eol=eol), groups)
+                except Exception:
+                    continue
+                if len(r):
+                    rows.append(r.assign(battery=c, group=str(groups.loc[c, "Group"]) if c in groups.index else "?",
+                                         battery_cost_cycles=cost, buy_price_ratio=buy, soh_eol=eol))
+            bar.progress((j + 1) / len(cells), text=f"{c} done")
+        bar.empty()
+        st.session_state["m3_ops"] = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    res = st.session_state.get("m3_ops")
+    if res is not None and len(res):
+        best = (res.sort_values("profit rate (per hour)", ascending=False)
+                .groupby(["battery", "battery_cost_cycles", "buy_price_ratio", "soh_eol"]).head(1))
+        tab = best.groupby(["group", "I_dis", "V_cut"]).size().rename("times best").reset_index()
+        tot = best.groupby("group").size().rename("settings")
+        tab = tab.merge(tot, on="group")
+        tab["share"] = tab["times best"] / tab["settings"]
+        st.markdown("**Which option is best, over all batteries and price settings**")
+        show_table(tab.set_index(["group", "I_dis", "V_cut"]).style.format({"share": "{:.0%}"}))
+        own_best = best.groupby("group")["own"].mean().rename("own operation best (share)")
+        show_table(own_best.to_frame().style.format("{:.0%}"))
+        download("Download the operation study (CSV)", res.drop(columns=[], errors="ignore").to_csv(index=False).encode(),
+                 f"m3_operation_study__v{te.ENGINE_VERSION}.csv", "text/csv", key="m3_ops_csv")
+
+
+def m3_lives(fleet: Dict[str, Any], rule: str) -> Tuple[Dict[str, Tuple[pd.DataFrame, str, float]], List[str]]:
+    """Integrated timelines of every constant-condition battery that reached end of life (frozen forecast stream,
+    detector), as the twin saw them cycle by cycle."""
+    lives, notes = {}, []
+    groups = te.condition_groups(CT_RAW)
+    cands = [c for g in M3_GROUPS for c in te.protocol_cells(CT_RAW, g)]
+    bar = st.progress(0.0, text="Replaying the twin on every battery…")
+    for j, c in enumerate(cands):
+        bar.progress((j + 1) / max(len(cands), 1), text=f"{c}…")
+        eol_c = m3_soh_eol_for(c, rule)
+        meas = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]][["n", "SOH"]].dropna().sort_values("n")
+        if not np.isfinite(eol_c) or len(meas) < 10:
+            notes.append(f"{c}: end of life undefined or too few cycles")
+            continue
+        e_meas = te.eol_cycle_from_replay(meas.reset_index(drop=True), eol_c)
+        if e_meas is None:
+            notes.append(f"{c}: did not reach end of life in its record")
+            continue
+        grp_c, fz, train_c = frozen_context(c)
+        why = frozen_unavailable_reason(c, grp_c, fz, train_c)
+        if why:
+            notes.append(f"{c}: {why}")
+            continue
+        try:
+            frames, _ = frozen_cached(ct, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1], float(eol_c), 0, "capacity",
+                                      float(eol_ah))
+        except Exception as exc:
+            notes.append(f"{c}: forecast failed ({exc})")
+            continue
+        an = (fleet.get("scan") or {}).get(c)
+        common = (fleet.get("common") or {}).get(c)
+        tl = te.integrated_timeline(eol_c, meas, frames, an, common)
+        lives[c] = (tl, str(groups.loc[c, "Group"]) if c in groups.index else "?", float(e_meas))
+    bar.empty()
+    return lives, notes
+
+
+def m3_maintenance_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
+    section("Mission 3 · 2. Maintenance: when to replace?")
+    st.markdown("Each battery's **real measured life** is replayed cycle by cycle, and replacement is decided with "
+                "only what the twin knew at that cycle. Policies: **perfect knowledge** (best cycle in hindsight, the "
+                "upper bound), **twin-informed** (order when the forecast end of life is within the lead time plus a "
+                "safety margin), **twin + age limit**, **best fixed age** (the usual practice) and **run to end of "
+                "life** (always unplanned). Margin and age are chosen on the *other* batteries (leave-one-out). "
+                "Revenue per cycle is proportional to SOH, so performance loss counts.")
+    key = (DATA_KEY, p["rule"], float(eol_ah))
+    saved = st.session_state.get("m3_lives")
+    if st.button("Run the replacement study (all batteries that reached end of life)", key="m3_maint_go",
+                 type="primary", icon=":material/build:",
+                 help="Replays the frozen forecast for each battery (saved results are reused)."):
+        lives, notes = m3_lives(fleet, p["rule"])
+        saved = {"key": key, "lives": lives, "notes": notes}
+        st.session_state["m3_lives"] = saved
+    if not saved or saved.get("key") != key:
+        placeholder("Press the button: the first run streams every battery through its frozen model (minutes on "
+                    "NASA, then saved).")
+        return
+    lives = saved["lives"]
+    if len(lives) < 3:
+        st.info("Fewer than three batteries reached end of life: the study needs leave-one-out choices.")
+        if saved["notes"]:
+            st.caption("Not in the study: " + "; ".join(saved["notes"]))
+        return
+    e = te.M3Economics(battery_cost_cycles=p["cost"], unplanned_factor=p["k"], lead_cycles=p["lead"])
+    per, summ = te.m3_maintenance_study(lives, e)
+    st.session_state["m3_maint"] = {"summary": summ, "per": per, "prices": dict(p)}
+    tw = summ.loc["twin-informed"] if "twin-informed" in summ.index else None
+    k = st.columns(3)
+    k[0].metric("Batteries", f"{len(lives)}", delta=", ".join(sorted({v[1] for v in lives.values()})), delta_color="off")
+    if tw is not None:
+        k[1].metric("Twin: share of the possible gain", f"{100 * tw['share of perfect-knowledge gain']:.0f} %")
+        fx = summ.loc["best fixed age", "share of perfect-knowledge gain"] if "best fixed age" in summ.index else np.nan
+        k[2].metric("Best fixed age", fmt(100 * fx, ".0f", "%"))
+    show_table(summ.style.format({"mean profit rate": "{:.3f}", "mean unused life (cycles)": "{:.1f}",
+                                  "share of perfect-knowledge gain": "{:.0%}"}),
+               note="Share of the gain = (profit of the policy − run to end of life) / (perfect knowledge − run to "
+                    "end of life), summed over batteries.")
+    show_table(per.pivot_table(index=["group", "battery", "end of life"], columns="policy",
+                               values="replace at").style.format("{:.0f}"))
+    with st.expander("Sweep over the assumed prices (27 settings)", icon=":material/tune:"):
+        rows = []
+        for cost, kk, lead in itertools.product((30, 60, 120), (1.5, 3, 5), (5, 10, 20)):
+            _, s = te.m3_maintenance_study(lives, te.M3Economics(battery_cost_cycles=cost, unplanned_factor=kk,
+                                                                  lead_cycles=lead))
+            r = {"battery cost": cost, "unplanned ×": kk, "lead": lead}
+            for pol in s.index:
+                r[pol] = s.loc[pol, "share of perfect-knowledge gain"]
+            rows.append(r)
+        sw = pd.DataFrame(rows)
+        if "twin-informed" in sw and "best fixed age" in sw:
+            ok = sw["twin-informed"].notna() & sw["best fixed age"].notna()
+            st.caption(f"Twin above the best fixed age in {(sw.loc[ok, 'twin-informed'] > sw.loc[ok, 'best fixed age']).sum()}"
+                       f" of {ok.sum()} settings with room to gain.")
+        show_table(sw.set_index(["battery cost", "unplanned ×", "lead"]).style.format("{:.0%}", na_rep="—"))
+    if saved["notes"]:
+        st.caption("Not in the study: " + "; ".join(saved["notes"]))
+    download("Download the replacement study (CSV)", per.to_csv(index=False).encode(),
+             f"m3_maintenance_study__v{te.ENGINE_VERSION}.csv", "text/csv", key="m3_maint_csv")
+
+
+def view_ops() -> None:
+    recommendations("ops")
+    anomaly_section()
+    p = m3_prices()
+    fleet = twin_fleet_parts(build=False)
+    if fleet is None:
+        section("Mission 3 · Optimisation")
+        if st.button("Build the twin's fleet-wide parts", key="m3_build", type="primary", icon=":material/hub:",
+                     help="Shared physics and anomaly scan for the whole fleet, once per session (shared with the "
+                          "Integrated twin page and saved in the result backup)."):
+            fleet = twin_fleet_parts(build=True)
+        else:
+            placeholder("Mission 3 uses the twin's fleet-wide parts (shared physics, anomaly scan). Build them once.")
+            return
+    m3_operation_section(fleet, p)
+    m3_maintenance_section(fleet, p)
 
 
 # =============================================================================

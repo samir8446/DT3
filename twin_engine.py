@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.32.0"
+ENGINE_VERSION = "5.34.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -11149,3 +11149,159 @@ def m3_maintenance_study(lives: Dict[str, Tuple[pd.DataFrame, str, float]], e: M
                      float((g["end of life"] - g["replace at"]).clip(lower=0).mean()),
                      "share of perfect-knowledge gain": gain / room if room > 0 else np.nan})
     return per, pd.DataFrame(summ).set_index("policy").sort_values("mean profit rate", ascending=False)
+
+
+
+# =============================================================================
+# 57. MISSION 3 · STAGE 2: OPERATION (which tested current and cut-off, at the battery's own temperature)
+# =============================================================================
+# Trade-off of the plan: aggressive operation (more energy per cycle / per hour) vs faster degradation.
+#   options      only (discharge current, cut-off) combinations NASA tested at the battery's temperature
+#   economics    MEASURED per option at beginning of life (first valid cycles of the batteries tested that way):
+#                energy delivered, energy charged, hours per cycle; over life they scale with SOH
+#   ageing       shared physics of the hybrid (shape + condition sensitivities), scaled by ONE factor fitted to this
+#                battery's measured fade (corrects the physics' optimism, 5ac); throughput tracked cycle by cycle
+#                (a deeper discharge moves more Ah per cycle)
+#   objective    J_op = revenue - energy cost; profit rate = (J_op - planned replacement) / hours, renewal at EOL
+# Options whose current or cut-off sensitivity is "limited" (at a bound) are flagged, not hidden.
+
+
+@dataclass
+class M3OperationEconomics:
+    sell_price_per_Wh: float = 1.0          # revenue per Wh delivered (relative units)
+    buy_price_ratio: float = 0.4            # energy bought for charging costs this fraction of the sell price
+    battery_cost_cycles: float = 60.0       # replacement cost, in beginning-of-life cycles of the OWN option's J_op
+    rest_h: float = 0.0                     # extra hours per cycle (rest, handling)
+    soh_eol: float = 0.8                    # end of life as a fraction of the option's own initial capacity
+    max_cycles: int = 2000
+
+    def __post_init__(self) -> None:
+        if not (0 < self.soh_eol < 1) or self.sell_price_per_Wh <= 0 or self.buy_price_ratio < 0:
+            raise ValueError("M3OperationEconomics: 0 < soh_eol < 1, sell price > 0, buy ratio >= 0")
+
+
+def m3_condition_economics(ct: pd.DataFrame, cells: Optional[Sequence[str]] = None, first: int = 10) -> pd.DataFrame:
+    """Per battery, MEASURED beginning-of-life economics (median of the first valid cycles): Ah delivered, Ah moved per
+    cycle (the physics' throughput axis, cum_Ah: charge and discharge), energy delivered and
+    charged (Wh), hours per cycle (discharge + CC + CV charge), round-trip energy efficiency, conditions."""
+    rows = []
+    good = ct[~ct["outlier"]]
+    for c, d in good.groupby("Cell_ID"):
+        if cells is not None and c not in cells:
+            continue
+        d = d.sort_values("n").head(first)
+        if len(d) < 3:
+            continue
+        med = lambda col: float(d[col].median()) if col in d and d[col].notna().any() else np.nan
+        h = (med("t_dis_s") + np.nan_to_num(med("t_cc_s")) + np.nan_to_num(med("t_cv_s"))) / 3600
+        dq = d["cum_Ah"].diff() / d["n"].diff() if "cum_Ah" in d else pd.Series(dtype=float)
+        rows.append({"battery": c, "T_C": med("T_mean_C"), "I_dis": med("I_dis_A"), "V_cut": med("V_min_V"),
+                     "Ah": med("Capacity_Ah"), "Ah moved": float(dq.median()) if dq.notna().any() else np.nan, "Wh out": med("E_dis_Wh"), "Wh in": med("E_ch_Wh"),
+                     "hours": h, "efficiency": med("E_dis_Wh") / med("E_ch_Wh") if med("E_ch_Wh") > 0 else np.nan})
+    return pd.DataFrame(rows).set_index("battery") if rows else pd.DataFrame()
+
+
+def m3_operation_options(h: Dict[str, Any], ct: pd.DataFrame, cell: str,
+                         groups: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Tested (current, cut-off) combinations at the battery's own temperature (same tested temperature value;
+    current and cut-off as each battery was actually run, rounded to 0.5 A and 0.1 V), with their measured economics (median over the batteries tested that way) and identification flags."""
+    tested = whatif_tested(h, groups)
+    tab = tested["by_battery"]
+    if cell not in tab.index:
+        raise ValueError(f"{cell} is not among the batteries the physics was fitted to")
+    tab = tab.copy()
+    tab["I_dis tested"] = (np.round(tab["I_dis"] / 0.5) * 0.5).round(2)   # each battery's own tested current
+    own = tab.loc[cell]
+    same_T = tab[np.isclose(tab["T_C tested"], own["T_C tested"])]
+    eco = m3_condition_economics(ct, list(same_T.index))
+    ident = whatif_identifiability(h, groups).set_index("key")
+    rows = []
+    for (i_, v_), g in same_T.groupby(["I_dis tested", "V_cut tested"]):
+        e = eco.reindex(g.index).dropna(how="all")
+        if not len(e):
+            continue
+        flags = []
+        if not np.isclose(i_, own["I_dis tested"]) and ident.loc["I_dis", "status"] != "identified":
+            flags.append(f"current: {ident.loc['I_dis', 'status']}")
+        if not np.isclose(v_, own["V_cut tested"]) and ident.loc["V_cut", "status"] != "identified":
+            flags.append(f"cut-off: {ident.loc['V_cut', 'status']}")
+        rows.append({"I_dis": float(i_), "V_cut": float(v_), "own": bool(np.isclose(i_, own["I_dis tested"]) and
+                                                                         np.isclose(v_, own["V_cut tested"])),
+                     "tested on": ", ".join(e.index), "Ah": e["Ah"].median(), "Ah moved": e["Ah moved"].median(),
+                     "Wh out": e["Wh out"].median(),
+                     "Wh in": e["Wh in"].median(), "hours": e["hours"].median(),
+                     "efficiency": e["efficiency"].median(), "flags": "; ".join(flags) or "none"})
+    return pd.DataFrame(rows)
+
+
+def m3_fade_scale(h: Dict[str, Any], cell: str) -> float:
+    """One factor k so that k x (physics capacity loss under the battery's own conditions) best matches its measured
+    loss over the recorded cycles (least squares through the origin)."""
+    cd = h["data"][cell]
+    mech = _nasa_spec(h.get("version", 2))[3]
+    s, pl, m = mech(h["params"], cd)
+    lp = 1 - (1 - s - pl) * (1 - m)
+    lm = 1 - np.asarray(cd["soh"], float)
+    ok = np.isfinite(lp) & np.isfinite(lm)
+    den = float(np.sum(lp[ok] ** 2))
+    return float(np.sum(lm[ok] * lp[ok]) / den) if den > 0 else 1.0
+
+
+def m3_operation_life(h: Dict[str, Any], cell: str, opt: Dict[str, Any], e: M3OperationEconomics,
+                      k_scale: Optional[float] = None) -> Dict[str, Any]:
+    """Simulate one life of `cell` operated at option opt (I_dis, V_cut, Ah, Wh out, Wh in, hours) until SOH reaches
+    e.soh_eol. Throughput per cycle = option's measured Ah moved (charge + discharge, the physics' axis) x SOH; SOH = 1 - k x physics loss(throughput, conditions)."""
+    cd = h["data"][cell]
+    mech = _nasa_spec(h.get("version", 2))[3]
+    k = m3_fade_scale(h, cell) if k_scale is None else k_scale
+    own_i, own_v = float(cd["I_dis"]), float(cd["V_cut"])
+    q_bol = float(opt["Ah moved"]) if np.isfinite(opt.get("Ah moved", np.nan)) else 2.0 * float(opt["Ah"])
+    a_max = e.max_cycles * q_bol / PINN_A_SCALE
+    grid = np.linspace(0.0, a_max, 4001)
+    cdx = _whatif_cd(cd, grid, I_dis=None if np.isclose(opt["I_dis"], own_i, atol=0.05) else opt["I_dis"],
+                     V_cut=None if abs(opt["V_cut"] - own_v) < 0.05 else opt["V_cut"])
+    s, pl, m = mech(h["params"], cdx)
+    loss = np.clip(k * (1 - (1 - s - pl) * (1 - m)), 0.0, 1.0)
+    a, soh_n, sohs = 0.0, 1.0, []
+    for _ in range(e.max_cycles):
+        sohs.append(soh_n)
+        a += q_bol * soh_n / PINN_A_SCALE
+        soh_n = 1.0 - float(np.interp(a, grid, loss))
+        if soh_n < e.soh_eol:
+            break
+    sohs = np.array(sohs)
+    cycles = len(sohs)
+    revenue = e.sell_price_per_Wh * float(opt["Wh out"]) * float(sohs.sum())
+    energy = e.sell_price_per_Wh * e.buy_price_ratio * float(opt["Wh in"]) * float(sohs.sum())
+    hours = cycles * (float(opt["hours"]) + e.rest_h)
+    return {"cycles": cycles, "hours": hours, "revenue": revenue, "energy cost": energy, "J_op": revenue - energy,
+            "J_op per hour": (revenue - energy) / hours if hours > 0 else np.nan, "reached EOL": soh_n < e.soh_eol,
+            "soh path": sohs}
+
+
+def m3_operation_study(h: Dict[str, Any], ct: pd.DataFrame, cell: str, e: M3OperationEconomics,
+                       groups: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+    """Every tested option for `cell`: life, J_op, and profit rate with a planned replacement at end of life. The
+    replacement cost is the same for all options: battery_cost_cycles x the OWN option's beginning-of-life J_op per
+    cycle (so it is one physical battery, priced once)."""
+    opts = m3_operation_options(h, ct, cell, groups)
+    if not len(opts):
+        return pd.DataFrame()
+    own = opts[opts["own"]]
+    ref = own.iloc[0] if len(own) else opts.iloc[0]
+    c_rep = e.battery_cost_cycles * e.sell_price_per_Wh * (ref["Wh out"] - e.buy_price_ratio * ref["Wh in"])
+    k = m3_fade_scale(h, cell)
+    rows = []
+    for _, o in opts.iterrows():
+        r = m3_operation_life(h, cell, o.to_dict(), e, k)
+        profit = r["J_op"] - c_rep
+        rows.append({"I_dis": o["I_dis"], "V_cut": o["V_cut"], "own": o["own"], "tested on": o["tested on"],
+                     "Wh out per cycle": o["Wh out"], "hours per cycle": o["hours"], "efficiency": o["efficiency"],
+                     "cycles to EOL": r["cycles"], "hours to EOL": r["hours"], "reached EOL": r["reached EOL"],
+                     "J_op": r["J_op"], "J_op per hour": r["J_op per hour"], "replacement cost": c_rep,
+                     "profit": profit, "profit rate (per hour)": profit / r["hours"] if r["hours"] > 0 else np.nan,
+                     "fade scale k": k, "flags": o["flags"]})
+    out = pd.DataFrame(rows).sort_values("profit rate (per hour)", ascending=False).reset_index(drop=True)
+    own_rate = out.loc[out["own"], "profit rate (per hour)"]
+    out["vs own (per hour)"] = out["profit rate (per hour)"] - float(own_rate.iloc[0]) if len(own_rate) else np.nan
+    return out

@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.32.0 · 2026-10-28
+# STATUS · handover for a new conversation · engine/app v5.34.0 · 2026-10-28
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,11 +9,11 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.32.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.32.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.34.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.34.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
-  tests/test_integrated_twin.py (12) + tests/test_m3_maintenance.py (5), v5.32.0
+  tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (4), v5.34.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
 - battery-twin.zip: complete local package (INSTALL.bat one-click Windows installer -> %USERPROFILE%\battery-twin-app,
   Desktop shortcut "Battery Digital Twin"; setup/run scripts for Windows and Mac; .streamlit/config.toml upload 1 GB)
@@ -631,13 +631,46 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   live): to fix in the live definition (fixed start cycle). 8 batteries: shares are indicative, not significant.
   Prices are assumed and swept; only the ranking across the sweep is claimed.
 
+## 5ax. Mission 3 · stage 2: operation (v5.33.0, engine section 57)
+- Knobs: discharge current and cut-off voltage; temperature = the battery's environment (not a control). Options =
+  only (current, cut-off) combinations NASA ran at the battery's tested temperature (each battery's own current,
+  rounded 0.5 A; cut-off 0.1 V). NASA varies the cut-off inside every temperature group (2.0/2.2/2.5/2.7 V): depth is
+  the best-identified knob; current varies only at 24 C (2 vs 4 A) and 4 C (1 vs 2 A).
+- Economics MEASURED per option (median of the first 10 valid cycles of the batteries run that way): Ah delivered,
+  Ah moved per cycle (cum_Ah, charge + discharge = the physics' axis), Wh out, Wh in, hours (discharge + CC + CV),
+  round-trip efficiency; scale with SOH over life. M3OperationEconomics: sell price per Wh, buy price ratio, battery
+  cost in own-option beginning-of-life J_op cycles (one physical battery, priced once), rest hours, EOL as SOH.
+- Ageing: shared physics v2 (hybrid) with the option's conditions, scaled by one factor k fitted to the battery's
+  measured fade (m3_fade_scale; corrects physics optimism); throughput cycle by cycle (m3_operation_life).
+  Bug found by the test and fixed: throughput per cycle must be Ah MOVED (~4.1 Ah), not Ah delivered (~2 Ah).
+- m3_operation_study: life, J_op, J_op per hour, profit rate with planned replacement at EOL, difference vs own
+  option; flags when the current or cut-off sensitivity is limited (at a bound).
+- Demo: ranking depends on the battery-cost ratio (S001: 1 A worse with cheap batteries, +9 % with realistic lives)
+  -> the plan's trade-off; must be swept on NASA.
+- scripts/m3_stage2.py: fits the shared physics on NASA (v2, Re, 30 starts, as the app), writes
+  whatif_identifiability.csv, physics_params.csv, measured_economics.csv, options.csv, operation_study.csv
+  (battery cost 30/60/120 x buy ratio 0.2/0.4/0.6 x EOL 0.7/0.8), best_option.csv.
+
+## 5ay. Mission 3 in the app (v5.34.0; user rule: everything runs in the platform, no Colab)
+- Operations & control = anomaly detection (unchanged) + Mission 3: "Prices and assumptions" (battery cost in cycles,
+  buy/sell price, unplanned x, lead time, end-of-life rule), "1. Operation" (selected battery: tested current x
+  cut-off options, chart + table, identifiability; button: every battery x 18 price settings -> which option is best,
+  CSV), "2. Maintenance" (button: replays the frozen forecast + detector on every constant-condition battery that
+  reached end of life; policies, share of the possible gain, replacement cycles, 27-setting sweep, CSV).
+- End-of-life rule "NASA convention": 1.4 Ah, or 80 % of initial when 1.4 Ah is within 2 % of initial or above it
+  (reproduces 5as/5aw: Reference 1.4 Ah, Hot/Cold 80 %). Alternative: control-bar setting.
+- Uses the twin's fleet-wide parts (shared physics v2, anomaly scan; same as the Integrated twin, saved in backup).
+- Old optimiser sections removed from the page (engine code kept, unused). Study results: M3 answers now from the
+  new studies. scripts/m3_stage2.py withdrawn (not uploaded).
+- Checks: AppTest of the page (build, option study, all-battery sweep, replacement study with both EOL rules, price
+  change, Study results), all pages, 21 tests, md_check 0.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.32.0 (twin_engine.py, app.py, tests/test_m3_maintenance.py, tests/test_integrated_twin.py).
-   Do NOT add scripts/m3_condition_check.py (set aside, 5aw).
-2. Stage 2 (operation): revenue and energy per cycle measured per tested condition (current, cut-off) from NASA;
-   extra fade from the shared physics (what-if machinery, tested values only); J_op per condition.
-3. Stage 3: joint operation x replacement, lifecycle profit, benefit vs fixed policies; Mission 3 app page.
-4. Open: B0045 / B0041 first FLEET alarm (Operations log); what-if identifiability table on NASA.
+1. USER: upload v5.34.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_operation.py);
+   in the app: Operations & control -> build fleet parts -> "Run for every battery and price setting" (download CSV)
+   -> "Run the replacement study" (NASA convention; download CSV); send both CSVs + screenshot of the
+   identifiability table and the replacement summary.
+2. Stage 3: joint operation x replacement, lifecycle profit, benefit; fixed forecast start (live definition, 5aw).
 3. Writing (after the twin is finished, user decision): Mission 2 chapter, physics-phase chapter, Mission 3 chapter.
 4. Optional: Mixed assessment run for PINN all inputs; PyBaMM benchmark.
 
