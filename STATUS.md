@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.31.0 · 2026-10-27
+# STATUS · handover for a new conversation · engine/app v5.32.0 · 2026-10-28
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,11 +9,11 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.31.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.31.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.32.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.32.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
-  tests/test_integrated_twin.py (12, v5.31.0)
+  tests/test_integrated_twin.py (12) + tests/test_m3_maintenance.py (5), v5.32.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
 - battery-twin.zip: complete local package (INSTALL.bat one-click Windows installer -> %USERPROFILE%\battery-twin-app,
   Desktop shortcut "Battery Digital Twin"; setup/run scripts for Windows and Mac; .streamlit/config.toml upload 1 GB)
@@ -565,11 +565,79 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - Demo (Reference, EOL 80 %; synthetic, not evidence): EOL error median / q50 / q75 / q90: S002 6.8 / 4.2 / 4.5 / 5.0;
   S005 17.8 / 8.1 / 9.0 / 9.7; S008 5.8 / 3.7 / 5.1 / 6.4; bias falls from +6..+18 to about 0..+3.
 
+## 5au. Conservative end of life on NASA (v5.31.0; 13 timelines; same EOL settings as 5as) -> NOT ADOPTED
+- EOL error / bias (cycles; median | q50 | q75 | q90): B0005 7.7/+2.7 | 14.9/-9.1 | 16.3/-10.9 | 17.2/-12.0 ·
+  B0006 11.5/+9.5 | 17.2/-6.4 | 18.1/-8.2 | 18.9/-9.2 · B0018 7.2/+4.1 | 8.7/+1.3 | 11.4/-2.9 | 14.2/-8.4 ·
+  B0046 5.5/+5.2 | 5.0/+2.9 | 3.8/+1.6 | 3.7/+1.3 · B0048 8.3/+7.2 | 7.5/+5.5 | 5.2/+1.7 | 3.6/-1.1 ·
+  B0041, B0045, B0047: unchanged (EOL 7-8 cycles after the forecast starts: fewer than 10 comparisons before EOL).
+  Mean of 8: median 6.2, q50 7.8, q75 8.0, q90 8.4.
+- Reference: overcorrects (bias flips to -6..-12, error doubles). Cause: the optimism rate is learned on short
+  horizons (5-20 cycles; the forecast starts at 50) and applied linearly 60-90 cycles ahead. B0005 at 58: median 145,
+  conservative 101, true 126; rate 0.17 points/cycle, decays to ~0 by cycle 106, where both agree. The common test event
+  (73-100) and regenerations also inflate it.
+- Cold: q75/q90 help where there is history (B0046, B0048: error -30 to -55 %), but warning timing is unchanged.
+- Hot: no EOL to score; q90 would put B0030 and B0032 on Watch at 22 and 34 with SOH 87-92 % (likely too early); q75 never.
+- Warnings: conservative moves Reference Watch 9-24 cycles earlier (B0006 61 vs 85; true EOL 110), i.e. 36-49 cycles
+  ahead for a 20-cycle window: earlier than useful.
+- DECISION: default stays "Median forecast"; the option stays in the app as experimental, documented here. Report the
+  late bias of the median (5as) together with this negative result. Possible fix not pursued: apply the correction
+  only up to the horizons where it was measured (no linear extrapolation); would need a new NASA run.
+
+## 5av. Review against the research plan + Mission 3 optimisation check (2026-10-28)
+- Plan (Internship_Research_Plan, project_master_context): M3 = optimisation (J_op = revenue - energy cost,
+  J_maint = maintenance cost + performance loss, profit; trade-off aggressive operation / faster degradation /
+  delayed maintenance; deliverables: integrated optimisation framework, demonstration case study, "what benefit?").
+  Option B work (5ah-5au) covers monitoring (forecast, anomalies, explanation, what-if), not the optimisation.
+- The optimiser exists (Operations: twin-aware policy, integrated O&M grid, DP, mismatch study; built before Mission 2
+  closed; no NASA results in STATUS). Its plant takes Ea, current exponent and cold multiplier from
+  stress_factor_regression; maintenance hazard, prices and downtimes are ASSUMED values.
+- Regression issues (code review): pools all 34 cells incl. Mixed and NASA-flagged B0049-56; 24 C current effect rests
+  on B0033/B0034 (4 A, different cut-offs); cell-level bootstrap ignores campaign clustering (CI too narrow);
+  Arrhenius on cell T + cold flag on ambient partly collinear; "early fade" = first half of record (20 cycles Hot,
+  84 Reference).
+- NASA does vary current at fixed temperature: 24 C 2 A (B0005-7, 18, 36) vs 4 A (B0033, 34); 4 C 1 A (B0045-48) vs
+  2 A (B0049-56, flagged). So the shared physics' a_I = 0 (lower bound) likely means "no extra fade per Ah at higher
+  current", not "cannot tell": the what-if wording "limited" must be revised once confirmed.
+- Optimiser sensitivity (generic cell, demo engine): best operation flips with the current exponent (0 -> fixed 4 A,
+  0.5 -> 4 A, 1 -> 2 A); replacement SOH 0.72 in all cases (driven by the ASSUMED hazard onset 0.68). Twin-aware
+  greedy policy below best fixed current by 2-12 % (generic) but +52 % ... 0 % on a calibrated demo plant: the benefit
+  depends on the law -> must be decided on NASA. DP (lifetime-optimal by construction) is the real optimiser.
+- scripts/m3_condition_check.py (new): per-cell fade (half record and first 40 cycles), regressions on 3 subsets x
+  2 windows x cell/group bootstrap, leave-one-group-out, current contrasts at fixed temperature, calibrated plant,
+  optimiser sensitivity over the current exponent. Demo dry run OK (68 s).
+
+## 5aw. MISSION 3 REBUILT on the validated twin (user decision 2026-10-28)
+- DECISION: the pre-Mission-2 optimiser (Operations: plant, twin-aware greedy policy, O&M grid, DP, mismatch) and
+  scripts/m3_condition_check.py are SET ASIDE. Mission 3 is rebuilt from the plan's objectives in three stages:
+  1 maintenance (when to replace) on the real NASA lives with the twin's own forecasts; 2 operation (current, cut-off)
+  with NASA-measured revenue/energy per condition and the shared physics' fade differences, tested conditions only;
+  3 integrated (joint choice, lifecycle profit, "what benefit?") + app page.
+- Stage 1 (engine section 56, v5.32.0): M3Economics (revenue per cycle x SOH = performance loss; planned replacement
+  = battery_cost_cycles of new-battery revenue; unplanned x unplanned_factor + lead-time downtime), m3_life_profit,
+  m3_twin_policy (order when forecast EOL within lead + margin; optional alarm and age-limit fallback), m3_oracle
+  (best replacement in hindsight), m3_fixed_age, m3_maintenance_study (leave-one-out: twin margin on the other
+  batteries, fixed age on the other batteries of the same group). Input = integrated timelines.
+- NASA (8 batteries that reached EOL: B0005, B0006, B0018, B0041, B0045-48; v5.31.0 timelines; default: battery
+  = 60 cycles of revenue, unplanned x3, lead 10): share of the perfect-knowledge gain over run-to-EOL: twin 0.42,
+  twin + age limit 0.40, best fixed age 0.11, run to EOL 0. Unplanned: twin 3/8, fixed 5/8, run to EOL 8/8.
+  Twin replaces 9-21 cycles before EOL in Reference (B0005 117 vs 126, B0006 99 vs 110, B0018 89 vs 98).
+- Sweep (battery 30/60/120 cycles x unplanned 1.5/3/5 x lead 5/10/20): twin above best fixed age in 26/26 settings
+  with room to gain; twin share 0.33-0.86 (lead 5: 0.64-0.86, lead 20: 0.33-0.50 apart from cheap unplanned);
+  fixed age 0.09-0.14 when unplanned >= 3x, negative when unplanned is cheap. Margin chosen: 5 cycles (matches
+  the late bias, 5as).
+- Limits: 3 Cold batteries (B0041, B0045, B0047) are always unplanned for lead >= 10: EOL comes within a few cycles
+  of the forecast start (30 % of the record), so no forecast can warn in time; the age fallback does not help (Cold
+  lives 29-60 cycles, too variable). The forecast start at 30 % of the record uses the record length (not known
+  live): to fix in the live definition (fixed start cycle). 8 batteries: shares are indicative, not significant.
+  Prices are assumed and swept; only the ranking across the sweep is claimed.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.31.0 (twin_engine.py, app.py, tests/test_integrated_twin.py); CI green; reboot.
-2. USER: re-download the 13 timelines (same EOL settings as 5as; "Watch uses" = Conservative 75 %; the CSV holds all
-   three quantiles anyway). Judge: EOL error and bias per quantile vs median (5as), warning lead time, Watch never
-   firing too early. Also: Operations event log for B0045 / B0041 first FLEET alarm.
+1. USER: upload v5.32.0 (twin_engine.py, app.py, tests/test_m3_maintenance.py, tests/test_integrated_twin.py).
+   Do NOT add scripts/m3_condition_check.py (set aside, 5aw).
+2. Stage 2 (operation): revenue and energy per cycle measured per tested condition (current, cut-off) from NASA;
+   extra fade from the shared physics (what-if machinery, tested values only); J_op per condition.
+3. Stage 3: joint operation x replacement, lifecycle profit, benefit vs fixed policies; Mission 3 app page.
+4. Open: B0045 / B0041 first FLEET alarm (Operations log); what-if identifiability table on NASA.
 3. Writing (after the twin is finished, user decision): Mission 2 chapter, physics-phase chapter, Mission 3 chapter.
 4. Optional: Mixed assessment run for PINN all inputs; PyBaMM benchmark.
 

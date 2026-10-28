@@ -1,9 +1,17 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.31.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.32.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Mission 3 rebuilt, stage 1: maintenance on the real lives (v5.32.0)
+
+1. Engine section 56: M3Economics, m3_life_profit, m3_twin_policy, m3_oracle, m3_fixed_age, m3_maintenance_study.
+   Replacement decisions replayed on each battery's measured life using only what the twin knew at each cycle;
+   all data-driven choices leave-one-out. The earlier optimiser is set aside (STATUS 5aw).
+2. tests/test_m3_maintenance.py (5): costs and downtime, twin policy (lead, margin, late forecast), age fallback,
+   oracle bound, leave-one-out choice independent of the scored battery.
 
 ## Conservative end of life for Watch (v5.31.0)
 

@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.31.0"
+ENGINE_VERSION = "5.32.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10998,3 +10998,154 @@ def whatif_projection(h: Dict[str, Any], cell: str, soh_eol: float, T_C: Optiona
             "limited": [k for k, v in chosen.items() if v is not None and ident.loc[k, "status"] == "limited"],
             "version": version}
     return out, summ
+
+
+
+# =============================================================================
+# 56. MISSION 3 (rebuilt on the validated twin) · STAGE 1: MAINTENANCE ON THE REAL NASA LIVES
+# =============================================================================
+# The plan: J_maint = maintenance cost + performance loss; profit = revenue - energy cost - maintenance cost.
+# Stage 1 decides WHEN to replace, on each battery's real measured life, using only what the twin knew at each cycle
+# (integrated_timeline: forecast end of life, status). Revenue per cycle is proportional to the measured SOH (a faded
+# battery delivers less: the performance loss). Prices are inputs (NASA has none); results are swept over them.
+# Every choice made from data is made WITHOUT the battery being scored (leave-one-out): the twin's safety margin
+# (pooled over the other batteries) and the fixed replacement age (other batteries of the same group).
+# Policies: perfect knowledge (best replacement cycle in hindsight, upper bound), twin-informed, best fixed age,
+# run to end of life (replace only when end of life is measured: always unplanned).
+
+
+@dataclass
+class M3Economics:
+    revenue_per_cycle: float = 1.0          # revenue of one cycle of a NEW battery (SOH 1); scales everything
+    battery_cost_cycles: float = 60.0       # planned replacement cost, in cycles of new-battery revenue
+    unplanned_factor: float = 3.0           # unplanned replacement costs this many times a planned one
+    lead_cycles: int = 10                   # cycles between ordering and installing a replacement
+    energy_cost_frac: float = 0.0           # energy cost as a fraction of revenue (J_op = revenue - energy cost)
+
+    def __post_init__(self) -> None:
+        if self.battery_cost_cycles < 0 or self.unplanned_factor < 1 or self.lead_cycles < 0:
+            raise ValueError("M3Economics: costs >= 0, unplanned_factor >= 1, lead_cycles >= 0")
+
+
+def m3_life_profit(n: np.ndarray, soh: np.ndarray, t_rep: float, unplanned: bool, e: M3Economics) -> Dict[str, float]:
+    """One battery life ended by a replacement at cycle t_rep. J_op = revenue - energy cost over the cycles used
+    (revenue x SOH: performance loss included); J_maint = replacement cost (x unplanned_factor if unplanned) + revenue
+    lost while waiting for the part (lead time, unplanned only). Profit rate = profit per cycle of calendar time."""
+    used = n <= t_rep
+    j_op = e.revenue_per_cycle * (1 - e.energy_cost_frac) * float(np.nansum(soh[used]))
+    down = float(e.lead_cycles) if unplanned else 0.0
+    j_maint = e.battery_cost_cycles * e.revenue_per_cycle * (e.unplanned_factor if unplanned else 1.0)
+    cycles = float(used.sum())
+    profit = j_op - j_maint
+    return {"replace at": float(t_rep), "unplanned": bool(unplanned), "cycles used": cycles, "downtime": down,
+            "J_op": j_op, "J_maint": j_maint, "profit": profit,
+            "profit rate": profit / (cycles + down) if cycles + down > 0 else np.nan}
+
+
+def _m3_series(tl: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    d = tl.sort_values("cycle")
+    return d["cycle"].to_numpy(float), d["SOH measured"].to_numpy(float)
+
+
+def m3_twin_policy(tl: pd.DataFrame, eol_cycle: float, e: M3Economics, margin: float = 0.0,
+                   use_alarm: bool = False, age_limit: Optional[float] = None) -> Dict[str, Any]:
+    """Twin-informed replacement: at the first cycle where the forecast end of life is within lead + margin cycles
+    (or the status is Alarm, with use_alarm; or, with age_limit, the age at which a replacement must be ordered to
+    arrive at that age: the fallback before the twin has a forecast), order a replacement; it is installed lead cycles later. If the battery
+    reaches end of life first, the replacement is unplanned at end of life. Uses only what the twin knew."""
+    n, soh = _m3_series(tl)
+    d = tl.sort_values("cycle")
+    fire = (d["EOL forecast"] - d["cycle"]) <= e.lead_cycles + margin
+    if use_alarm and "status" in d:
+        fire = fire | (d["status"] == "Alarm")
+    if age_limit is not None and np.isfinite(age_limit):
+        fire = fire | (d["cycle"] >= age_limit - e.lead_cycles)  # age rule: ordered so it arrives at the age limit
+    fire = fire & (d["cycle"] < eol_cycle)
+    if fire.any():
+        ordered = float(d.loc[fire, "cycle"].iloc[0])
+        t = ordered + e.lead_cycles
+        out = m3_life_profit(n, soh, eol_cycle, True, e) if t > eol_cycle else m3_life_profit(n, soh, t, False, e)
+        out["ordered at"] = ordered
+    else:
+        out = m3_life_profit(n, soh, eol_cycle, True, e)
+        out["ordered at"] = np.nan
+    return out
+
+
+def m3_oracle(tl: pd.DataFrame, eol_cycle: float, e: M3Economics) -> Dict[str, Any]:
+    """Best planned replacement cycle in hindsight (any cycle up to end of life): the upper bound."""
+    n, soh = _m3_series(tl)
+    cand = [m3_life_profit(n, soh, t, False, e) for t in n[(n >= n[0] + 1) & (n <= eol_cycle)]]
+    return max(cand, key=lambda r: r["profit rate"]) if cand else m3_life_profit(n, soh, eol_cycle, False, e)
+
+
+def m3_fixed_age(tl: pd.DataFrame, eol_cycle: float, age: float, e: M3Economics) -> Dict[str, Any]:
+    n, soh = _m3_series(tl)
+    return m3_life_profit(n, soh, eol_cycle, True, e) if age > eol_cycle else m3_life_profit(n, soh, age, False, e)
+
+
+def m3_maintenance_study(lives: Dict[str, Tuple[pd.DataFrame, str, float]], e: M3Economics,
+                         margins: Sequence[float] = (0, 5, 10, 15, 20, 30),
+                         use_alarm: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """lives: battery -> (integrated timeline, group, measured end-of-life cycle); only batteries that reached end of
+    life. Leave-one-out: the twin's margin maximises the mean profit rate of the OTHER batteries (all groups); the
+    fixed age maximises it over the other batteries of the SAME group (candidate ages = their cycles). Returns
+    (per battery x policy, per policy summary with the share of the perfect-knowledge gain over run-to-end-of-life
+    that each policy captures)."""
+    def _best(score: Dict[float, float]) -> float:
+        ok = {k: v for k, v in score.items() if np.isfinite(v)}
+        return max(ok, key=ok.get) if ok else np.nan
+
+    def _mean(vals: List[float]) -> float:
+        v = [x for x in vals if np.isfinite(x)]
+        return float(np.mean(v)) if len(v) == len(vals) and v else np.nan   # an age some battery never reached: invalid
+
+    rows = []
+    bats = sorted(lives)
+    for b in bats:
+        tl, grp, E = lives[b]
+        others = [o for o in bats if o != b]
+        same = [o for o in others if lives[o][1] == grp]
+        a_b = np.nan                                       # fixed age, chosen on the other batteries of the group
+        if same:
+            start = max(float(_m3_series(lives[o][0])[0][0]) for o in same)
+            ages = sorted({float(x) for o in same for x in _m3_series(lives[o][0])[0] if start + 1 <= x})
+            a_b = _best({a: _mean([m3_fixed_age(lives[o][0], lives[o][2], a, e)["profit rate"] for o in same])
+                         for a in ages})
+        m_b = _best({m: _mean([m3_twin_policy(lives[o][0], lives[o][2], e, m, use_alarm)["profit rate"]
+                               for o in others]) for m in margins}) if others else margins[0]
+        m_c = m_b
+        if same and others:                                # twin + age limit: margin re-chosen with the age rule on
+            def _age_for(o: str) -> float:
+                so = [x for x in others if x != o and lives[x][1] == lives[o][1]]
+                if not so:
+                    return np.nan
+                st_ = max(float(_m3_series(lives[x][0])[0][0]) for x in so)
+                ag = sorted({float(x) for x_ in so for x in _m3_series(lives[x_][0])[0] if st_ + 1 <= x})
+                return _best({a: _mean([m3_fixed_age(lives[x][0], lives[x][2], a, e)["profit rate"] for x in so])
+                              for a in ag})
+            ages_o = {o: _age_for(o) for o in others}
+            m_c = _best({m: _mean([m3_twin_policy(lives[o][0], lives[o][2], e, m, use_alarm, ages_o[o])["profit rate"]
+                                   for o in others]) for m in margins})
+        pol = {"perfect knowledge": m3_oracle(tl, E, e),
+               "twin-informed": {**m3_twin_policy(tl, E, e, m_b, use_alarm), "chosen margin": m_b},
+               "run to end of life": m3_life_profit(*_m3_series(tl), E, True, e)}
+        if np.isfinite(a_b):
+            pol["best fixed age"] = {**m3_fixed_age(tl, E, a_b, e), "chosen age": a_b}
+            pol["twin + age limit"] = {**m3_twin_policy(tl, E, e, m_c if np.isfinite(m_c) else m_b, use_alarm, a_b),
+                                       "chosen margin": m_c, "chosen age": a_b}
+        for name, r in pol.items():
+            rows.append({"battery": b, "group": grp, "end of life": E, "policy": name, **r})
+    per = pd.DataFrame(rows)
+    base = per[per["policy"] == "run to end of life"].set_index("battery")["profit rate"]
+    best = per[per["policy"] == "perfect knowledge"].set_index("battery")["profit rate"]
+    summ = []
+    for name, g in per.groupby("policy"):
+        g = g.set_index("battery")
+        gain = (g["profit rate"] - base.reindex(g.index)).sum()
+        room = (best.reindex(g.index) - base.reindex(g.index)).sum()
+        summ.append({"policy": name, "batteries": len(g), "mean profit rate": g["profit rate"].mean(),
+                     "unplanned": int(g["unplanned"].sum()), "mean unused life (cycles)":
+                     float((g["end of life"] - g["replace at"]).clip(lower=0).mean()),
+                     "share of perfect-knowledge gain": gain / room if room > 0 else np.nan})
+    return per, pd.DataFrame(summ).set_index("policy").sort_values("mean profit rate", ascending=False)
