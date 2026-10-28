@@ -1,9 +1,18 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.30.1)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.31.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Conservative end of life for Watch (v5.31.0)
+
+1. "Watch uses": Median forecast (default) or Conservative 50 / 75 / 90 %. The conservative forecast is today's
+   forecast made to fade faster by the q-quantile of how optimistic the twin's own forecasts of this battery were over
+   the last 40 cycles (causal; never more optimistic than the median; median until 10 comparisons exist).
+2. Engine: forecast_optimism, conservative_eol, CONSERVATIVE_QS; integrated_snapshot / integrated_timeline take
+   watch_q; the timeline reports the conservative end of life for all three quantiles.
+3. Tests: 12 (rate learned and causal, optimism corrected and Watch earlier, never more optimistic, fallback).
 
 ## Integrated twin fixes after the first NASA run (v5.30.1)
 

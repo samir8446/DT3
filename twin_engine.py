@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.30.1"
+ENGINE_VERSION = "5.31.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10704,19 +10704,58 @@ def _shares_from_traj(tr: Optional[pd.DataFrame], n: float) -> Optional[Dict[str
     return out
 
 
+CONSERVATIVE_QS = (0.5, 0.75, 0.9)        # quantiles of the twin's own past optimism (timeline reports all three)
+
+
+def forecast_optimism(frames: Optional[Dict[int, Tuple[np.ndarray, ...]]], measured: Optional[pd.DataFrame],
+                      n: float, window: int = 40, min_h: int = 5) -> np.ndarray:
+    """The twin's own track record up to cycle n (causal). For every forecast origin m in [n - window, n) and every
+    valid cycle j with m + min_h <= j <= n: rate = (forecast made at m for j - measured SOH at j) / (j - m), in SOH
+    (fraction) per cycle ahead. Positive = the forecast faded too slowly (optimistic)."""
+    if not frames or measured is None or not len(measured):
+        return np.array([])
+    m_ = measured[measured["n"] <= n]
+    nj, yj = m_["n"].to_numpy(float), m_["SOH"].to_numpy(float)
+    out = []
+    for m in (k for k in frames if n - window <= k < n):
+        fut, med = frames[m][0], frames[m][1]
+        sel = nj >= m + min_h
+        if sel.any() and len(fut):
+            pred = np.interp(nj[sel], fut, med)
+            out.append((pred - yj[sel]) / (nj[sel] - m))
+    return np.concatenate(out) if out else np.array([])
+
+
+def conservative_eol(frame: Tuple[np.ndarray, ...], origin: float, rates: np.ndarray, q: float, soh_eol: float,
+                     min_pairs: int = 10) -> Tuple[float, float]:
+    """End of life of today's forecast shifted by the q-quantile of the past optimism rate (never shifted toward
+    optimism: rate floored at 0). Returns (end-of-life cycle, rate used in SOH points per cycle); with fewer than
+    min_pairs past comparisons the rate is NaN and the end of life is the median one."""
+    fut, med = frame[0], frame[1]
+    if len(rates) < min_pairs:
+        return _first_below(fut, med, soh_eol), np.nan
+    b = max(float(np.quantile(rates, q)), 0.0)
+    return _first_below(fut, med - b * (fut - origin), soh_eol), 100 * b
+
+
 def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFrame] = None,
                         frames: Optional[Dict[int, Tuple[np.ndarray, ...]]] = None,
                         anomaly: Optional[pd.DataFrame] = None, common: Optional[Dict[float, List[str]]] = None,
                         traj_main: Optional[pd.DataFrame] = None, traj_check: Optional[pd.DataFrame] = None,
-                        watch_cycles: int = 20) -> Dict[str, Any]:
+                        watch_cycles: int = 20, watch_q: Optional[float] = None) -> Dict[str, Any]:
     """What the integrated twin says about one battery at cycle n ("today").
     measured: valid cycles (columns n, SOH); frames: frozen_stream frames; anomaly: anomaly_replay2 of this battery,
     common: its common-cause onsets; traj_main / traj_check: hybrid_trajectory of the main (v2) and check (v3) physics.
     Forecast and detector use only cycles <= n. The status is the most severe of: end of life reached (measured),
-    detector alarm, common test event or forecast end of life (early edge of the band) within watch_cycles."""
+    detector alarm, common test event or forecast end of life within watch_cycles: the median forecast, or with
+    watch_q the conservative one (today's forecast shifted by the watch_q-quantile of the twin's own past optimism,
+    v5.31.0). The conservative end of life is reported for every CONSERVATIVE_QS whatever watch_q is."""
     out: Dict[str, Any] = {"cycle": float(n), "SOH measured": np.nan, "forecast from": np.nan, "EOL forecast": np.nan,
                            "EOL early": np.nan, "EOL late": np.nan, "remaining cycles": np.nan, "EOL reached at": np.nan,
-                           "forecast horizon": np.nan, "band half-width (points)": np.nan, "detector": None, "status": INTEGRATED_STATUS[0], "reason": "", "shares": None,
+                           "forecast horizon": np.nan, "band half-width (points)": np.nan, "calibration pairs": 0,
+                           **{f"EOL conservative q{int(100 * q)}": np.nan for q in CONSERVATIVE_QS},
+                           **{f"optimism q{int(100 * q)} (points/cycle)": np.nan for q in CONSERVATIVE_QS},
+                           "EOL for watch": np.nan, "watch basis": "median forecast", "detector": None, "status": INTEGRATED_STATUS[0], "reason": "", "shares": None,
                            "shares check": None, "split gap (points)": np.nan, "dominant": None,
                            "explanation causal": False}
     if measured is not None and len(measured):
@@ -10733,6 +10772,12 @@ def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFram
             out["forecast from"] = float(k)
             out["forecast horizon"] = float(fut[-1]) if len(fut) else np.nan
             out["band half-width (points)"] = 50 * float(hi[0] - lo[0]) if len(fut) else np.nan
+            rates = forecast_optimism(frames, measured, n)
+            out["calibration pairs"] = int(len(rates))
+            for q in CONSERVATIVE_QS:
+                e_q, b_q = conservative_eol(frames[k], k, rates, q, soh_eol)
+                out[f"EOL conservative q{int(100 * q)}"] = e_q
+                out[f"optimism q{int(100 * q)} (points/cycle)"] = b_q
             out["EOL forecast"] = _first_below(fut, med, soh_eol)
             out["EOL early"] = _first_below(fut, lo, soh_eol)
             out["EOL late"] = _first_below(fut, hi, soh_eol)
@@ -10753,6 +10798,18 @@ def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFram
         out["dominant"] = max(mech, key=lambda m_: mech[m_] if np.isfinite(mech[m_]) else -1)
     if sh and sh2:
         out["split gap (points)"] = 100 * max(abs(sh[m] - sh2[m]) for m in (MECHANISMS[0], MECHANISMS[2]))
+    out["EOL for watch"] = out["EOL forecast"]
+    if watch_q is not None and np.isfinite(out["forecast from"]):
+        tag = f"q{int(100 * watch_q)}"
+        if f"EOL conservative {tag}" not in out:
+            e_q, b_q = conservative_eol(frames[int(out["forecast from"])], out["forecast from"],
+                                        forecast_optimism(frames, measured, n), watch_q, soh_eol)
+            out[f"EOL conservative {tag}"], out[f"optimism {tag} (points/cycle)"] = e_q, b_q
+        if np.isfinite(out[f"optimism {tag} (points/cycle)"]):
+            out["EOL for watch"] = out[f"EOL conservative {tag}"]
+            out["watch basis"] = f"conservative {int(100 * watch_q)} %"
+        else:
+            out["watch basis"] = "median forecast: too little track record for the conservative estimate"
     # status, most severe first
     if np.isfinite(out["EOL reached at"]):
         out["status"] = INTEGRATED_STATUS[3]
@@ -10762,9 +10819,10 @@ def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFram
     elif verdict == DETECTION_STATUS[4]:
         out["status"] = INTEGRATED_STATUS[1]
         out["reason"] = "common test event: fade steepened at the same time in other batteries of the campaign"
-    elif np.isfinite(out["EOL forecast"]) and out["EOL forecast"] - float(n) <= watch_cycles:
+    elif np.isfinite(out["EOL for watch"]) and out["EOL for watch"] - float(n) <= watch_cycles:
         out["status"] = INTEGRATED_STATUS[1]
-        out["reason"] = f"end of life forecast within {watch_cycles} cycles (cycle {out['EOL forecast']:.0f})"
+        out["reason"] = (f"end of life forecast within {watch_cycles} cycles (cycle {out['EOL for watch']:.0f}, "
+                         f"{out['watch basis']})")
     elif np.isfinite(out["EOL early"]) and out["EOL early"] - float(n) <= watch_cycles:
         # v5.30.1: the band's early edge no longer sets Watch (NASA B0005: the frozen MLP's band is about +-15 points
         # already one cycle ahead, so its early edge sat 1-6 cycles ahead for 60 cycles); it is reported instead
@@ -10783,11 +10841,12 @@ def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFram
 def integrated_timeline(soh_eol: float, measured: pd.DataFrame, frames: Optional[Dict[int, Tuple[np.ndarray, ...]]],
                         anomaly: Optional[pd.DataFrame] = None, common: Optional[Dict[float, List[str]]] = None,
                         traj_main: Optional[pd.DataFrame] = None, traj_check: Optional[pd.DataFrame] = None,
-                        watch_cycles: int = 20) -> pd.DataFrame:
+                        watch_cycles: int = 20, watch_q: Optional[float] = None) -> pd.DataFrame:
     """integrated_snapshot at every measured cycle, as a flat table (for the report and the tests)."""
     rows = []
     for n in measured.sort_values("n")["n"].to_numpy(float):
-        s = integrated_snapshot(n, soh_eol, measured, frames, anomaly, common, traj_main, traj_check, watch_cycles)
+        s = integrated_snapshot(n, soh_eol, measured, frames, anomaly, common, traj_main, traj_check, watch_cycles,
+                                watch_q)
         r = {k: v for k, v in s.items() if k not in ("shares", "shares check")}
         for tag, sh in (("", s["shares"]), (" [check]", s["shares check"])):
             for m in (*MECHANISMS, HYBRID_UNEXPLAINED):

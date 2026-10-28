@@ -47,7 +47,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.30.1"
+REQUIRED_ENGINE = "5.31.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -62,7 +62,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay", "pinn_state_raw", "hybrid_portable", "integrated_snapshot", "integrated_timeline", "whatif_identifiability", "whatif_tested", "whatif_projection")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay", "pinn_state_raw", "hybrid_portable", "integrated_snapshot", "integrated_timeline", "whatif_identifiability", "whatif_tested", "whatif_projection", "forecast_optimism", "conservative_eol")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -6947,6 +6947,8 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # =============================================================================
 TWIN_STATUS_COLORS = {"Normal": "#009E73", "Watch": "#E69F00", "Alarm": "#CC0000", "End of life reached": "#6B1E1E"}
 TWIN_HYB = dict(restarts=30, fit_with="Re", lam=0.3)        # the Models view's defaults: both views share one result
+TWIN_WATCH_BASIS = {"Median forecast": None, "Conservative 50 %": 0.5, "Conservative 75 %": 0.75,
+                    "Conservative 90 %": 0.9}
 TWIN_PARTS = {"main": "Explanation (physics version 2)", "check": "Explanation check (physics version 3)",
               "scan": "Anomaly detection", "fleet": "Fleet-wide parts"}
 
@@ -7028,7 +7030,7 @@ def twin_battery_parts(c: str) -> Dict[str, Any]:
 def fig_twin(n: int, meas: pd.DataFrame, removed: pd.DataFrame, future: Optional[pd.DataFrame],
              status: Optional[List[str]], an_n: Optional[np.ndarray], frame: Optional[Tuple[np.ndarray, ...]],
              snap: Dict[str, Any], traj: Optional[pd.DataFrame], P: Palette, c: str, soh_eol_c: float,
-             x_max: float) -> go.Figure:
+             x_max: float, cons_b: float = float("nan"), watch_q: Optional[float] = None) -> go.Figure:
     """Top: measured SOH up to today (coloured by the detector), today's forecast with its band and end-of-life
     estimate. Bottom: where the capacity went (explanation), up to today."""
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.62, 0.38],
@@ -7066,6 +7068,18 @@ def fig_twin(n: int, meas: pd.DataFrame, removed: pd.DataFrame, future: Optional
                                  name="Forecast band", hoverinfo="skip"), 1, 1)
         fig.add_trace(go.Scatter(x=fut[keep], y=100 * med[keep], name="Forecast (frozen model, from today)", mode="lines",
                                  line=dict(color="#D55E00", width=2.4, dash="dash")), 1, 1)
+        if np.isfinite(cons_b) and watch_q is not None:
+            cons = med - cons_b / 100 * (fut - snap["forecast from"])
+            fig.add_trace(go.Scatter(x=fut[keep], y=100 * cons[keep], mode="lines",
+                                     name=f"Conservative {int(100 * watch_q)} % (own track record)",
+                                     line=dict(color="#CC79A7", width=2, dash="dot")), 1, 1)
+            ec = snap.get(f"EOL conservative q{int(100 * watch_q)}", float("nan"))
+            if np.isfinite(ec) and not np.isfinite(snap["EOL reached at"]):
+                fig.add_trace(go.Scatter(x=[ec], y=[100 * soh_eol_c], mode="markers", name="Conservative end of life",
+                                         marker=dict(symbol="diamond-open", size=12, color="#CC79A7",
+                                                     line=dict(width=2)),
+                                         hovertemplate="conservative end of life: cycle %{x:.0f}<extra></extra>"),
+                              1, 1)
         e, e_lo, e_hi = snap["EOL forecast"], snap["EOL early"], snap["EOL late"]
         if np.isfinite(e) and not np.isfinite(snap["EOL reached at"]):
             fig.add_trace(go.Scatter(
@@ -7255,7 +7269,7 @@ def view_twin() -> None:
     frames = bp["frames"]
 
     ns = meas["n"].astype(int).tolist()
-    c1, c2, c3 = st.columns([3.2, 1.2, 1.2], vertical_alignment="bottom")
+    c1, c2, c3, c4 = st.columns([3.0, 1.1, 1.1, 1.5], vertical_alignment="bottom")
     n = int(c1.select_slider("Today (discharge cycle)", options=ns, value=ns[-1], key=f"itw_n_{cell}",
                              help="Everything up to this cycle is known to the twin; the forecast starts here."))
     reveal = c2.toggle("Show later measurements", value=False, key="itw_reveal",
@@ -7263,7 +7277,13 @@ def view_twin() -> None:
     watch = int(c3.select_slider("Watch window (cycles)", [10, 20, 30, 50], value=20, key="itw_watch",
                                  help="Status 'Watch' when the early edge of the forecast band reaches end of life "
                                       "within this many cycles."))
-    snap = te.integrated_snapshot(n, soh_eol_c, meas, frames, an, common, t_main, t_check, watch)
+    basis = c4.selectbox("Watch uses", list(TWIN_WATCH_BASIS), index=0, key="itw_basis",
+                         help="Median: today's forecast as it is. Conservative: today's forecast made to fade faster "
+                              "by how much the twin's own forecasts of this battery were too optimistic over the last "
+                              "40 cycles (50, 75 or 90 % quantile of that past error). Needs at least 10 past "
+                              "comparisons; before that the median is used. Changes Watch only, not the forecast.")
+    watch_q = TWIN_WATCH_BASIS[basis]
+    snap = te.integrated_snapshot(n, soh_eol_c, meas, frames, an, common, t_main, t_check, watch, watch_q)
 
     k = st.columns(5)
     k[0].metric("Today", f"cycle {n}", delta=f"of {ns[-1]} recorded", delta_color="off")
@@ -7278,6 +7298,11 @@ def view_twin() -> None:
     elif np.isfinite(e):
         band = (f"band {e_lo:.0f}–{e_hi:.0f}" if np.isfinite(e_lo) and np.isfinite(e_hi) else
                 f"band from {e_lo:.0f}" if np.isfinite(e_lo) else None)
+        if watch_q is not None:
+            ec = snap.get(f"EOL conservative q{int(100 * watch_q)}", float("nan"))
+            band = (f"conservative {int(100 * watch_q)} %: cycle {ec:.0f}" if np.isfinite(ec) and
+                    np.isfinite(snap.get(f"optimism q{int(100 * watch_q)} (points/cycle)", float("nan")))
+                    else "conservative: too little track record")
         k[2].metric("End of life (forecast)", f"cycle {e:.0f}", delta=band, delta_color="off")
         k[3].metric("Remaining (forecast)", f"{snap['remaining cycles']:.0f} cycles")
     else:
@@ -7315,8 +7340,10 @@ def view_twin() -> None:
         x_max = max(x_max, min(e * 1.1, x_last * 2.0))
     status_list = te.anomaly_cycle_status(an, common, soh_eol=soh_eol_c) if an is not None else None
     future = meas[meas["n"] > n] if reveal else None
+    cons_b = (snap.get(f"optimism q{int(100 * watch_q)} (points/cycle)", float("nan")) if watch_q is not None
+              else float("nan"))
     show(fig_twin(n, meas, removed, future, status_list, an["n"].to_numpy(float) if an is not None else None, frame,
-                  snap, t_main, P, cell, soh_eol_c, x_max), key="itw_fig", export=False)
+                  snap, t_main, P, cell, soh_eol_c, x_max, cons_b, watch_q), key="itw_fig", export=False)
 
     left, right = st.columns([1.15, 1])
     with left:
@@ -7358,10 +7385,11 @@ def view_twin() -> None:
             for t_ in lines:
                 st.caption(t_)
 
-    tl = te.integrated_timeline(soh_eol_c, meas, frames, an, common, t_main, t_check, watch)
+    tl = te.integrated_timeline(soh_eol_c, meas, frames, an, common, t_main, t_check, watch, watch_q)
     download("Download this battery's twin timeline (CSV)",
              tl.assign(battery=cell, group=grp_c, **{"app version": te.ENGINE_VERSION,
-                                                    "end of life": _twin_eol_label()}).to_csv(index=False).encode(),
+                                                    "end of life": _twin_eol_label(),
+                                                    "watch uses": basis}).to_csv(index=False).encode(),
              f"integrated_twin_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="itw_csv")
     twin_whatif(fleet, cell, soh_eol_c)
 

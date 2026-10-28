@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.30.1 · 2026-10-27
+# STATUS · handover for a new conversation · engine/app v5.31.0 · 2026-10-27
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,11 +9,11 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.30.1"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.30.1"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.31.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.31.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
-  tests/test_integrated_twin.py (9, v5.30.1)
+  tests/test_integrated_twin.py (12, v5.31.0)
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
 - battery-twin.zip: complete local package (INSTALL.bat one-click Windows installer -> %USERPROFILE%\battery-twin-app,
   Desktop shortcut "Battery Digital Twin"; setup/run scripts for Windows and Mac; .streamlit/config.toml upload 1 GB)
@@ -534,11 +534,42 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   3 cycles). (6) Forecast line and band drawn as lines (Plotly added markers to short traces).
 - The white vertical line at ~cycle 24 in the B0045 screenshot is most likely the hover cursor, not data.
 
+## 5as. Integrated twin scored per group (v5.30.1; Reference 1.40 Ah, Hot/Cold 80 % of initial; 13 timelines)
+- End-of-life forecast error (cycles, median forecast vs measured EOL, every cycle from forecast start to EOL):
+  B0005 7.7 (bias +2.7) · B0006 11.5 (+9.5) · B0018 7.2 (+4.1) · B0041 2.9 (+2.0) · B0045 1.6 (-0.4) · B0046 5.5 (+5.2)
+  · B0047 4.8 (+4.8) · B0048 8.3 (+7.2). Mean 6.2 cycles; 7 of 8 biased late (optimistic). Error shrinks toward EOL
+  (Reference: >30 cycles before EOL 10.5-15.5; 10-30 before 3.2-10.3; last 10 2.1-4.3).
+- Not scorable: B0007 (ends at 74.8-75.6 %, just above its threshold; forecast ~167 vs record end 168 -> Watch
+  from 149 was right), Hot (40 cycles, SOH 87-92 %, EOL beyond horizon 56).
+- First warning (Watch or Alarm) before EOL: B0005 74 (common event) / 101 (EOL forecast) -> 52 / 25 cycles ahead;
+  B0006 Alarm 54 -> 56 ahead (its forecast was 29 cycles late at 56: the FLEET alarm caught what the forecast
+  missed); B0018 21; Cold 7-22 (EOL at 80 % comes only 7-24 cycles after the forecast starts at 22); B0045 FLEET at
+  21 before its forecast existed.
+- Detector: common test event B0005/6/7 at 73-74 (as expected); regenerations labelled normal (B0005/6/7/18/31);
+  no alarm in Hot; FLEET B0006 54 (= 5ak), B0041 59 (5ak: 55), B0045 21 (5ak: 13) -> CHECK in Operations whether 5ak
+  lists the onset of kappa > threshold and the twin the confirmed alarm.
+- Explanation at the last cycle (v2 / v3): Cold plating 72-77 % (B0046-48), B0045 42 % + 37 % not explained,
+  B0041 29 % + 56 % not explained; Reference LAM dominant in both versions (v2 40-67 %, v3 49-79 %; gap 9-13 pts ->
+  robust); Hot SEI vs LAM flips with the version (v2 SEI 46-57 %, v3 14-20 %; gap 32-37 pts -> not determined).
+
+## 5at. Conservative end of life for Watch (v5.31.0)
+- Why not the forecast band: each frozen model has its own band method with no common meaning (B0005 MLP band
+  +-15 points one cycle ahead), so a band quantile would be noise.
+- Method (causal, per battery, "self-updating"): at today n, compare every forecast made in the last 40 cycles with
+  the SOH measured since (horizon >= 5 cycles): optimism rate = (forecast - measured) / cycles ahead. Conservative
+  forecast = today's median minus the q-quantile of that rate x cycles ahead (rate floored at 0: never more
+  optimistic than the median). Needs >= 10 comparisons, else median (stated in the status). Changes Watch and the
+  reported conservative EOL only; the Mission 2 forecast is untouched.
+- App: "Watch uses" = Median (default) / Conservative 50, 75, 90 %; conservative curve and end of life on the chart.
+  Timeline CSV always carries EOL conservative q50/q75/q90 and the optimism rates, whatever the choice.
+- Demo (Reference, EOL 80 %; synthetic, not evidence): EOL error median / q50 / q75 / q90: S002 6.8 / 4.2 / 4.5 / 5.0;
+  S005 17.8 / 8.1 / 9.0 / 9.7; S008 5.8 / 3.7 / 5.1 / 6.4; bias falls from +6..+18 to about 0..+3.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.30.1 (twin_engine.py, app.py, tests/test_integrated_twin.py); CI green; reboot; app shows v5.30.1.
-2. USER: Integrated twin: Reference group with 1.40 Ah (B0005, B0006, B0007, B0018); Cold and Hot with 80 % of
-   initial capacity. Send timeline CSVs per group (EOL forecast error per battery, Watch timing before EOL). Check
-   B0045's FLEET onset in Operations (13 or 21?).
+1. USER: upload v5.31.0 (twin_engine.py, app.py, tests/test_integrated_twin.py); CI green; reboot.
+2. USER: re-download the 13 timelines (same EOL settings as 5as; "Watch uses" = Conservative 75 %; the CSV holds all
+   three quantiles anyway). Judge: EOL error and bias per quantile vs median (5as), warning lead time, Watch never
+   firing too early. Also: Operations event log for B0045 / B0041 first FLEET alarm.
 3. Writing (after the twin is finished, user decision): Mission 2 chapter, physics-phase chapter, Mission 3 chapter.
 4. Optional: Mixed assessment run for PINN all inputs; PyBaMM benchmark.
 

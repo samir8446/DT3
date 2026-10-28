@@ -149,7 +149,51 @@ def test_hybrid_portable_pickles(demo):
 def test_app_requires_this_engine():
     app = (ROOT / "app.py").read_text(encoding="utf-8")
     req = re.search(r'REQUIRED_ENGINE = "([^"]+)"', app).group(1)
-    assert req == te.ENGINE_VERSION == "5.30.1"
+    assert req == te.ENGINE_VERSION == "5.31.0"
     for f in ("integrated_snapshot", "integrated_timeline", "whatif_projection", "whatif_identifiability",
               "hybrid_portable"):
         assert f in app and hasattr(te, f)
+
+
+# ---- v5.31.0: conservative end of life from the twin's own track record ----
+def _optimistic_case(true_rate=-0.004, fc_rate=-0.002):
+    """Measured SOH fades at true_rate per cycle; every forecast (re-anchored to today's measurement) fades at the
+    slower fc_rate: systematically optimistic, like the frozen forecasters on NASA."""
+    n = np.arange(1, 121, dtype=float)
+    meas = pd.DataFrame({"n": n, "SOH": 1.0 + true_rate * n})
+    frames = {}
+    for m in range(36, 121):
+        fut = np.arange(m + 1, 300, dtype=float)
+        med = (1.0 + true_rate * m) + fc_rate * (fut - m)
+        frames[m] = (fut, med, med - 0.01, med + 0.01)
+    return meas, frames
+
+
+def test_optimism_rate_is_learned_and_causal():
+    meas, frames = _optimistic_case()
+    r = te.forecast_optimism(frames, meas, 80)
+    assert len(r) >= 10 and np.allclose(r, 0.002)                 # forecast 0.002 per cycle too slow
+    meas2 = meas.copy()
+    meas2.loc[meas2["n"] > 80, "SOH"] = 0.0
+    assert np.allclose(te.forecast_optimism(frames, meas2, 80), r)  # nothing after today
+
+
+def test_conservative_eol_corrects_optimism_and_sets_watch():
+    meas, frames = _optimistic_case()
+    true_eol = (1 - 0.7) / 0.004                                    # 75
+    s = te.integrated_snapshot(60, 0.7, meas, frames, watch_cycles=20, watch_q=0.5)
+    assert s["EOL forecast"] > true_eol + 5                         # median: late
+    assert abs(s["EOL conservative q50"] - true_eol) <= 1.5         # corrected
+    assert s["status"] == "Watch" and "conservative 50 %" in s["reason"]
+    m = te.integrated_snapshot(60, 0.7, meas, frames, watch_cycles=20)
+    assert m["status"] == "Normal"                                  # median alone would not warn yet
+
+
+def test_conservative_never_more_optimistic_and_needs_history():
+    meas, frames = _optimistic_case(true_rate=-0.002, fc_rate=-0.004)   # pessimistic forecasts
+    s = te.integrated_snapshot(80, 0.7, meas, frames, watch_q=0.9)
+    assert s["EOL conservative q90"] == s["EOL forecast"]
+    meas, frames = _optimistic_case()
+    early = te.integrated_snapshot(38, 0.7, meas, frames, watch_q=0.75)  # 2 cycles of history
+    assert early["calibration pairs"] < 10 and "too little track record" in early["watch basis"]
+    assert early["EOL for watch"] == early["EOL forecast"]
