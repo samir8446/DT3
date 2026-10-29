@@ -7479,7 +7479,14 @@ def m3_maintenance_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
             st.caption("Not in the study: " + "; ".join(saved["notes"]))
         return
     e = te.M3Economics(battery_cost_cycles=p["cost"], unplanned_factor=p["k"], lead_cycles=p["lead"])
-    per, summ = te.m3_maintenance_study(lives, e)
+    mkey = (key, p["cost"], p["k"], p["lead"])
+    mc = st.session_state.get("m3_maint_cache")
+    if mc and mc[0] == mkey:
+        per, summ = mc[1], mc[2]
+    else:
+        with st.spinner("Replacement study…"):
+            per, summ = te.m3_maintenance_study(lives, e)
+        st.session_state["m3_maint_cache"] = (mkey, per, summ)
     st.session_state["m3_maint"] = {"summary": summ, "per": per, "prices": dict(p)}
     tw = summ.loc["twin-informed"] if "twin-informed" in summ.index else None
     k = st.columns(3)
@@ -7514,20 +7521,32 @@ def m3_maintenance_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
     show_table(per.pivot_table(index=["group", "battery", "end of life"], columns="policy",
                                values="replace at").style.format("{:.0f}"))
     with st.expander("Sweep over the assumed prices (27 settings)", icon=":material/tune:"):
-        rows = []
-        for cost, kk, lead in itertools.product((30, 60, 120), (1.5, 3, 5), (5, 10, 20)):
-            _, s = te.m3_maintenance_study(lives, te.M3Economics(battery_cost_cycles=cost, unplanned_factor=kk,
-                                                                  lead_cycles=lead))
-            r = {"battery cost": cost, "unplanned ×": kk, "lead": lead}
-            for pol in s.index:
-                r[pol] = s.loc[pol, "share of perfect-knowledge gain"]
-            rows.append(r)
-        sw = pd.DataFrame(rows)
-        if "twin-informed" in sw and "best fixed age" in sw:
-            ok = sw["twin-informed"].notna() & sw["best fixed age"].notna()
-            st.caption(f"Twin above the best fixed age in {(sw.loc[ok, 'twin-informed'] > sw.loc[ok, 'best fixed age']).sum()}"
-                       f" of {ok.sum()} settings with room to gain.")
-        show_table(sw.set_index(["battery cost", "unplanned ×", "lead"]).style.format("{:.0%}", na_rep="—"))
+        if st.button("Run the price sweep", key="m3_maint_sweep_go", icon=":material/play_arrow:",
+                     help="27 replacement studies (battery cost x unplanned factor x lead time); a few minutes."):
+            rows = []
+            bar = st.progress(0.0, text="Price sweep…")
+            combos = list(itertools.product((30, 60, 120), (1.5, 3, 5), (5, 10, 20)))
+            for j, (cost, kk, lead) in enumerate(combos):
+                _, s = te.m3_maintenance_study(lives, te.M3Economics(battery_cost_cycles=cost, unplanned_factor=kk,
+                                                                      lead_cycles=lead))
+                r = {"battery cost": cost, "unplanned ×": kk, "lead": lead}
+                for pol in s.index:
+                    r[pol] = s.loc[pol, "share of perfect-knowledge gain"]
+                rows.append(r)
+                bar.progress((j + 1) / len(combos))
+            bar.empty()
+            st.session_state["m3_maint_sweep"] = (key, pd.DataFrame(rows))
+        sv = st.session_state.get("m3_maint_sweep")
+        if sv and sv[0] == key:
+            sw = sv[1]
+            if "twin-informed" in sw and "best fixed age" in sw:
+                ok = sw["twin-informed"].notna() & sw["best fixed age"].notna()
+                st.caption(f"Twin above the best fixed age in "
+                           f"{(sw.loc[ok, 'twin-informed'] > sw.loc[ok, 'best fixed age']).sum()} of {ok.sum()} "
+                           f"settings with room to gain.")
+            show_table(sw.set_index(["battery cost", "unplanned ×", "lead"]).style.format("{:.0%}", na_rep="—"))
+        else:
+            st.caption("Press the button to run the sweep (it is not run automatically: it takes minutes).")
     if saved["notes"]:
         st.caption("Not in the study: " + "; ".join(saved["notes"]))
     download("Download the replacement study (CSV)", per.to_csv(index=False).encode(),
@@ -7562,13 +7581,34 @@ def m3_lifecycle_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
         placeholder("Run the replacement study above first: the lifecycle study uses its replayed lives.")
         return
     try:
-        depth = m3_depth_cached(CT_RAW, DATA_KEY_RAW, tuple(sorted(h["data"]))) if store is not None else None
         lives = saved["lives"]
-        per, summ = te.m3_lifecycle_study(
-            h, ct, lives, te.condition_groups(CT_RAW), depth,
-            te.M3OperationEconomics(buy_price_ratio=p["buy"], battery_cost_cycles=p["cost"]),
-            unplanned_factor=p["k"], lead_cycles=p["lead"],
-            soh_eols={c: m3_soh_eol_for(c, p["rule"]) for c in lives})
+        # only the batteries this study needs: those tested at the temperatures of the batteries that reached end of
+        # life (a battery's operation options are the combinations run at its temperature); Pulsed / Hot lives of up
+        # to ~1700 simulated cycles are skipped -> about 5x less work on Streamlit Cloud
+        tested = te.whatif_tested(h, te.condition_groups(CT_RAW))["by_battery"]
+        temps = {float(tested.loc[c, "T_C tested"]) for c in lives if c in tested.index}
+        keep = sorted(c for c in h["data"] if c in tested.index and float(tested.loc[c, "T_C tested"]) in temps)
+        h = dict(h, data={c: h["data"][c] for c in keep})
+        lkey = (saved.get("key"), p["cost"], p["buy"], p["k"], p["lead"], p["rule"])
+        lc = st.session_state.get("m3_life_cache")
+        if lc and lc[0] == lkey:
+            per, summ = lc[1], lc[2]
+            depth = lc[3] if len(lc) > 3 else None
+        else:
+            st.caption(f"Combines operation and replacement for the {len(lives)} batteries of the replacement study, "
+                       f"simulating the {len(keep)} batteries tested at their temperatures. It runs only when you "
+                       f"press the button (about a minute on Streamlit Cloud) and is kept until a price changes.")
+            if not st.button("Run the lifecycle study", key="m3_life_go", type="primary", icon=":material/insights:"):
+                return
+            depth = m3_depth_cached(CT_RAW, DATA_KEY_RAW, tuple(sorted(fleet["main"]["data"]))) \
+                if store is not None else None
+            with st.spinner("Lifecycle study (operation x replacement)…"):
+                per, summ = te.m3_lifecycle_study(
+                    h, ct, lives, te.condition_groups(CT_RAW), depth,
+                    te.M3OperationEconomics(buy_price_ratio=p["buy"], battery_cost_cycles=p["cost"]),
+                    unplanned_factor=p["k"], lead_cycles=p["lead"],
+                    soh_eols={c: m3_soh_eol_for(c, p["rule"]) for c in lives})
+            st.session_state["m3_life_cache"] = (lkey, per, summ, depth)
     except Exception as exc:
         report_error("Lifecycle study failed", exc, debug)
         return
@@ -7612,26 +7652,38 @@ def m3_lifecycle_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
         note="Profit rates per hour. Negative values: the battery's life is too short to pay back its cost at these "
              "prices (Cold batteries).")
     with st.expander(f"Sweep over the assumed prices · {gsel}", icon=":material/tune:"):
-        rows = []
-        for cost, kk, lead in itertools.product((30, 60, 120), (1.5, 3, 5), (5, 10, 20)):
-            try:
-                _, s = te.m3_lifecycle_study(h, ct, lives, te.condition_groups(CT_RAW), depth,
-                                             te.M3OperationEconomics(buy_price_ratio=p["buy"], battery_cost_cycles=cost),
-                                             unplanned_factor=kk, lead_cycles=lead,
-                                             soh_eols={c: m3_soh_eol_for(c, p["rule"]) for c in lives})
-            except Exception:
-                continue
-            if gsel not in s.index.get_level_values(0):
-                continue
-            gg = s.loc[gsel, "vs usual practice (% of operating profit per hour)"]
-            rows.append({"battery cost": cost, "unplanned ×": kk, "lead": lead,
-                         "twin strategy (%)": gg["twin strategy"], "twin replacement (%)": gg["twin replacement"],
-                         "upper bound (%)": gg["upper bound"]})
-        sw = pd.DataFrame(rows)
-        if len(sw):
-            st.caption(f"{gsel}: twin strategy above usual practice in {(sw['twin strategy (%)'] > 0).sum()} of "
-                       f"{len(sw)} settings; median {sw['twin strategy (%)'].median():+.0f} %.")
-            show_table(sw.set_index(["battery cost", "unplanned ×", "lead"]).style.format("{:+.1f}"))
+        if st.button("Run the lifecycle price sweep", key="m3_life_sweep_go", icon=":material/play_arrow:",
+                     help="27 lifecycle studies (battery cost x unplanned factor x lead time): this takes several "
+                          "minutes; all groups are computed at once."):
+            rows = []
+            bar = st.progress(0.0, text="Lifecycle price sweep…")
+            combos = list(itertools.product((30, 60, 120), (1.5, 3, 5), (5, 10, 20)))
+            for j, (cost, kk, lead) in enumerate(combos):
+                try:
+                    _, s = te.m3_lifecycle_study(h, ct, lives, te.condition_groups(CT_RAW), depth,
+                                                 te.M3OperationEconomics(buy_price_ratio=p["buy"],
+                                                                         battery_cost_cycles=cost),
+                                                 unplanned_factor=kk, lead_cycles=lead,
+                                                 soh_eols={c: m3_soh_eol_for(c, p["rule"]) for c in lives})
+                except Exception:
+                    continue
+                for gname in s.index.get_level_values(0).unique():
+                    gg = s.loc[gname, "vs usual practice (% of operating profit per hour)"]
+                    rows.append({"group": gname, "battery cost": cost, "unplanned ×": kk, "lead": lead,
+                                 "twin strategy (%)": gg["twin strategy"],
+                                 "twin replacement (%)": gg["twin replacement"], "upper bound (%)": gg["upper bound"]})
+                bar.progress((j + 1) / len(combos))
+            bar.empty()
+            st.session_state["m3_life_sweep"] = (saved.get("key"), p["buy"], p["rule"], pd.DataFrame(rows))
+        sv = st.session_state.get("m3_life_sweep")
+        if sv and sv[:3] == (saved.get("key"), p["buy"], p["rule"]) and len(sv[3]):
+            sw = sv[3][sv[3]["group"] == gsel].drop(columns="group")
+            if len(sw):
+                st.caption(f"{gsel}: twin strategy above usual practice in {(sw['twin strategy (%)'] > 0).sum()} of "
+                           f"{len(sw)} settings; median {sw['twin strategy (%)'].median():+.0f} %.")
+                show_table(sw.set_index(["battery cost", "unplanned ×", "lead"]).style.format("{:+.1f}"))
+        else:
+            st.caption("Press the button to run the sweep (it is not run automatically: it takes several minutes).")
     download("Download the lifecycle study (CSV)", per.to_csv(index=False).encode(),
              f"m3_lifecycle_study__v{te.ENGINE_VERSION}.csv", "text/csv", key="m3_life_csv")
 

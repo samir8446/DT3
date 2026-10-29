@@ -751,6 +751,29 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   Per-group shares now shown on the page (app-only change, v5.37.0 kept).
 - Still needed from the NASA run: per-group replacement table and the lifecycle section (CSV + per-group table).
 
+## 5be. Replacement study per group (v5.37.0, app-only per-group table)
+- Share of the possible gain (unplanned): Reference (3): twin 96 % (0), twin + age 93 % (0), best fixed age 58 % (1),
+  run to EOL 0 (3). Cold (5): twin + age 62 % (1), fixed age 54 % (1), twin 34 % (3), run to EOL 0 (5).
+- Replacement cycles: Reference twin B0005 117 (EOL 126), B0006 99 (110), B0018 87 (98); fixed age 98 for all.
+  Cold fixed age 29 (= shortest Cold life); twin + age: B0041 54, others 29.
+- Reading: where lives are long enough to be forecast, the twin is close to perfect knowledge; in Cold the forecast
+  starts too late to order a part (EOL 7-24 cycles after it starts), so the age limit carries it. Recommended rule
+  for all groups: twin + age limit. Small samples (3 and 5): direction, not precise percentages.
+
+## 5bf. Mission 3 page speed (app-only, v5.37.0 kept)
+- Cause of the very slow page: both 27-setting price sweeps sat inside expanders, which Streamlit executes on every
+  rerun even when collapsed (each lifecycle sweep = 27 x (replacement study + ~25 operation studies)); any click,
+  including the group selector, reran everything.
+- Fix: sweeps run only on their button ("Run the price sweep", "Run the lifecycle price sweep"; results kept for the
+  session); replacement and lifecycle results cached in the session per price setting. Demo: rerun / group switch
+  1.1 s (was minutes); replacement + lifecycle 7 s; lifecycle sweep ~1 min (NASA: several minutes, optional).
+
+## 5bf. Mission 3 page speed (app-only, v5.37.0 kept so saved results stay valid)
+- On Streamlit Cloud the lifecycle study started by itself after the replacement study and simulated the whole
+  fleet (~25 batteries, Pulsed lives up to ~1700 cycles): the page seemed to hang and the lifecycle section was not
+  reached. Now: "Run the lifecycle study" button; it simulates only the batteries tested at the temperatures of the
+  batteries that reached end of life; results kept until a price changes (sweeps were already behind buttons).
+
 ## 6. Next steps (Mission 3, option B)
 1. USER: upload v5.37.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_operation.py,
    tests/test_m3_lifecycle.py); Operations & control: fleet parts -> operation (all batteries) -> replacement study ->
