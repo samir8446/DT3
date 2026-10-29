@@ -774,11 +774,71 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   reached. Now: "Run the lifecycle study" button; it simulates only the batteries tested at the temperatures of the
   batteries that reached end of life; results kept until a price changes (sweeps were already behind buttons).
 
-## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.37.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_operation.py,
-   tests/test_m3_lifecycle.py); Operations & control: fleet parts -> operation (all batteries) -> replacement study ->
-   lifecycle: send the three CSVs + screenshots of the lifecycle per-group table, Reference and Cold metrics.
-2. Then: freeze the plan's six answers in STATUS (5av item 3) and start writing (Mission 2, physics, Mission 3).
+## 5bg. Lifecycle result (v5.37.0, NASA convention, default prices) and ANSWERS TO THE PLAN'S QUESTIONS
+- Lifecycle, % of operating profit per hour vs usual practice (own operation + best fixed age); share of the possible
+  gain in brackets. Reference (3): twin replacement +37 (93 %), twin + age limit +34 (91 %), twin strategy (twin +
+  operation chosen on the other batteries) +40 (96 %), upper bound +44. Cold (5): twin replacement -49 (40 %), twin +
+  age limit +14 (67 %), twin strategy -44 (42 %), upper bound +93. Operation part: Reference +3, Cold +5.
+  "Twin + age limit" lifecycle values computed offline from the CSVs (exact identity for own operation: stage-1 rate x
+  usual J_op per hour; checked on all 8 batteries); with the chosen operation added approx: Reference +37, Cold +20.
+  -> Recommended rule: twin + age limit + shallowest tested cut-off; the only strategy above usual practice in both
+  groups. Cold profits are negative at these prices (losses compared). TODO next engine release: "twin + age +
+  operation" computed in the app (one rebuild).
+
+### Answers (frozen 2026-10-29; numbers from the sections cited)
+M1 · Which parameter best represents battery health? One or several? Best-ranked indicator: discharge energy
+     (fitness 0.85; capacity family); best power-fade indicator: load-step DC resistance. PCA: PC1 49 % of indicator
+     variance (|corr| with SOH 0.60), PC2 19 % -> ageing is multi-dimensional (capacity and power fade evolve partly
+     independently): supports theta = [SOH, R_int, R_ct]. The twin FORECASTS capacity-based SOH and TRACKS the
+     resistances (diagnostics / inputs); state this choice in the write-up. (Study results, v5.37.0)
+M1 · How do operating conditions influence degradation? Cold (4 C): lithium plating dominant (71-77 % of the loss in
+     both physics versions; B0041/B0045 also 37-56 % not explained). Room temperature: LAM dominant in both versions
+     (robust). Hot (43 C): SEI vs LAM split depends on the physics version (not determined). Depth of discharge: deeper
+     than ~2.7 V adds <1 % energy and costs 6-12 % of life (cut-off sensitivity identified). Discharge current: effect
+     not identifiable from NASA (sensitivity at its bound; current tied to the group). (5ae, 5as, 5bd)
+M2 · Can we predict future degradation accurately? Yes within a group: frozen models RMSE Reference 4.47, Hot 0.95,
+     Cold 2.77 SOH points at 30 % of life; end-of-life forecast mean error 6.2 cycles on 8 batteries, late in 7 of 8;
+     a self-correction from the twin's own track record did not fix the bias (5h, 5as, 5au).
+M2 · How often should the model update? Anchor to the measured capacity every cycle; retraining barely matters
+     (Reference never updated 4.35 -> anchored, no retraining 1.45) (5h).
+M2 · Which variables are most informative? The measured capacity (anchor) carries the update; adding 19 measured
+     state features to the PINN made it worse (no-physics twin Hot 0.93 -> 1.45, Cold 4.79 -> 7.81: overfitting with
+     3-4 training batteries); physics helps only in Hot (5ap, 5p).
+M2 · supplementary (Live-twin cohort validation, Study results CSV, 32 batteries, 20-cycle forecasts at 30 / 50 %
+     origins, single-battery online models): median RMSE (SOH points) particle filter 2.03, hybrid 2.23, ensemble 2.25,
+     mechanistic 2.38, trend 3.64, default twin 4.18; band coverage ensemble 1.00, PF 0.90, twin 0.38 (too narrow).
+     Mechanistic fails on High current (39.7). Supports the Mission 2 choice: fleet-trained frozen models + anchoring
+     rather than single-battery estimators. Default Live-twin estimator should not be presented as the best one.
+M1 · NOTE: the Study results "Operating conditions" line comes from the set-aside stress regression (5av, flawed): use
+     the M1 conditions answer above instead.
+
+M3 · How to perform the integrated optimisation? Lifecycle profit per hour = J_op (measured energy delivered and
+     charged per tested operation, ageing from the shared physics scaled to the battery) - J_maint (planned /
+     unplanned replacement, lead-time downtime), evaluated on the real NASA lives with every data-driven choice made
+     leave-one-out (5aw, 5ax, 5bb).
+M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs usual practice (96 % of the possible
+     gain), mostly from replacement timing (+37). Cold: twin alone -49 %, twin + age limit +14 % (approx +20 % with
+     shallow cut-off). Recommended: twin + age limit + shallowest tested cut-off. Assumed prices, 3 + 5 batteries.
+
+## 5bh. Platform audit (2026-10-29, app-only changes; engine v5.37.0 unchanged, saved results stay valid)
+- Fixed (stale content): Home M3 status chip read the old optimiser (now: Mission 3 studies); Home card text for
+  Operations; Diagnostics "operating conditions" regression (shown twice) now labelled screening only, not used by
+  the twin; Study results M1 answer: regression coefficients replaced by the shared-physics identifiability
+  (identified / at the edge of its range / not identifiable; needs the fleet parts built); Study results methods:
+  old Integrated O&M text and "operations plant / stress regression" rows replaced by the Mission 3 lifecycle method;
+  Integrated twin model card: live forecast start wording; Watch options "Conservative" marked experimental (5au);
+  identifiability tables explain "limited" (at 0 = no extra effect found, no claim); version guard now exact.
+- Checked OK: all pages run; 27 tests; md_check 0; Mission 3 flow; hybrid caching fix (v5.30) in place.
+- Watch items (not changed): Streamlit 1.66 deprecates st.components.v1.html (used for the animations, app.py ~2111):
+  keep requirements below 1.66 or port to st.iframe before upgrading. Old optimiser code (fig_dp_policy, om/mm
+  figures, POLICIES) is dead code: remove at the next engine release. Engine wording "limited" for a sensitivity at
+  0 (whatif_identifiability) and the lifecycle strategy "twin + age limit + chosen operation": next engine release.
+  Live-twin default estimator is the weakest in the cohort validation (5bg supplementary): do not present it as best.
+
+## 6. Next steps
+1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
+   Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).
+2. Optional engine release (one rebuild): lifecycle strategy "twin + age limit + chosen operation" in the app.
 3. Writing (after the twin is finished, user decision): Mission 2 chapter, physics-phase chapter, Mission 3 chapter.
 4. Optional: Mixed assessment run for PINN all inputs; PyBaMM benchmark.
 

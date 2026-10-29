@@ -49,7 +49,7 @@ import twin_engine as te
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
 REQUIRED_ENGINE = "5.37.0"
-if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
+if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
 
@@ -65,7 +65,7 @@ _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_pro
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
                    "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay", "pinn_state_raw", "hybrid_portable", "integrated_snapshot", "integrated_timeline", "whatif_identifiability", "whatif_tested", "whatif_projection", "forecast_optimism", "conservative_eol", "m3_depth_table", "m3_operation_study", "m3_maintenance_study", "m3_lifecycle_study", "frozen_live_window")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
-if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
+if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE or _missing:
     _here = Path(__file__).resolve().parent
     _copies = sorted(p.name for p in _here.glob("twin_engine*.py")) + sorted(p.name for p in _here.glob("app*.py"))
     st.error(f"**Version mismatch.** This app.py needs twin_engine.py version **{REQUIRED_ENGINE}**, but the engine it "
@@ -3109,6 +3109,11 @@ def stress_section() -> None:
 
 
 def condition_effects_section() -> None:
+    st.warning("**Screening only, not used by the twin.** This pooled regression mixes every group (including Mixed "
+               "conditions and NASA-flagged batteries), rests on two batteries for the 24 °C current effect and gives "
+               "too-narrow intervals (batteries of one campaign are not independent). The identified condition effects "
+               "come from the shared physics: see the what-if on the Integrated twin and Mission 3 in Operations & "
+               "control (cut-off identified; discharge current not).", icon=":material/warning:")
     sf = stress_factors_cached(ct, DATA_KEY)
     if not sf.get("available"):
         st.info("Operating-condition regression needs at least four cells with a measurable early fade rate.")
@@ -3342,10 +3347,14 @@ def _study_answers(res: Dict[str, Any]) -> Dict[str, List[str]]:
                                                   "ageing is multi-dimensional (capacity and power fade diverge), "
                                                   "so the twin tracks SOH and two resistances."))
     sf = res.get("sf") or {}
-    if sf.get("available"):
-        co = sf["coefficients"]
-        parts = [f"{f}: {r['Estimate']:.3g} [{r['90% CI low']:.3g}, {r['90% CI high']:.3g}]" for f, r in co.iterrows()]
-        A["M1"].append(f"Operating conditions ({sf['n_cells']} cells, R² {sf['r2']:.2f}): " + "; ".join(parts) + ".")
+    fleet_ = st.session_state.get("itw_fleet") or {}
+    if fleet_.get("main") is not None:                     # identified effects from the shared physics (not the
+        idf = te.whatif_identifiability(fleet_["main"], te.condition_groups(CT_RAW))   # pooled screening regression)
+        by = {s_: [c_ for c_, v_ in zip(idf["condition"], idf["status"]) if v_ == s_]
+              for s_ in ("identified", "limited", "not identifiable")}
+        A["M1"].append("Operating conditions (shared physics): identified: " + (", ".join(by["identified"]) or "none")
+                       + "; at the edge of its range: " + (", ".join(by["limited"]) or "none")
+                       + "; not identifiable from NASA: " + (", ".join(by["not identifiable"]) or "none") + ".")
     mc = res.get("mech_checks")
     if mc is not None and len(mc):
         A["M1"].append("Mechanisms: " + "; ".join(f"{k.lower()} → {r['Verdict']}" for k, r in mc.iterrows()) + ".")
@@ -3974,8 +3983,9 @@ def view_home() -> None:
     status = {"M1 · Health & mechanisms": "answered" if study else "open",
               "M2 · Self-updating twin": "answered" if study and study["res"].get("update") is not None else
               ("partly answered" if study else "open"),
-              "M3 · Operation & maintenance": "answered" if (st.session_state.get("dp") or st.session_state.get("om"))
-              else "open"}
+              "M3 · Operation & maintenance": "answered" if st.session_state.get("m3_life") else
+              ("partly answered" if (st.session_state.get("m3_maint") or st.session_state.get("m3_ops") is not None)
+               else "open")}
     chips = "".join(f'<div class="bt-mchip bt-m-{v.split()[0]}"><b>{m}</b> {html.escape(v)}</div>' for m, v in status.items())
     st.markdown(f'<div class="bt-mstrip">{chips}</div>', unsafe_allow_html=True)
     section("Where to start")
@@ -3984,7 +3994,7 @@ def view_home() -> None:
              ("Model updating", V_UPDATE, "How often the twin's models must update, and how."),
              ("Live twin", V_LIVE, "Replay a battery cycle by cycle: the models learn, forecast and detect anomalies live."),
              ("Integrated twin", V_TWIN, "One battery, one view: forecast, anomalies, why it ages, and what-if."),
-             ("Operations & control", V_OPS, "Optimise operation and replacement for a calibrated battery."),
+             ("Operations & control", V_OPS, "Anomalies, then Mission 3: best operation, when to replace, lifecycle benefit."),
              ("Study results", V_STUDY, "Run the cohort study and get the answers to the three Missions.")]
     cols = st.columns(len(cards))
     for c_, (t, v, d) in zip(cols, cards):
@@ -4161,16 +4171,20 @@ def methods_panel() -> None:
                     "test; PCA decides whether one parameter suffices. **Degradation modes**: LLI / LAM / CL proxies "
                     "from ICA peak area, capacity and resistance (Birkl et al. 2017); DVA peak spacing. **Knee**: "
                     "two-segment piecewise-linear fit with an F-test.")
-        st.markdown("**Integrated O&M** (Mission 3): renewal-reward long-run profit rate with sudden-failure hazard "
-                    "h(SOH) after the knee,")
-        st.latex(r"\max_{\pi,\,S_\mathrm{rep}}\ \frac{\mathbb{E}\left[\sum_k S_{k-1}\,(R_k - E_k)\right] - "
-                 r"\mathbb{E}[C_\mathrm{maint}]}{\mathbb{E}\left[\sum_k S_{k-1}\,t_k\right] + \mathbb{E}[t_\mathrm{down}]},"
-                 r"\qquad S_k = \prod_{j \le k}\left(1 - h(\mathrm{SOH}_j)\right)")
+        st.markdown("**Mission 3** (rebuilt on the validated twin): lifecycle profit per hour of a battery life, with "
+                    "J_op = revenue − energy cost from energy delivered and charged **measured** per tested operation "
+                    "(inside each battery, from the raw discharge traces), ageing from the shared physics scaled to the "
+                    "battery's measured fade, and J_maint = planned or unplanned replacement plus lead-time downtime. "
+                    "Replacement policies are replayed on the **real measured lives** with only what the twin knew at "
+                    "each cycle; every data-driven choice (safety margin, fixed age, operation) is made leave-one-out.")
+        st.latex(r"\rho = \frac{\sum_{n \le t_\mathrm{rep}} \mathrm{SOH}_n\,(W_\mathrm{out}\,p - W_\mathrm{in}\,p_\mathrm{buy})"
+                 r" - C_\mathrm{rep}\,(1 + (k_u - 1)\,\mathbb{1}_\mathrm{unplanned})}"
+                 r"{\sum_{n \le t_\mathrm{rep}} h_n + L\,h\,\mathbb{1}_\mathrm{unplanned}}")
         st.markdown(
             "| Model class (Rufino Júnior et al. 2024, Fig. 1) | Implemented as |\n|---|---|\n"
             "| Empirical | Direct ML regression SOH(n) (baseline) |\n"
-            "| Semi-empirical | Power law in Ah; Arrhenius / current stress regression |\n"
-            "| Equivalent-circuit | 1-RC ECM inside the dual EKF twin and the operations plant |\n"
+            "| Semi-empirical | Power law in Ah (Live twin); pooled condition regression (screening only) |\n"
+            "| Equivalent-circuit | 1-RC ECM inside the dual EKF twin |\n"
             "| Electrochemical / physics-based | Butler–Volmer and SEI-type fade law in the hybrid PINN |\n"
             "| Data-driven | RF, GBR, GPR, SVR, MLP, Ridge fade-rate models with conformal bands |\n"
             "| Bayesian filtering / inference | Dual EKF (states + rate); particle filter and hierarchical "
@@ -6816,8 +6830,9 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # =============================================================================
 TWIN_STATUS_COLORS = {"Normal": "#009E73", "Watch": "#E69F00", "Alarm": "#CC0000", "End of life reached": "#6B1E1E"}
 TWIN_HYB = dict(restarts=30, fit_with="Re", lam=0.3)        # the Models view's defaults: both views share one result
-TWIN_WATCH_BASIS = {"Median forecast": None, "Conservative 50 %": 0.5, "Conservative 75 %": 0.75,
-                    "Conservative 90 %": 0.9}
+TWIN_WATCH_BASIS = {"Median forecast": None, "Conservative 50 % (experimental)": 0.5,
+                    "Conservative 75 % (experimental)": 0.75, "Conservative 90 % (experimental)": 0.9}
+# experimental: on NASA the conservative estimate over-corrected in Reference (bias -6..-12 cycles); not adopted (5au)
 TWIN_PARTS = {"main": "Explanation (physics version 2)", "check": "Explanation check (physics version 3)",
               "scan": "Anomaly detection", "fleet": "Fleet-wide parts"}
 
@@ -7018,7 +7033,7 @@ def fig_twin_whatif(d: pd.DataFrame, summ: Dict[str, Any], P: Palette, c: str, s
 def twin_model_card(grp_c: Optional[str], fz: Optional[Tuple[str, str]], fleet: Optional[Dict[str, Any]]) -> None:
     fc = (f"{te.PROTOCOL_MODELS[fz[0]][1]} (frozen {grp_c} model; test RMSE "
           f"{te.FROZEN_SCORES.get(grp_c, float('nan')):.2f} SOH pts at 30 % of life)") if fz else "none for this group"
-    rows = [("Forecast SOH and end of life", fc, "Trained once at 30 % of the record, re-anchored every cycle to the "
+    rows = [("Forecast SOH and end of life", fc, "Starts at 30 % of the training batteries' median life (known at deployment), re-anchored every cycle to the "
              "measured capacity (Mission 2 update study: anchoring matters, retraining barely does)."),
             ("Anomalies", "FLEET (ageing speed vs the fleet) + OWN (fade slope vs its own past), common-cause check, "
              "end-of-life event", "Validated 11/11 on simulated knees and regeneration; causal."),
@@ -7045,7 +7060,9 @@ def twin_whatif(fleet: Dict[str, Any], c: str, soh_eol_c: float) -> None:
                 "among the NASA batteries can be changed, and only to values NASA tested, so the twin never "
                 "extrapolates outside its evidence.")
     show_table(ident.drop(columns=["key"]).set_index("condition"),
-               note="limited: the fit pushed the sensitivity to the edge of its allowed range, so the data could not "
+               note="limited: the fit put the sensitivity at the edge of its allowed range. At 0 this means the data "
+                    "show no extra effect (e.g. discharge current), not that the effect is known to be zero. "
+                    "Edge of range: the data could not "
                     "determine it; the effect shown is that edge, not a measured effect.")
     cols = st.columns(len(te.WHATIF_CONDITIONS))
     pick: Dict[str, Optional[float]] = {}
@@ -7345,7 +7362,9 @@ def m3_operation_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
                 report_error("Depth measurement failed; economics fall back to between-battery values", exc, debug)
                 depth = None
     with st.expander("What NASA lets the twin vary (identifiability)", icon=":material/rule:"):
-        show_table(ident.drop(columns=["key"]).set_index("condition"))
+        show_table(ident.drop(columns=["key"]).set_index("condition"),
+                   note="limited = sensitivity at the edge of its allowed range; at 0 the data show no extra effect "
+                        "(e.g. discharge current, which changes together with the group), so no claim is made.")
     eol_c = m3_soh_eol_for(cell, p["rule"])
     if cell not in h["data"]:
         placeholder(f"{cell} is not in the constant-condition groups ({', '.join(te.NASA_PHYSICS_GROUPS)}).")
