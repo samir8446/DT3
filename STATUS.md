@@ -737,6 +737,20 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - v5.36.0 Reference rows for orientation only (superseded): usual 0.308/0.238/0.204, twin strategy 0.383/0.265/0.237
   per hour (B0005/B0006/B0018).
 
+## 5bd. Mission 3 on NASA after the fixes (v5.37.0)
+- Operation (1278 rows): the best option is the SHALLOWEST tested cut-off in 100 % of settings for Reference, Hot,
+  High current and 99 % for Cold; Pulsed: 2 A / 2.6 V in 74 % (current "limited", not claimed). Inside each battery
+  the trade-off is monotone, e.g. B0005: 2.1 V 6.59 Wh 95 cycles 0.247/h; 2.4 V 6.58 Wh 102 cycles 0.288/h; 2.7 V
+  6.55 Wh 108 cycles 0.318/h. Median gain of switching to the best option: ~5 % of operating profit per hour
+  (Reference, Hot, High current, Pulsed); Cold 17 % (unstable: losses). Caveat: the depth ageing effect comes from the
+  shared physics (cut-off sensitivity identified); Pulsed lives at 80 % are extrapolated far beyond the record
+  (e.g. B0027 1275-1680 cycles, k small): ranking only.
+- Replacement (calendar cycles now counted): twin + age limit 69 % of the possible gain (1 unplanned of 8), best
+  fixed age 55 % (2), twin alone 47 % (3), run to EOL 0 (8). Cold fixed age 29 = the shortest Cold life: it works
+  because the twin cannot warn in time in Cold (EOL soon after the forecast starts). -> combined rule is the answer.
+  Per-group shares now shown on the page (app-only change, v5.37.0 kept).
+- Still needed from the NASA run: per-group replacement table and the lifecycle section (CSV + per-group table).
+
 ## 6. Next steps (Mission 3, option B)
 1. USER: upload v5.37.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_operation.py,
    tests/test_m3_lifecycle.py); Operations & control: fleet parts -> operation (all batteries) -> replacement study ->

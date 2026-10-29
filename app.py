@@ -7492,6 +7492,25 @@ def m3_maintenance_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
                                   "share of perfect-knowledge gain": "{:.0%}"}),
                note="Share of the gain = (profit of the policy − run to end of life) / (perfect knowledge − run to "
                     "end of life), summed over batteries.")
+    # per group: groups differ in kind (Cold lives are short and start just as the forecast does)
+    rows_g = []
+    for gname, g in per.groupby("group"):
+        base = g[g["policy"] == "run to end of life"].set_index("battery")["profit rate"]
+        best = g[g["policy"] == "perfect knowledge"].set_index("battery")["profit rate"]
+        room = (best - base).sum()
+        for pol, gp in g.groupby("policy"):
+            gp = gp.set_index("battery")
+            rows_g.append({"group": gname, "policy": pol, "batteries": len(gp),
+                           "unplanned": int(gp["unplanned"].sum()),
+                           "share of the possible gain": ((gp["profit rate"] - base.reindex(gp.index)).sum() / room)
+                           if room > 0 else np.nan})
+    by_g = pd.DataFrame(rows_g).pivot_table(index="policy", columns="group",
+                                            values=["share of the possible gain", "unplanned"])
+    st.markdown("**By group**")
+    show_table(by_g.style.format("{:.0%}", subset=[c for c in by_g.columns if c[0] == "share of the possible gain"])
+               .format("{:.0f}", subset=[c for c in by_g.columns if c[0] == "unplanned"]),
+               note="Margin and age are still chosen leave-one-out; the share is computed within each group.")
+    st.session_state["m3_maint"]["by_group"] = by_g
     show_table(per.pivot_table(index=["group", "battery", "end of life"], columns="policy",
                                values="replace at").style.format("{:.0f}"))
     with st.expander("Sweep over the assumed prices (27 settings)", icon=":material/tune:"):
