@@ -3392,6 +3392,10 @@ def _study_answers(res: Dict[str, Any]) -> Dict[str, List[str]]:
                            f"{int(sm.loc['twin-informed', 'batteries'])}); best fixed age "
                            + (f"{100 * sm.loc['best fixed age', 'share of perfect-knowledge gain']:.0f} %."
                               if "best fixed age" in sm.index else "n/a."))
+            if "twin + alarm + age limit" in sm.index:
+                A["M3"].append(f"With the anomaly alarms in the decision: twin + alarm + age limit "
+                               f"{100 * sm.loc['twin + alarm + age limit', 'share of perfect-knowledge gain']:.0f} % "
+                               f"({int(sm.loc['twin + alarm + age limit', 'unplanned'])} unplanned).")
     ops = st.session_state.get("m3_ops")
     if ops is not None and len(ops):
         best = (ops.sort_values("profit rate (per hour)", ascending=False)
@@ -3632,8 +3636,9 @@ def view_replay() -> None:
         with st.spinner(f"Streaming the frozen {grp_c} model (" + ("trained once" if int(refit) == 0 else
                                                                     f"retrained every {int(refit)} cycles") + "; saved, so it runs only once)…"):
             try:
+                ns_, nm_ = te.frozen_live_window(ct, cell, train_c)   # live start: 30 % of the training lives
                 fz_frames, _fz_track = frozen_cached(ct, imp, DATA_KEY, cell, tuple(train_c), fz[0], fz[1],
-                                                     float(soh_eol), int(refit), anchor, float(eol_ah))
+                                                     float(soh_eol), int(refit), anchor, float(eol_ah), ns_, nm_)
             except Exception as exc:
                 report_error("Frozen model stream failed", exc, debug)
                 use_fz = False
@@ -7471,12 +7476,30 @@ def m3_lives(fleet: Dict[str, Any], rule: str) -> Tuple[Dict[str, Tuple[pd.DataF
     return lives, notes
 
 
+def m3_policy_summary(per: pd.DataFrame) -> pd.DataFrame:
+    """Per-policy summary of a replacement study (same definitions as te.m3_maintenance_study), recomputed here so
+    the alarm-aware variants sit in the same table."""
+    base = per[per["policy"] == "run to end of life"].set_index("battery")["profit rate"]
+    best = per[per["policy"] == "perfect knowledge"].set_index("battery")["profit rate"]
+    rows = []
+    for name, g in per.groupby("policy"):
+        g = g.set_index("battery")
+        room = (best.reindex(g.index) - base.reindex(g.index)).sum()
+        rows.append({"policy": name, "batteries": len(g), "mean profit rate": g["profit rate"].mean(),
+                     "unplanned": int(g["unplanned"].sum()),
+                     "mean unused life (cycles)": float((g["end of life"] - g["replace at"]).clip(lower=0).mean()),
+                     "share of perfect-knowledge gain": ((g["profit rate"] - base.reindex(g.index)).sum() / room)
+                     if room > 0 else np.nan})
+    return pd.DataFrame(rows).set_index("policy").sort_values("mean profit rate", ascending=False)
+
+
 def m3_maintenance_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
     section("Mission 3 · 2. Maintenance: when to replace?")
     st.markdown("Each battery's **real measured life** is replayed cycle by cycle, and replacement is decided with "
                 "only what the twin knew at that cycle. Policies: **perfect knowledge** (best cycle in hindsight, the "
                 "upper bound), **twin-informed** (order when the forecast end of life is within the lead time plus a "
-                "safety margin), **twin + age limit**, **best fixed age** (the usual practice) and **run to end of "
+                "safety margin), **twin + age limit**, **twin + alarm** and **twin + alarm + age limit** (an anomaly "
+                "alarm, FLEET or OWN, also triggers the order), **best fixed age** (the usual practice) and **run to end of "
                 "life** (always unplanned). Margin and age are chosen on the *other* batteries (leave-one-out). "
                 "Revenue per cycle is proportional to SOH, so performance loss counts.")
     key = (DATA_KEY, p["rule"], float(eol_ah))
@@ -7503,8 +7526,16 @@ def m3_maintenance_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
     if mc and mc[0] == mkey:
         per, summ = mc[1], mc[2]
     else:
-        with st.spinner("Replacement study…"):
-            per, summ = te.m3_maintenance_study(lives, e)
+        with st.spinner("Replacement study (with and without the anomaly alarms)…"):
+            per, _ = te.m3_maintenance_study(lives, e)
+            # alarm-aware variants: an Alarm status (FLEET / OWN indicator) also triggers the order; the safety
+            # margin is re-chosen leave-one-out with the alarms on
+            per_a, _ = te.m3_maintenance_study(lives, e, use_alarm=True)
+            per_a = per_a[per_a["policy"].isin(["twin-informed", "twin + age limit"])].copy()
+            per_a["policy"] = per_a["policy"].map({"twin-informed": "twin + alarm",
+                                                   "twin + age limit": "twin + alarm + age limit"})
+            per = pd.concat([per, per_a], ignore_index=True)
+            summ = m3_policy_summary(per)
         st.session_state["m3_maint_cache"] = (mkey, per, summ)
     st.session_state["m3_maint"] = {"summary": summ, "per": per, "prices": dict(p)}
     tw = summ.loc["twin-informed"] if "twin-informed" in summ.index else None

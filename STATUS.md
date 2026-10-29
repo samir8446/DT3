@@ -835,6 +835,20 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   0 (whatif_identifiability) and the lifecycle strategy "twin + age limit + chosen operation": next engine release.
   Live-twin default estimator is the weakest in the cohort validation (5bg supplementary): do not present it as best.
 
+## 5bi. Framework connections (2026-10-29, app-only; engine v5.37.0 unchanged)
+- Review: backbone connected (SOH -> frozen forecaster per group -> anchor rule -> Integrated twin -> Mission 3 ->
+  lifecycle profit). Supporting evidence only: Live-twin estimators and update-frequency study (justify fleet models),
+  health-indicator ranking + PCA (justify SOH; power fade enters the decisions only via measured efficiency),
+  electrochemistry (cross-check of the physics split). Independent / set aside: condition regression (screening),
+  stress & safety thresholds (not constraints; all options are tested conditions), conservative Watch. Outside the
+  Mission 3 benefit: Hot, High current, Pulsed (no EOL in record), Mixed (varying conditions). Two physics fits by
+  design: the detector keeps its own validated fleet fit.
+- Connected now: (1) anomaly alarms enter the replacement decision: policies "twin + alarm" and "twin + alarm + age
+  limit" (Alarm status also triggers the order; margin re-chosen leave-one-out with alarms on), in the summary, by-group
+  table and Study results; (2) Live twin frozen stream uses the live forecast start (frozen_live_window), consistent with
+  the Integrated twin (shares its saved results when settings match).
+- To run on NASA: replacement study -> compare twin + alarm (+ age limit) with 5be (B0006 FLEET 54, B0041 59, B0045 21).
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).
