@@ -48,7 +48,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.35.0"
+REQUIRED_ENGINE = "5.36.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -63,7 +63,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay", "pinn_state_raw", "hybrid_portable", "integrated_snapshot", "integrated_timeline", "whatif_identifiability", "whatif_tested", "whatif_projection", "forecast_optimism", "conservative_eol", "m3_depth_table", "m3_operation_study", "m3_maintenance_study")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay", "pinn_state_raw", "hybrid_portable", "integrated_snapshot", "integrated_timeline", "whatif_identifiability", "whatif_tested", "whatif_projection", "forecast_optimism", "conservative_eol", "m3_depth_table", "m3_operation_study", "m3_maintenance_study", "m3_lifecycle_study", "frozen_live_window")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -2421,11 +2421,13 @@ def live_cached(_ekf: te.EKFResult, _ct: pd.DataFrame, _imp: Optional[pd.DataFra
 
 @st.cache_data(show_spinner=False, max_entries=16)
 def frozen_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str, train: Tuple[str, ...],
-                  fkey: str, mkey: str, soh_eol: float, refit: int, anchor: str, eol_ah: float
-                  ) -> Tuple[Dict[int, Any], pd.DataFrame]:
+                  fkey: str, mkey: str, soh_eol: float, refit: int, anchor: str, eol_ah: float,
+                  n_start: Optional[int] = None, n_max: Optional[int] = None) -> Tuple[Dict[int, Any], pd.DataFrame]:
+    """n_start / n_max: the live forecast window (te.frozen_live_window); None = the assessment's (30 % of the
+    battery's own record), used by the Live twin."""
     return backed("frozen", lambda: te.frozen_stream(_ct, _imp, cell, list(train), fkey, mkey, soh_eol, refit, anchor,
-                                                     eol_ah=eol_ah),
-                  _ct, _imp, cell, train, fkey, mkey, soh_eol, refit, anchor, eol_ah)
+                                                     n_start=n_start, n_max=n_max, eol_ah=eol_ah),
+                  _ct, _imp, cell, train, fkey, mkey, soh_eol, refit, anchor, eol_ah, n_start, n_max)
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -3387,6 +3389,13 @@ def _study_answers(res: Dict[str, Any]) -> Dict[str, List[str]]:
                 .groupby(["battery", "battery_cost_cycles", "buy_price_ratio", "soh_eol"]).head(1))
         A["M3"].append(f"Operation: the battery's own current and cut-off is best in {100 * best['own'].mean():.0f} % "
                        f"of battery × price settings ({best['battery'].nunique()} batteries).")
+    lf = st.session_state.get("m3_life")
+    if lf:
+        g = lf["summary"]["vs usual practice (% of operating profit per hour)"]
+        A["M3"].append(f"Expected benefit: twin strategy {g['twin strategy']:+.0f} % lifecycle profit per hour vs usual "
+                       f"practice ({g['twin replacement']:+.0f} % from replacement, "
+                       f"{g['twin strategy'] - g['twin replacement']:+.0f} % from operation); upper bound "
+                       f"{g['upper bound']:+.0f} %.")
     if not A["M3"]:
         A["M3"].append("Run the operation and replacement studies in Operations & control to fill in this answer.")
     return A
@@ -6867,8 +6876,8 @@ def twin_fleet_parts(build: bool) -> Optional[Dict[str, Any]]:
 
 
 def twin_battery_parts(c: str) -> Dict[str, Any]:
-    """This battery's forecast stream: the group's frozen model, trained once at 30 % of the record and re-anchored
-    every cycle to the measured capacity (the Mission 2 update-study choice; same settings as the Live twin's
+    """This battery's forecast stream: the group's frozen model, starting at 30 % of the TRAINING batteries' median
+    life (known at deployment; v5.36.0) and re-anchored every cycle to the measured capacity (the Mission 2 update-study choice; same settings as the Live twin's
     default, so both views share the saved result)."""
     grp_c, fz, train_c = frozen_context(c)
     out: Dict[str, Any] = {"group": grp_c, "fz": fz, "train": train_c, "frames": None, "track": None,
@@ -6877,8 +6886,9 @@ def twin_battery_parts(c: str) -> Dict[str, Any]:
         return out
     try:
         with st.spinner(f"Streaming {c} through the frozen {grp_c} model (saved, so it runs only once)…"):
+            ns, nm = te.frozen_live_window(ct, c, train_c)
             out["frames"], out["track"] = frozen_cached(ct, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1],
-                                                        float(soh_eol), 0, "capacity", float(eol_ah))
+                                                        float(soh_eol), 0, "capacity", float(eol_ah), ns, nm)
     except Exception as exc:
         out["error"] = str(exc)
     return out
@@ -7425,8 +7435,9 @@ def m3_lives(fleet: Dict[str, Any], rule: str) -> Tuple[Dict[str, Tuple[pd.DataF
             notes.append(f"{c}: {why}")
             continue
         try:
+            ns, nm = te.frozen_live_window(ct, c, train_c)
             frames, _ = frozen_cached(ct, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1], float(eol_c), 0, "capacity",
-                                      float(eol_ah))
+                                      float(eol_ah), ns, nm)
         except Exception as exc:
             notes.append(f"{c}: forecast failed ({exc})")
             continue
@@ -7501,6 +7512,86 @@ def m3_maintenance_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
              f"m3_maintenance_study__v{te.ENGINE_VERSION}.csv", "text/csv", key="m3_maint_csv")
 
 
+def fig_m3_lifecycle(summ: pd.DataFrame, P: Palette) -> go.Figure:
+    order = ["do nothing", "usual practice", "twin replacement", "twin strategy", "upper bound"]
+    s = summ.reindex(order)
+    col = {"do nothing": "#9AA3AD", "usual practice": "#E69F00", "twin replacement": "#56B4E9",
+           "twin strategy": "#0072B2", "upper bound": "#6B7A8F"}
+    fig = go.Figure(go.Bar(x=order, y=s["mean profit rate (per hour)"], marker_color=[col[o] for o in order],
+                           text=[f"{v:.0%}" if np.isfinite(v) else "" for v in s["share of the possible gain"]],
+                           textposition="outside", hovertemplate="%{x}: %{y:.3f} per hour<extra></extra>"))
+    fig.update_yaxes(title_text="Mean lifecycle profit rate (per hour)")
+    return style_fig(fig, P, 420, "Lifecycle profit by strategy (labels: share of the possible gain)")
+
+
+def m3_lifecycle_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
+    section("Mission 3 · 3. Lifecycle: what benefit is expected?")
+    st.markdown("Operation and replacement together, in one number per battery: operating profit per hour over a "
+                "battery's life, replacement included. **Do nothing**: own operation, run to end of life. **Usual "
+                "practice**: own operation, best fixed replacement age. **Twin replacement**: own operation, "
+                "twin-informed replacement. **Twin strategy**: the operation that worked best on the *other* "
+                "batteries of the group, plus twin-informed replacement. **Upper bound**: best operation and "
+                "replacement in hindsight. The measured life stays the reality; another operation stretches or "
+                "shortens it by the physics' life ratio, and the twin's replacement timing is assumed as good relative "
+                "to end of life as on the measured operation.")
+    saved = st.session_state.get("m3_lives")
+    h = fleet.get("main")
+    if not saved or h is None or len(saved.get("lives") or {}) < 3:
+        placeholder("Run the replacement study above first: the lifecycle study uses its replayed lives.")
+        return
+    try:
+        depth = m3_depth_cached(CT_RAW, DATA_KEY_RAW, tuple(sorted(h["data"]))) if store is not None else None
+        lives = saved["lives"]
+        per, summ = te.m3_lifecycle_study(
+            h, ct, lives, te.condition_groups(CT_RAW), depth,
+            te.M3OperationEconomics(buy_price_ratio=p["buy"], battery_cost_cycles=p["cost"]),
+            unplanned_factor=p["k"], lead_cycles=p["lead"],
+            soh_eols={c: m3_soh_eol_for(c, p["rule"]) for c in lives})
+    except Exception as exc:
+        report_error("Lifecycle study failed", exc, debug)
+        return
+    if not len(per):
+        placeholder("No battery of the replacement study is covered by the shared physics.")
+        return
+    st.session_state["m3_life"] = {"summary": summ, "per": per, "prices": dict(p)}
+    g = summ["vs usual practice (% of operating profit per hour)"]
+    k = st.columns(3)
+    k[0].metric("Twin strategy vs usual practice", f"{g['twin strategy']:+.0f} %",
+                help="Difference in mean lifecycle profit rate, as % of the usual practice's operating profit per hour.")
+    k[1].metric("from replacement", f"{g['twin replacement']:+.0f} %")
+    k[2].metric("from operation", f"{g['twin strategy'] - g['twin replacement']:+.0f} %")
+    show(fig_m3_lifecycle(summ, P), key="m3_life_fig", data=summ.reset_index())
+    show_table(summ.style.format({"mean profit rate (per hour)": "{:.3f}", "share of the possible gain": "{:.0%}",
+                                  "vs usual practice (% of operating profit per hour)": "{:+.1f}"}))
+    cols = ["group", "battery", "end of life", "own option", "chosen option", "life ratio (chosen / own)",
+            "do nothing", "usual practice", "twin replacement", "twin strategy", "upper bound"]
+    show_table(per[cols].set_index(["group", "battery"]).style.format(
+        {c: "{:.3f}" for c in cols[5:]} | {"end of life": "{:.0f}"}),
+        note="Profit rates per hour. Negative values: the battery's life is too short to pay back its cost at these "
+             "prices (Cold batteries).")
+    with st.expander("Sweep over the assumed prices", icon=":material/tune:"):
+        rows = []
+        for cost, kk, lead in itertools.product((30, 60, 120), (1.5, 3, 5), (5, 10, 20)):
+            try:
+                _, s = te.m3_lifecycle_study(h, ct, lives, te.condition_groups(CT_RAW), depth,
+                                             te.M3OperationEconomics(buy_price_ratio=p["buy"], battery_cost_cycles=cost),
+                                             unplanned_factor=kk, lead_cycles=lead,
+                                             soh_eols={c: m3_soh_eol_for(c, p["rule"]) for c in lives})
+            except Exception:
+                continue
+            gg = s["vs usual practice (% of operating profit per hour)"]
+            rows.append({"battery cost": cost, "unplanned ×": kk, "lead": lead,
+                         "twin strategy (%)": gg["twin strategy"], "twin replacement (%)": gg["twin replacement"],
+                         "upper bound (%)": gg["upper bound"]})
+        sw = pd.DataFrame(rows)
+        if len(sw):
+            st.caption(f"Twin strategy above usual practice in {(sw['twin strategy (%)'] > 0).sum()} of {len(sw)} "
+                       f"settings; median {sw['twin strategy (%)'].median():+.0f} %.")
+            show_table(sw.set_index(["battery cost", "unplanned ×", "lead"]).style.format("{:+.1f}"))
+    download("Download the lifecycle study (CSV)", per.to_csv(index=False).encode(),
+             f"m3_lifecycle_study__v{te.ENGINE_VERSION}.csv", "text/csv", key="m3_life_csv")
+
+
 def view_ops() -> None:
     recommendations("ops")
     anomaly_section()
@@ -7517,6 +7608,7 @@ def view_ops() -> None:
             return
     m3_operation_section(fleet, p)
     m3_maintenance_section(fleet, p)
+    m3_lifecycle_section(fleet, p)
 
 
 # =============================================================================

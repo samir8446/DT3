@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.35.0"
+ENGINE_VERSION = "5.36.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -10832,7 +10832,7 @@ def integrated_snapshot(n: float, soh_eol: float, measured: Optional[pd.DataFram
     elif not frames:
         out["reason"] = "no forecast for this battery"
     elif not np.isfinite(out["forecast from"]):
-        out["reason"] = f"the forecast starts at cycle {min(frames):.0f} (30 % of the record)"
+        out["reason"] = f"the forecast starts at cycle {min(frames):.0f}"
     else:
         out["reason"] = "no alarm; end of life not expected within the watch window"
     return out
@@ -11379,3 +11379,130 @@ def m3_operation_study(h: Dict[str, Any], ct: pd.DataFrame, cell: str, e: M3Oper
     own_rate = out.loc[out["own"], "profit rate (per hour)"]
     out["vs own (per hour)"] = out["profit rate (per hour)"] - float(own_rate.iloc[0]) if len(own_rate) else np.nan
     return out
+
+
+
+# =============================================================================
+# 58. MISSION 3 · STAGE 3: LIFECYCLE PROFIT, "WHAT BENEFIT IS EXPECTED?"
+# =============================================================================
+# Live forecast window: a deployed twin does not know a battery's record length, so its forecast cannot start at 30 %
+# of it. frozen_live_window starts at 30 % of the TRAINING batteries' median record (known at deployment), horizon
+# 1.4 x that median. The Mission 2 assessment keeps its own origin definition (unchanged).
+#
+# Strategies per battery that reached end of life, in one unit (operating profit per hour):
+#   do nothing        own operation, run to end of life (replacement unplanned)
+#   usual practice    own operation, best fixed replacement age (leave-one-out within the group)
+#   twin replacement  own operation, twin-informed replacement (stage 1)
+#   twin strategy     operation chosen on the OTHER batteries of the group (stage 2, leave-one-out) + twin replacement
+#   upper bound       best operation for this battery + replacement at the best cycle in hindsight
+# The measured life is kept as the reality: another operation stretches or shortens it by the physics' life ratio
+# (simulated own / simulated chosen life; the physics is used for the difference only), and the twin's replacement
+# timing is assumed as good relative to end of life as it was on the measured operation (stated assumption).
+
+
+def frozen_live_window(ct: pd.DataFrame, cell: str, train: Sequence[str], frac: float = 0.3,
+                       horizon: float = 1.4) -> Tuple[int, int]:
+    """(n_start, n_max) for a live twin: frac and horizon of the training batteries' median record length."""
+    lens = [float(ct.loc[ct["Cell_ID"] == c, "n"].max()) for c in train if (ct["Cell_ID"] == c).any()]
+    med = float(np.median(lens)) if lens else float(ct.loc[ct["Cell_ID"] == cell, "n"].max())
+    n0, _ = safe_origin(ct, cell, int(max(10, round(frac * med))))
+    return int(n0), int(max(round(horizon * med), n0 + 20))
+
+
+def _m3_rate(n: np.ndarray, soh: np.ndarray, t_rep: float, unplanned: bool, margin: float, hours: float,
+             c_rep: float, k_unpl: float, lead: int) -> float:
+    used = n <= t_rep
+    cyc = float(used.sum())
+    if cyc <= 0 or hours <= 0:
+        return np.nan
+    j = margin * float(np.nansum(soh[used])) - c_rep * (k_unpl if unplanned else 1.0)
+    return j / (cyc * hours + (lead * hours if unplanned else 0.0))
+
+
+def m3_lifecycle_study(h: Dict[str, Any], ct: pd.DataFrame, lives: Dict[str, Tuple[pd.DataFrame, str, float]],
+                       groups: Optional[pd.DataFrame], depth: Optional[pd.DataFrame], e_op: M3OperationEconomics,
+                       unplanned_factor: float = 3.0, lead_cycles: int = 10,
+                       soh_eols: Optional[Dict[str, float]] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Lifecycle profit rate (per hour) of the five strategies for every battery in `lives` that the physics covers.
+    soh_eols: end of life per battery (fraction of initial capacity) for the operation simulations."""
+    soh_eols = soh_eols or {}
+    e_m = M3Economics(battery_cost_cycles=e_op.battery_cost_cycles, unplanned_factor=unplanned_factor,
+                      lead_cycles=lead_cycles)
+    per_m, _ = m3_maintenance_study(lives, e_m)
+    pol = {(r["battery"], r["policy"]): r for r in per_m.to_dict("records")}
+
+    def study(c: str) -> pd.DataFrame:
+        e = replace(e_op, soh_eol=float(soh_eols.get(c, e_op.soh_eol)))
+        try:
+            return m3_operation_study(h, ct, c, e, groups, depth)
+        except Exception:
+            return pd.DataFrame()
+
+    grp_of = {c: (str(groups.loc[c, "Group"]) if groups is not None and c in groups.index else "?") for c in h["data"]}
+    studies = {c: study(c) for c in h["data"]}
+    key = lambda r: (round(float(r["I_dis"]), 1), round(float(r["V_cut"]), 1))
+    rows = []
+    for b, (tl, grp, E) in lives.items():
+        s = studies.get(b)
+        if s is None or not len(s) or not s["own"].any():
+            continue
+        own = s[s["own"]].iloc[0]
+        margin_of = lambda r: float(r["Wh out per cycle"]) * (1 - e_op.buy_price_ratio * 1.0 / max(float(r["efficiency"]),
+                                                                                                     1e-6))
+        m_own, h_own = margin_of(own), float(own["hours per cycle"])
+        c_rep = e_op.battery_cost_cycles * m_own
+        d = tl.sort_values("cycle")
+        n, soh = d["cycle"].to_numpy(float), d["SOH measured"].to_numpy(float)
+        sel = n <= E
+        n, soh = n[sel], soh[sel]
+        rate = lambda nn, ss, tr, un, mg, hh: _m3_rate(nn, ss, tr, un, mg, hh, c_rep, unplanned_factor, lead_cycles)
+        out = {"battery": b, "group": grp, "end of life": E, "own option": f"{own['I_dis']:g} A · {own['V_cut']:.1f} V"}
+        out["do nothing"] = rate(n, soh, E, True, m_own, h_own)
+        fx = pol.get((b, "best fixed age"))
+        out["usual practice"] = rate(n, soh, fx["replace at"], fx["unplanned"], m_own, h_own) if fx else np.nan
+        tw = pol[(b, "twin-informed")]
+        out["twin replacement"] = rate(n, soh, tw["replace at"], tw["unplanned"], m_own, h_own)
+        # operation chosen on the other batteries of the group (leave-one-out)
+        score: Dict[Tuple[float, float], List[float]] = {}
+        for c, sc in studies.items():
+            if c == b or grp_of.get(c) != grp or not len(sc):
+                continue
+            for _, r in sc.iterrows():
+                score.setdefault(key(r), []).append(float(r["vs own (per hour)"]))
+        avail = {key(r): r for _, r in s.iterrows()}
+        cand = {k_: np.mean(v) for k_, v in score.items() if k_ in avail}
+        ch = avail[max(cand, key=cand.get)] if cand else own
+        out["chosen option"] = f"{ch['I_dis']:g} A · {ch['V_cut']:.1f} V"
+        out["chosen on"] = "other batteries of the group" if cand else "no other battery: own"
+
+        def scaled(r_opt: pd.Series) -> Tuple[np.ndarray, np.ndarray, float, float]:
+            ratio = float(own["cycles to EOL"]) / float(r_opt["cycles to EOL"])   # >1: the option ages faster
+            e_new = E / ratio
+            nn = np.arange(1, int(np.floor(e_new)) + 1, dtype=float)
+            return nn, np.interp(nn * ratio, n, soh), e_new, ratio
+
+        nn, ss, e_new, ratio = scaled(ch)
+        out["life ratio (chosen / own)"] = 1 / ratio
+        out["twin strategy"] = rate(nn, ss, tw["replace at"] / ratio, tw["unplanned"], margin_of(ch),
+                                    float(ch["hours per cycle"]))
+        best_u = -np.inf
+        for _, r_opt in s.iterrows():
+            nn, ss, e_new, _ = scaled(r_opt)
+            for tr in nn[nn >= 2]:
+                best_u = max(best_u, rate(nn, ss, tr, False, margin_of(r_opt), float(r_opt["hours per cycle"])))
+        out["upper bound"] = best_u if np.isfinite(best_u) else np.nan
+        out["usual J_op per hour"] = m_own / h_own
+        rows.append(out)
+    per = pd.DataFrame(rows)
+    if not len(per):
+        return per, pd.DataFrame()
+    strat = ["do nothing", "usual practice", "twin replacement", "twin strategy", "upper bound"]
+    summ = pd.DataFrame({"mean profit rate (per hour)": per[strat].mean()})
+    base, top = per["do nothing"], per["upper bound"]
+    summ["share of the possible gain"] = [((per[s_] - base).sum() / (top - base).sum()) if (top - base).sum() > 0
+                                          else np.nan for s_ in strat]
+    ref = per["usual J_op per hour"].mean()
+    summ["vs usual practice (% of operating profit per hour)"] = 100 * (summ["mean profit rate (per hour)"] -
+                                                                       summ.loc["usual practice",
+                                                                                "mean profit rate (per hour)"]) / ref
+    return per, summ

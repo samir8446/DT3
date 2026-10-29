@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.35.0 · 2026-10-29
+# STATUS · handover for a new conversation · engine/app v5.36.0 · 2026-10-29
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,11 +9,11 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.35.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.35.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.36.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.36.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
-  tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6), v5.35.0
+  tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6) + test_m3_lifecycle.py (2), v5.36.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
 - battery-twin.zip: complete local package (INSTALL.bat one-click Windows installer -> %USERPROFILE%\battery-twin-app,
   Desktop shortcut "Battery Digital Twin"; setup/run scripts for Windows and Mac; .streamlit/config.toml upload 1 GB)
@@ -684,11 +684,50 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
   as "economics: between batteries") when the depth table is missing. App: depth table cached + in result backup.
 - Tests 23: depth table monotone and matching capacity; option economics follow the target battery, not the peers.
 
+## 5ba. Mission 3 on NASA in the app (v5.35.0) -> stages 1 and 2 validated
+- Replacement study (NASA convention fixed): reproduces 5aw exactly: twin 42 % of the possible gain, twin + age 40 %,
+  best fixed age 11 %, run to EOL 0; unplanned 3 / 3 / 5 / 8 of 8; Reference replacements B0005 117 (EOL 126),
+  B0006 99 (110), B0018 89 (98); Cold EOL 29-60 cycles.
+- Operation study (1278 rows, all "within battery" economics; flags: 108 "current: limited", cut-off never flagged
+  -> the depth sensitivity is identified, the current one is not):
+  - Depth: inside the batteries, discharging deeper than ~2.7 V adds almost no energy (Reference B0005: 6.55 Wh at
+    2.7 V, 6.58 at 2.4 V, 6.59 at 2.1 V) but the physics charges extra fade (B0005 life 142 / 133 / 124 cycles).
+    Median over Reference options: -0.3 V -> +0.2 % energy, -6 % life.
+  - Best option over 18 price settings: Reference 2.7 V 56 %, 2.4 V 44 % (B0006/B0018/B0007 -> shallower; B0005/B0036
+    stay at 2.7 V); Hot 2.6 V 100 %; High current 2.1 V 100 %; Cold 2.7 V 60 %, 2.0 V 38 %; Pulsed 2 A 69 % (current:
+    limited, not claimed). Own operation best in 19-50 % of settings; ranking almost independent of the prices.
+  - Size of the gain (best vs own, % of own operating profit per hour, median): Reference 2.6, High current 2.8,
+    Hot 4.8, Pulsed 4.0, Cold 15.2 (Cold profits are near zero/negative: lives 18-60 cycles vs battery cost, so its
+    percentages are unstable).
+- Answer to the plan (aggressive operation vs faster degradation), within NASA's evidence: the lever NASA identifies
+  is depth of discharge; stopping near 2.6-2.7 V (measured) instead of 2.0-2.4 V loses <1-2 % energy per cycle and
+  gains life, worth a few % of operating profit per hour. Current: effect not identified (sensitivity at its
+  bound), no claim. Maintenance timing with the twin (42 % vs 11 %) is the larger lever.
+
+## 5bb. Mission 3 · stage 3: lifecycle profit, "what benefit is expected?" (v5.36.0, engine section 58)
+- Live forecast window (fixes the leak noted in 5aw): frozen_live_window = start at 30 % of the TRAINING batteries'
+  median record (safe_origin applied), horizon 1.4 x that median. Used by the Integrated twin and Mission 3
+  (frozen_cached got optional n_start / n_max); the Live twin and the Mission 2 assessment keep their definitions.
+  Expect changed Integrated-twin timelines and replacement numbers (e.g. B0041: forecast started at 53, now ~22).
+- m3_lifecycle_study: per battery that reached EOL, lifecycle profit per hour (Stage 2 units: Wh x price, energy
+  cost via efficiency, hours per cycle, battery priced once, unplanned x k + lead-time downtime) of: do nothing,
+  usual practice (best fixed age, LOO), twin replacement (stage 1), twin strategy (operation chosen on the OTHER
+  batteries of the group by mean gain vs own + twin replacement), upper bound (best operation + best replacement in
+  hindsight). Measured life = reality; another operation scales it by the physics' life ratio; the twin's timing
+  relative to EOL is assumed unchanged (stated assumption). Outputs: share of the possible gain, % vs usual practice
+  of operating profit per hour, split into replacement and operation parts; 27-setting price sweep.
+- App: Operations & control -> "Mission 3 · 3. Lifecycle" (automatic after the replacement study): three metrics
+  (twin strategy vs usual practice, from replacement, from operation), chart, tables, sweep, CSV. Study results:
+  M3 answer "expected benefit".
+- Demo (synthetic, 3 batteries): twin strategy +72 % vs usual practice (+61 replacement, +11 operation), 25/27 settings
+  positive. NASA numbers pending.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.35.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_operation.py);
-   Operations & control -> build fleet parts -> operation "Run for every battery..." (CSV) -> replacement study
-   (NASA convention, CSV); screenshots: B0005 options table, replacement summary, identifiability expander.
-2. Stage 3: joint operation x replacement, lifecycle profit, benefit; fixed forecast start (live definition, 5aw).
+1. USER: upload v5.36.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_lifecycle.py);
+   Operations & control: build fleet parts -> operation "Run for every battery..." -> replacement study (NASA
+   convention) -> lifecycle section appears; send the lifecycle CSV + screenshots (metrics, chart, sweep caption) and
+   the new replacement summary (live window changes it). Refresh the result backup.
+2. Then: freeze the plan's six answers in STATUS (5av item 3) and start writing (Mission 2, physics, Mission 3).
 3. Writing (after the twin is finished, user decision): Mission 2 chapter, physics-phase chapter, Mission 3 chapter.
 4. Optional: Mixed assessment run for PINN all inputs; PyBaMM benchmark.
 
