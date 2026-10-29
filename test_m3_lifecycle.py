@@ -52,8 +52,19 @@ def test_lifecycle_bound_and_consistency(demo):
     assert len(per) == len(lives)
     for s_ in ("do nothing", "usual practice", "twin replacement", "twin strategy"):
         assert (per["upper bound"] >= per[s_] - 1e-9).all(), s_
-    assert summ.loc["do nothing", "share of the possible gain"] == pytest.approx(0.0)
-    assert summ.loc["upper bound", "share of the possible gain"] == pytest.approx(1.0)
+    assert summ.loc[("all", "do nothing"), "share of the possible gain"] == pytest.approx(0.0)
+    assert summ.loc[("all", "upper bound"), "share of the possible gain"] == pytest.approx(1.0)
+    assert ("Reference", "twin strategy") in summ.index
     same = per["chosen option"] == per["own option"]
     assert np.allclose(per.loc[same, "twin strategy"], per.loc[same, "twin replacement"])
     assert (per["chosen on"] == "other batteries of the group").all()
+
+
+
+def test_lives_count_every_calendar_cycle():
+    tl = pd.DataFrame({"cycle": [1.0, 2, 3, 30, 31, 60], "SOH measured": [1.0, 0.99, 0.98, 0.9, 0.89, 0.8],
+                       "EOL forecast": np.nan, "status": "Normal"})
+    n, soh = te._m3_series(tl)
+    assert len(n) == 60 and n[0] == 1 and soh[29] == pytest.approx(0.9)          # gaps 4-29, 32-59 filled
+    r = te.m3_fixed_age(tl, 60, 10, te.M3Economics())
+    assert r["cycles used"] == 10 and np.isfinite(r["profit rate"])               # an age inside a gap still works

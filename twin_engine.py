@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.36.0"
+ENGINE_VERSION = "5.37.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -11043,8 +11043,15 @@ def m3_life_profit(n: np.ndarray, soh: np.ndarray, t_rep: float, unplanned: bool
 
 
 def _m3_series(tl: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
-    d = tl.sort_values("cycle")
-    return d["cycle"].to_numpy(float), d["SOH measured"].to_numpy(float)
+    """Every calendar cycle from 1 to the last recorded one, SOH interpolated across cycles removed by data cleaning
+    (they were still operated and still earned; v5.37.0: B0041 has 17 valid of 60 cycles). Flat before the first
+    valid cycle."""
+    d = tl.sort_values("cycle").dropna(subset=["SOH measured"])
+    nv, sv = d["cycle"].to_numpy(float), d["SOH measured"].to_numpy(float)
+    if not len(nv):
+        return nv, sv
+    n = np.arange(1.0, float(nv[-1]) + 1.0)
+    return n, np.interp(n, nv, sv)
 
 
 def m3_twin_policy(tl: pd.DataFrame, eol_cycle: float, e: M3Economics, margin: float = 0.0,
@@ -11108,8 +11115,7 @@ def m3_maintenance_study(lives: Dict[str, Tuple[pd.DataFrame, str, float]], e: M
         same = [o for o in others if lives[o][1] == grp]
         a_b = np.nan                                       # fixed age, chosen on the other batteries of the group
         if same:
-            start = max(float(_m3_series(lives[o][0])[0][0]) for o in same)
-            ages = sorted({float(x) for o in same for x in _m3_series(lives[o][0])[0] if start + 1 <= x})
+            ages = sorted({float(x) for o in same for x in _m3_series(lives[o][0])[0] if 2 <= x <= lives[o][2]})
             a_b = _best({a: _mean([m3_fixed_age(lives[o][0], lives[o][2], a, e)["profit rate"] for o in same])
                          for a in ages})
         m_b = _best({m: _mean([m3_twin_policy(lives[o][0], lives[o][2], e, m, use_alarm)["profit rate"]
@@ -11120,8 +11126,7 @@ def m3_maintenance_study(lives: Dict[str, Tuple[pd.DataFrame, str, float]], e: M
                 so = [x for x in others if x != o and lives[x][1] == lives[o][1]]
                 if not so:
                     return np.nan
-                st_ = max(float(_m3_series(lives[x][0])[0][0]) for x in so)
-                ag = sorted({float(x) for x_ in so for x in _m3_series(lives[x_][0])[0] if st_ + 1 <= x})
+                ag = sorted({float(x) for x_ in so for x in _m3_series(lives[x_][0])[0] if 2 <= x <= lives[x_][2]})
                 return _best({a: _mean([m3_fixed_age(lives[x][0], lives[x][2], a, e)["profit rate"] for x in so])
                               for a in ag})
             ages_o = {o: _age_for(o) for o in others}
@@ -11256,7 +11261,7 @@ def m3_operation_options(h: Dict[str, Any], ct: pd.DataFrame, cell: str,
     tab["I_dis tested"] = (np.round(tab["I_dis"] / 0.5) * 0.5).round(2)   # each battery's own tested current
     own = tab.loc[cell]
     same_T = tab[np.isclose(tab["T_C tested"], own["T_C tested"])]
-    eco = m3_condition_economics(ct, list(same_T.index))
+    eco = m3_condition_economics(ct, list(same_T.index) + ([cell] if cell not in same_T.index else []))
     ident = whatif_identifiability(h, groups).set_index("key")
     rows = []
     dep = depth.set_index(["battery", "V"]) if depth is not None and len(depth) else None
@@ -11276,10 +11281,15 @@ def m3_operation_options(h: Dict[str, Any], ct: pd.DataFrame, cell: str,
             if peers:
                 r = pd.DataFrame({b: {"q": dep.loc[(b, vq), "Ah"] / dep.loc[(b, M3_DEPTH_REF), "Ah"],
                                       "w": dep.loc[(b, vq), "Wh"] / dep.loc[(b, M3_DEPTH_REF), "Ah"],
-                                      "t": dep.loc[(b, vq), "hours"] / dep.loc[(b, M3_DEPTH_REF), "Ah"],
-                                      "eff": eco.loc[b, "efficiency"], "ch": eco.loc[b, "charge hours"] / eco.loc[b, "Ah"],
-                                      "mv": eco.loc[b, "Ah moved"] / eco.loc[b, "Ah"]} for b in peers}).T.median()
+                                      "t": dep.loc[(b, vq), "hours"] / dep.loc[(b, M3_DEPTH_REF), "Ah"]}
+                                  for b in peers}).T.median()
                 ah, wh = ref_b * r["q"], ref_b * r["w"]
+                # charging (same CC-CV protocol for all): THIS battery's own charge energy, time and Ah moved per Ah
+                # delivered (v5.37.0: from peers, weak cells made deep options look inefficient and slow)
+                me = eco.loc[cell]
+                r["ch"] = me["charge hours"] / me["Ah"]
+                r["mv"] = me["Ah moved"] / me["Ah"]
+                r["eff"] = wh / (ah * me["Wh in"] / me["Ah"]) if ah > 0 else me["efficiency"]
                 flags = []
                 if not np.isclose(i_, own["I_dis tested"]) and ident.loc["I_dis", "status"] != "identified":
                     flags.append(f"current: {ident.loc['I_dis', 'status']}")
@@ -11451,8 +11461,7 @@ def m3_lifecycle_study(h: Dict[str, Any], ct: pd.DataFrame, lives: Dict[str, Tup
                                                                                                      1e-6))
         m_own, h_own = margin_of(own), float(own["hours per cycle"])
         c_rep = e_op.battery_cost_cycles * m_own
-        d = tl.sort_values("cycle")
-        n, soh = d["cycle"].to_numpy(float), d["SOH measured"].to_numpy(float)
+        n, soh = _m3_series(tl)
         sel = n <= E
         n, soh = n[sel], soh[sel]
         rate = lambda nn, ss, tr, un, mg, hh: _m3_rate(nn, ss, tr, un, mg, hh, c_rep, unplanned_factor, lead_cycles)
@@ -11497,12 +11506,21 @@ def m3_lifecycle_study(h: Dict[str, Any], ct: pd.DataFrame, lives: Dict[str, Tup
     if not len(per):
         return per, pd.DataFrame()
     strat = ["do nothing", "usual practice", "twin replacement", "twin strategy", "upper bound"]
-    summ = pd.DataFrame({"mean profit rate (per hour)": per[strat].mean()})
-    base, top = per["do nothing"], per["upper bound"]
-    summ["share of the possible gain"] = [((per[s_] - base).sum() / (top - base).sum()) if (top - base).sum() > 0
-                                          else np.nan for s_ in strat]
-    ref = per["usual J_op per hour"].mean()
-    summ["vs usual practice (% of operating profit per hour)"] = 100 * (summ["mean profit rate (per hour)"] -
-                                                                       summ.loc["usual practice",
-                                                                                "mean profit rate (per hour)"]) / ref
+
+    def _summ(sub: pd.DataFrame) -> pd.DataFrame:
+        sub = sub.dropna(subset=strat)
+        s = pd.DataFrame({"mean profit rate (per hour)": sub[strat].mean()})
+        base, top = sub["do nothing"], sub["upper bound"]
+        s["share of the possible gain"] = [((sub[s_] - base).sum() / (top - base).sum()) if (top - base).sum() > 0
+                                           else np.nan for s_ in strat]
+        ref = sub["usual J_op per hour"].mean()
+        s["vs usual practice (% of operating profit per hour)"] = 100 * (s["mean profit rate (per hour)"] -
+                                                                        s.loc["usual practice",
+                                                                              "mean profit rate (per hour)"]) / ref
+        s["batteries"] = len(sub)
+        return s
+
+    # per group first (groups differ in kind: at the same prices a Cold battery may never pay back its cost)
+    parts = [_summ(g).assign(group=gname) for gname, g in per.groupby("group")] + [_summ(per).assign(group="all")]
+    summ = pd.concat(parts).rename_axis("strategy").reset_index().set_index(["group", "strategy"])
     return per, summ

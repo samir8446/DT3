@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.36.0 · 2026-10-29
+# STATUS · handover for a new conversation · engine/app v5.37.0 · 2026-10-29
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,11 +9,11 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.36.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.36.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.37.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.37.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
-  tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6) + test_m3_lifecycle.py (2), v5.36.0
+  tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6) + test_m3_lifecycle.py (3), v5.37.0 (27 tests)
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
 - battery-twin.zip: complete local package (INSTALL.bat one-click Windows installer -> %USERPROFILE%\battery-twin-app,
   Desktop shortcut "Battery Digital Twin"; setup/run scripts for Windows and Mac; .streamlit/config.toml upload 1 GB)
@@ -722,11 +722,25 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - Demo (synthetic, 3 batteries): twin strategy +72 % vs usual practice (+61 replacement, +11 operation), 25/27 settings
   positive. NASA numbers pending.
 
+## 5bc. First NASA lifecycle run (v5.36.0) -> three errors, fixed in v5.37.0
+- Live window effect on the replacement study: almost none (twin 42 %, fixed age 11 %; B0018 twin 87 instead of 89).
+- Headline was twin strategy +71 % vs usual practice (+34 replacement, +37 operation): NOT VALID, because:
+  1 gaps: lives counted only VALID cycles (B0041: 17 valid of 60; revenue for 17 cycles, cost over 60; its best fixed
+    age 29 fell before its first valid cycle -> empty "usual practice"). Fix: _m3_series = every calendar cycle
+    1..last, SOH interpolated across cleaned-out cycles (affects stages 1 and 3).
+  2 charging side still between batteries: efficiency, charge time per Ah and Ah moved came from the PEERS of each
+    depth (2.0 V peers B0041/B0045 -> efficiency 0.768 vs 0.820, B0041 4.9 vs 3.1 h per cycle). Fix: from the target
+    battery itself (same CC-CV protocol for all); charge energy = option Ah x own Wh in per Ah.
+  3 pooled headline: Cold batteries do not pay back their cost at these prices (lives 29-60 cycles), their large
+    negative rates dominated the mean. Fix: lifecycle summary per group (+ "all" for completeness); page has a group
+    selector (default Reference), a per-group table and per-group sweep; Study results lists each group.
+- v5.36.0 Reference rows for orientation only (superseded): usual 0.308/0.238/0.204, twin strategy 0.383/0.265/0.237
+  per hour (B0005/B0006/B0018).
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.36.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_lifecycle.py);
-   Operations & control: build fleet parts -> operation "Run for every battery..." -> replacement study (NASA
-   convention) -> lifecycle section appears; send the lifecycle CSV + screenshots (metrics, chart, sweep caption) and
-   the new replacement summary (live window changes it). Refresh the result backup.
+1. USER: upload v5.37.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_operation.py,
+   tests/test_m3_lifecycle.py); Operations & control: fleet parts -> operation (all batteries) -> replacement study ->
+   lifecycle: send the three CSVs + screenshots of the lifecycle per-group table, Reference and Cold metrics.
 2. Then: freeze the plan's six answers in STATUS (5av item 3) and start writing (Mission 2, physics, Mission 3).
 3. Writing (after the twin is finished, user decision): Mission 2 chapter, physics-phase chapter, Mission 3 chapter.
 4. Optional: Mixed assessment run for PINN all inputs; PyBaMM benchmark.

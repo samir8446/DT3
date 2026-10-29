@@ -48,7 +48,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.36.0"
+REQUIRED_ENGINE = "5.37.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -3391,11 +3391,14 @@ def _study_answers(res: Dict[str, Any]) -> Dict[str, List[str]]:
                        f"of battery × price settings ({best['battery'].nunique()} batteries).")
     lf = st.session_state.get("m3_life")
     if lf:
-        g = lf["summary"]["vs usual practice (% of operating profit per hour)"]
-        A["M3"].append(f"Expected benefit: twin strategy {g['twin strategy']:+.0f} % lifecycle profit per hour vs usual "
-                       f"practice ({g['twin replacement']:+.0f} % from replacement, "
-                       f"{g['twin strategy'] - g['twin replacement']:+.0f} % from operation); upper bound "
-                       f"{g['upper bound']:+.0f} %.")
+        sm = lf["summary"]
+        for gname in [x for x in sm.index.get_level_values(0).unique() if x != "all"]:
+            g = sm.loc[gname, "vs usual practice (% of operating profit per hour)"]
+            A["M3"].append(f"Expected benefit, {gname} ({int(sm.loc[gname, 'batteries'].iloc[0])} batteries): twin "
+                           f"strategy {g['twin strategy']:+.0f} % lifecycle profit per hour vs usual practice "
+                           f"({g['twin replacement']:+.0f} % replacement, "
+                           f"{g['twin strategy'] - g['twin replacement']:+.0f} % operation); upper bound "
+                           f"{g['upper bound']:+.0f} %.")
     if not A["M3"]:
         A["M3"].append("Run the operation and replacement studies in Operations & control to fill in this answer.")
     return A
@@ -7554,22 +7557,42 @@ def m3_lifecycle_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
         placeholder("No battery of the replacement study is covered by the shared physics.")
         return
     st.session_state["m3_life"] = {"summary": summ, "per": per, "prices": dict(p)}
-    g = summ["vs usual practice (% of operating profit per hour)"]
+    gcol = "vs usual practice (% of operating profit per hour)"
+    head = []
+    for gname in summ.index.get_level_values(0).unique():
+        s_ = summ.loc[gname]
+        head.append({"group": gname, "batteries": int(s_["batteries"].iloc[0]),
+                     "usual practice (per hour)": s_.loc["usual practice", "mean profit rate (per hour)"],
+                     "twin strategy vs usual (%)": s_.loc["twin strategy", gcol],
+                     "from replacement (%)": s_.loc["twin replacement", gcol],
+                     "from operation (%)": s_.loc["twin strategy", gcol] - s_.loc["twin replacement", gcol],
+                     "upper bound vs usual (%)": s_.loc["upper bound", gcol]})
+    head = pd.DataFrame(head).set_index("group")
+    groups_avail = [g_ for g_ in head.index if g_ != "all"] + ["all"]
+    default = "Reference" if "Reference" in groups_avail else groups_avail[0]
+    gsel = st.segmented_control("Group", groups_avail, default=default, key="m3_life_group") or default
+    s_ = summ.loc[gsel]
+    g = s_[gcol]
     k = st.columns(3)
-    k[0].metric("Twin strategy vs usual practice", f"{g['twin strategy']:+.0f} %",
+    k[0].metric(f"Twin strategy vs usual practice · {gsel}", f"{g['twin strategy']:+.0f} %",
                 help="Difference in mean lifecycle profit rate, as % of the usual practice's operating profit per hour.")
     k[1].metric("from replacement", f"{g['twin replacement']:+.0f} %")
     k[2].metric("from operation", f"{g['twin strategy'] - g['twin replacement']:+.0f} %")
-    show(fig_m3_lifecycle(summ, P), key="m3_life_fig", data=summ.reset_index())
-    show_table(summ.style.format({"mean profit rate (per hour)": "{:.3f}", "share of the possible gain": "{:.0%}",
-                                  "vs usual practice (% of operating profit per hour)": "{:+.1f}"}))
+    if (s_["mean profit rate (per hour)"] < 0).any():
+        st.caption("Negative profit rates: at these prices a battery of this group does not pay back its own cost "
+                   "within its life (short lives). Percentages there compare losses; read them with care.")
+    show(fig_m3_lifecycle(s_, P), key="m3_life_fig", data=s_.reset_index())
+    show_table(head.style.format({"usual practice (per hour)": "{:.3f}", "twin strategy vs usual (%)": "{:+.1f}",
+                                  "from replacement (%)": "{:+.1f}", "from operation (%)": "{:+.1f}",
+                                  "upper bound vs usual (%)": "{:+.1f}"}),
+               note="One line per group; 'all' pools groups of different kinds and is shown for completeness only.")
     cols = ["group", "battery", "end of life", "own option", "chosen option", "life ratio (chosen / own)",
             "do nothing", "usual practice", "twin replacement", "twin strategy", "upper bound"]
     show_table(per[cols].set_index(["group", "battery"]).style.format(
         {c: "{:.3f}" for c in cols[5:]} | {"end of life": "{:.0f}"}),
         note="Profit rates per hour. Negative values: the battery's life is too short to pay back its cost at these "
              "prices (Cold batteries).")
-    with st.expander("Sweep over the assumed prices", icon=":material/tune:"):
+    with st.expander(f"Sweep over the assumed prices · {gsel}", icon=":material/tune:"):
         rows = []
         for cost, kk, lead in itertools.product((30, 60, 120), (1.5, 3, 5), (5, 10, 20)):
             try:
@@ -7579,14 +7602,16 @@ def m3_lifecycle_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
                                              soh_eols={c: m3_soh_eol_for(c, p["rule"]) for c in lives})
             except Exception:
                 continue
-            gg = s["vs usual practice (% of operating profit per hour)"]
+            if gsel not in s.index.get_level_values(0):
+                continue
+            gg = s.loc[gsel, "vs usual practice (% of operating profit per hour)"]
             rows.append({"battery cost": cost, "unplanned ×": kk, "lead": lead,
                          "twin strategy (%)": gg["twin strategy"], "twin replacement (%)": gg["twin replacement"],
                          "upper bound (%)": gg["upper bound"]})
         sw = pd.DataFrame(rows)
         if len(sw):
-            st.caption(f"Twin strategy above usual practice in {(sw['twin strategy (%)'] > 0).sum()} of {len(sw)} "
-                       f"settings; median {sw['twin strategy (%)'].median():+.0f} %.")
+            st.caption(f"{gsel}: twin strategy above usual practice in {(sw['twin strategy (%)'] > 0).sum()} of "
+                       f"{len(sw)} settings; median {sw['twin strategy (%)'].median():+.0f} %.")
             show_table(sw.set_index(["battery cost", "unplanned ×", "lead"]).style.format("{:+.1f}"))
     download("Download the lifecycle study (CSV)", per.to_csv(index=False).encode(),
              f"m3_lifecycle_study__v{te.ENGINE_VERSION}.csv", "text/csv", key="m3_life_csv")

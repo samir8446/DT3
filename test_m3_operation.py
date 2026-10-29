@@ -85,3 +85,15 @@ def test_option_economics_follow_the_target_battery_not_the_peers(demo):
     assert own["economics"] == "within battery"
     assert own["Wh out"] == pytest.approx(3.5 * cap["S001"])     # peers' capacities do not leak in
     assert own["Ah"] == pytest.approx(cap["S001"])
+
+
+
+def test_charging_side_comes_from_the_target_battery(demo):
+    ct, groups, h = demo
+    cap = {"S001": 2.2, "S002": 1.6, "S005": 1.9, "S008": 1.7, "S003": 2.0, "S004": 1.8, "S006": 2.1, "S007": 1.5}
+    dep = pd.DataFrame([{"battery": b, "V": te.M3_DEPTH_REF, "Ah": q, "Wh": 3.5 * q, "hours": 0.5 * q}
+                        for b, q in cap.items()])
+    eco = te.m3_condition_economics(ct).loc["S001"]
+    o = te.m3_operation_options(h, ct, "S001", groups, dep).query("own").iloc[0]
+    assert o["Wh in"] == pytest.approx(o["Ah"] * eco["Wh in"] / eco["Ah"])
+    assert o["Ah moved"] == pytest.approx(o["Ah"] * eco["Ah moved"] / eco["Ah"])
