@@ -58,3 +58,30 @@ def test_study_prices_one_battery_and_compares_to_own(demo):
     assert (r["cycles to EOL"] > 0).all() and r["reached EOL"].all()
     cheap = te.m3_operation_study(h, ct, "S003", te.M3OperationEconomics(battery_cost_cycles=0.0), groups)
     assert np.allclose(cheap["profit rate (per hour)"], cheap["J_op per hour"])
+
+
+# ---- v5.35.0: depth economics measured inside batteries (cell-to-cell confound removed) ----
+def test_depth_table_is_monotone_and_matches_capacity(demo):
+    ct, groups, h = demo
+    master, imp, _ = te.make_synthetic_master(
+        n_cells=8, n_cycles=120, ambients=(24, 34, 43, 4, 24, 34, 43, 24), currents=(2, 2, 2, 2, 1, 4, 4, 2),
+        k_true=(4e-4, 5e-4, 3.5e-4, 5e-4, 6e-4, 4.5e-4, 5e-4, 5.5e-4), seed=7)
+    store = te.ParquetStore.from_dataframe(master)
+    dep = te.m3_depth_table(store, ct, ["S001", "S003"])
+    for b, d in dep.groupby("battery"):
+        d = d.sort_values("V", ascending=False)
+        assert (np.diff(d["Ah"]) >= -1e-9).all() and (np.diff(d["Wh"]) >= -1e-9).all()   # deeper = more
+        cap = ct[(ct.Cell_ID == b) & ~ct.outlier].sort_values("n").head(10)["Capacity_Ah"].median()
+        assert d["Ah"].max() == pytest.approx(cap, rel=0.03)
+
+
+def test_option_economics_follow_the_target_battery_not_the_peers(demo):
+    ct, groups, h = demo
+    cap = {"S001": 2.2, "S002": 1.6, "S005": 1.9, "S008": 1.7, "S003": 2.0, "S004": 1.8, "S006": 2.1, "S007": 1.5}
+    dep = pd.DataFrame([{"battery": b, "V": te.M3_DEPTH_REF, "Ah": q, "Wh": 3.5 * q, "hours": 0.5 * q}
+                        for b, q in cap.items()])
+    opts = te.m3_operation_options(h, ct, "S001", groups, dep)
+    own = opts[opts["own"]].iloc[0]
+    assert own["economics"] == "within battery"
+    assert own["Wh out"] == pytest.approx(3.5 * cap["S001"])     # peers' capacities do not leak in
+    assert own["Ah"] == pytest.approx(cap["S001"])

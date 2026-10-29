@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.34.0"
+ENGINE_VERSION = "5.35.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -11196,13 +11196,56 @@ def m3_condition_economics(ct: pd.DataFrame, cells: Optional[Sequence[str]] = No
         h = (med("t_dis_s") + np.nan_to_num(med("t_cc_s")) + np.nan_to_num(med("t_cv_s"))) / 3600
         dq = d["cum_Ah"].diff() / d["n"].diff() if "cum_Ah" in d else pd.Series(dtype=float)
         rows.append({"battery": c, "T_C": med("T_mean_C"), "I_dis": med("I_dis_A"), "V_cut": med("V_min_V"),
+                     "charge hours": (np.nan_to_num(med("t_cc_s")) + np.nan_to_num(med("t_cv_s"))) / 3600,
                      "Ah": med("Capacity_Ah"), "Ah moved": float(dq.median()) if dq.notna().any() else np.nan, "Wh out": med("E_dis_Wh"), "Wh in": med("E_ch_Wh"),
                      "hours": h, "efficiency": med("E_dis_Wh") / med("E_ch_Wh") if med("E_ch_Wh") > 0 else np.nan})
     return pd.DataFrame(rows).set_index("battery") if rows else pd.DataFrame()
 
 
+M3_DEPTH_GRID = np.round(np.arange(1.8, 2.81, 0.1), 1)
+M3_DEPTH_REF = 2.7            # every NASA battery discharges at least this deep: the common normaliser
+
+
+def m3_depth_table(store: "ParquetStore", ct: pd.DataFrame, cells: Sequence[str], first: int = 10,
+                   grid: Sequence[float] = tuple(M3_DEPTH_GRID)) -> pd.DataFrame:
+    """INSIDE each battery: Ah, Wh and hours delivered from full charge down to each voltage of `grid` that the
+    discharge actually reached (median of its first valid cycles; raw telemetry, voltage made monotone with a running
+    minimum as for the Q(V) features). Comparing depths inside one battery removes cell-to-cell differences, which
+    otherwise pose as a depth-of-discharge effect when each cut-off was run on other batteries."""
+    rows = []
+    for c in cells:
+        keep = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n").head(first)["Cycle_Index"]
+        if not len(keep):
+            continue
+        try:
+            df = prepare_cell(store.cell_frame(c))
+        except Exception:
+            continue
+        load = df[(df["Cycle_Type"] == "discharge") & (df["Current_A"] < -0.1) & df["Cycle_Index"].isin(set(keep))]
+        per = {v: [] for v in grid}
+        for _, d in load.groupby("Cycle_Index", sort=True):
+            if len(d) < 10:
+                continue
+            v = np.minimum.accumulate(d["Voltage_V"].to_numpy())
+            dt = d["dt"].to_numpy()
+            a = np.abs(d["Current_A"].to_numpy())
+            q, e, tt = np.cumsum(a * dt) / 3600, np.cumsum(d["Voltage_V"].to_numpy() * a * dt) / 3600, np.cumsum(dt) / 3600
+            for vg in grid:
+                idx = np.flatnonzero(v <= vg + 1e-3)
+                if len(idx):
+                    i = idx[0]
+                    per[vg].append((q[i], e[i], tt[i]))
+        for vg, vals in per.items():
+            if len(vals) >= 3:
+                arr = np.array(vals)
+                rows.append({"battery": c, "V": float(vg), "Ah": float(np.median(arr[:, 0])),
+                             "Wh": float(np.median(arr[:, 1])), "hours": float(np.median(arr[:, 2]))})
+    return pd.DataFrame(rows)
+
+
 def m3_operation_options(h: Dict[str, Any], ct: pd.DataFrame, cell: str,
-                         groups: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                         groups: Optional[pd.DataFrame] = None,
+                         depth: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Tested (current, cut-off) combinations at the battery's own temperature (same tested temperature value;
     current and cut-off as each battery was actually run, rounded to 0.5 A and 0.1 V), with their measured economics (median over the batteries tested that way) and identification flags."""
     tested = whatif_tested(h, groups)
@@ -11216,10 +11259,39 @@ def m3_operation_options(h: Dict[str, Any], ct: pd.DataFrame, cell: str,
     eco = m3_condition_economics(ct, list(same_T.index))
     ident = whatif_identifiability(h, groups).set_index("key")
     rows = []
+    dep = depth.set_index(["battery", "V"]) if depth is not None and len(depth) else None
+    ref_b = None
+    if dep is not None and (cell, M3_DEPTH_REF) in dep.index:
+        ref_b = float(dep.loc[(cell, M3_DEPTH_REF), "Ah"])
     for (i_, v_), g in same_T.groupby(["I_dis tested", "V_cut tested"]):
         e = eco.reindex(g.index).dropna(how="all")
         if not len(e):
             continue
+        if ref_b is not None:
+            # within-battery depth effect: peers = batteries at this temperature and current that reached v_,
+            # each normalised by its own Ah to the common depth; scaled to this battery's own Ah to that depth
+            vq = round(float(v_), 1)
+            peers = [b for b in same_T.index if np.isclose(same_T.loc[b, "I_dis tested"], i_)
+                     and (b, vq) in dep.index and (b, M3_DEPTH_REF) in dep.index and b in eco.index]
+            if peers:
+                r = pd.DataFrame({b: {"q": dep.loc[(b, vq), "Ah"] / dep.loc[(b, M3_DEPTH_REF), "Ah"],
+                                      "w": dep.loc[(b, vq), "Wh"] / dep.loc[(b, M3_DEPTH_REF), "Ah"],
+                                      "t": dep.loc[(b, vq), "hours"] / dep.loc[(b, M3_DEPTH_REF), "Ah"],
+                                      "eff": eco.loc[b, "efficiency"], "ch": eco.loc[b, "charge hours"] / eco.loc[b, "Ah"],
+                                      "mv": eco.loc[b, "Ah moved"] / eco.loc[b, "Ah"]} for b in peers}).T.median()
+                ah, wh = ref_b * r["q"], ref_b * r["w"]
+                flags = []
+                if not np.isclose(i_, own["I_dis tested"]) and ident.loc["I_dis", "status"] != "identified":
+                    flags.append(f"current: {ident.loc['I_dis', 'status']}")
+                if not np.isclose(v_, own["V_cut tested"]) and ident.loc["V_cut", "status"] != "identified":
+                    flags.append(f"cut-off: {ident.loc['V_cut', 'status']}")
+                rows.append({"I_dis": float(i_), "V_cut": float(v_),
+                             "own": bool(np.isclose(i_, own["I_dis tested"]) and np.isclose(v_, own["V_cut tested"])),
+                             "tested on": ", ".join(e.index), "economics from": ", ".join(peers),
+                             "economics": "within battery", "Ah": ah, "Ah moved": ah * r["mv"], "Wh out": wh,
+                             "Wh in": wh / r["eff"], "hours": ref_b * r["t"] + ah * r["ch"], "efficiency": r["eff"],
+                             "flags": "; ".join(flags) or "none"})
+                continue
         flags = []
         if not np.isclose(i_, own["I_dis tested"]) and ident.loc["I_dis", "status"] != "identified":
             flags.append(f"current: {ident.loc['I_dis', 'status']}")
@@ -11227,7 +11299,8 @@ def m3_operation_options(h: Dict[str, Any], ct: pd.DataFrame, cell: str,
             flags.append(f"cut-off: {ident.loc['V_cut', 'status']}")
         rows.append({"I_dis": float(i_), "V_cut": float(v_), "own": bool(np.isclose(i_, own["I_dis tested"]) and
                                                                          np.isclose(v_, own["V_cut tested"])),
-                     "tested on": ", ".join(e.index), "Ah": e["Ah"].median(), "Ah moved": e["Ah moved"].median(),
+                     "tested on": ", ".join(e.index), "economics from": ", ".join(e.index),
+                     "economics": "between batteries", "Ah": e["Ah"].median(), "Ah moved": e["Ah moved"].median(),
                      "Wh out": e["Wh out"].median(),
                      "Wh in": e["Wh in"].median(), "hours": e["hours"].median(),
                      "efficiency": e["efficiency"].median(), "flags": "; ".join(flags) or "none"})
@@ -11280,11 +11353,11 @@ def m3_operation_life(h: Dict[str, Any], cell: str, opt: Dict[str, Any], e: M3Op
 
 
 def m3_operation_study(h: Dict[str, Any], ct: pd.DataFrame, cell: str, e: M3OperationEconomics,
-                       groups: Optional[pd.DataFrame] = None) -> pd.DataFrame:
+                       groups: Optional[pd.DataFrame] = None, depth: Optional[pd.DataFrame] = None) -> pd.DataFrame:
     """Every tested option for `cell`: life, J_op, and profit rate with a planned replacement at end of life. The
     replacement cost is the same for all options: battery_cost_cycles x the OWN option's beginning-of-life J_op per
     cycle (so it is one physical battery, priced once)."""
-    opts = m3_operation_options(h, ct, cell, groups)
+    opts = m3_operation_options(h, ct, cell, groups, depth)
     if not len(opts):
         return pd.DataFrame()
     own = opts[opts["own"]]
@@ -11296,6 +11369,7 @@ def m3_operation_study(h: Dict[str, Any], ct: pd.DataFrame, cell: str, e: M3Oper
         r = m3_operation_life(h, cell, o.to_dict(), e, k)
         profit = r["J_op"] - c_rep
         rows.append({"I_dis": o["I_dis"], "V_cut": o["V_cut"], "own": o["own"], "tested on": o["tested on"],
+                     "economics": o["economics"], "economics from": o["economics from"],
                      "Wh out per cycle": o["Wh out"], "hours per cycle": o["hours"], "efficiency": o["efficiency"],
                      "cycles to EOL": r["cycles"], "hours to EOL": r["hours"], "reached EOL": r["reached EOL"],
                      "J_op": r["J_op"], "J_op per hour": r["J_op per hour"], "replacement cost": c_rep,

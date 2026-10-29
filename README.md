@@ -1,9 +1,16 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.34.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.35.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Mission 3 corrections after the first NASA run (v5.35.0)
+
+1. End-of-life rule "NASA convention" = 1.4 Ah but never above 80 % of initial capacity (Cold batteries).
+2. Operation economics measured inside each battery from the raw discharge traces (m3_depth_table): Ah, Wh, hours to
+   every voltage reached, normalised by the battery's own Ah to 2.7 V; removes the cell-to-cell confound.
+3. Tests 23.
 
 ## Mission 3 in the app (v5.34.0)
 

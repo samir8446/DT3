@@ -48,7 +48,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.34.0"
+REQUIRED_ENGINE = "5.35.0"
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE):
     import importlib
     te = importlib.reload(te)
@@ -63,7 +63,7 @@ st.set_page_config(
 _REQUIRED_FUNCS = ("fleet_shape_forecast", "fleet_shape", "shape_drop", "run_protocol", "protocol_scoreboard",
                    "train_ml_v2", "baseline_forecast_v2", "train_trajectory_model", "train_deep_trajectory",
                    "tune_level_model", "run_protocol_task", "train_pinn_model", "training_influence",
-                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay", "pinn_state_raw", "hybrid_portable", "integrated_snapshot", "integrated_timeline", "whatif_identifiability", "whatif_tested", "whatif_projection", "forecast_optimism", "conservative_eol")
+                   "ensemble_trajectories", "safe_origin", "reference_condition_ct", "dqdv_cell", "dqdv_modes", "dqdv_indicators", "attach_dqdv", "pinn_explain", "recovery_cohort", "recovery_physics_fit", "recovery_pinn_table", "nasa_physics_fit", "nasa_physics_table", "nasa_physics_trajectory", "nasa_hybrid_fit", "hybrid_table", "hybrid_trajectory", "hybrid_validation", "physics_forecast", "nasa_anomaly_scan", "anomaly_summary", "anomaly_validation", "nasa_anomaly_scan2", "anomaly_summary2", "anomaly_validation2", "anomaly_common_cause", "anomaly_events", "anomaly_cycle_status", "eol_cycle_from_replay", "pinn_state_raw", "hybrid_portable", "integrated_snapshot", "integrated_timeline", "whatif_identifiability", "whatif_tested", "whatif_projection", "forecast_optimism", "conservative_eol", "m3_depth_table", "m3_operation_study", "m3_maintenance_study")
 _missing = [f for f in _REQUIRED_FUNCS if not hasattr(te, f)]
 if not str(getattr(te, "ENGINE_VERSION", "0")).startswith(REQUIRED_ENGINE) or _missing:
     _here = Path(__file__).resolve().parent
@@ -7254,22 +7254,22 @@ def view_twin() -> None:
 # =============================================================================
 # Mission 3 (rebuilt on the validated twin): operation (stage 2) and maintenance (stage 1), in Operations & control
 # =============================================================================
-M3_EOL_RULES = {"NASA convention: 1.4 Ah, or 80 % of initial capacity for batteries that start near or below it": "nasa",
+M3_EOL_RULES = {"NASA convention: 1.4 Ah, but never above 80 % of initial capacity": "nasa",
                 "Control-bar end of life": "bar"}
 M3_GROUPS = ("Reference", "High current", "Hot", "Cold", "Pulsed load")   # constant conditions (Mixed excluded)
 
 
 def m3_soh_eol_for(c: str, rule: str) -> float:
     """End of life of battery c as a fraction of its initial capacity. NASA convention: 1.4 Ah (30 % fade of the
-    rated 2 Ah), or 80 % of initial capacity when 1.4 Ah is within 2 % of (or above) its initial capacity (cold
-    batteries). NaN when the control-bar threshold is undefined for this battery."""
+    rated 2 Ah), but never above 80 % of the battery's initial capacity (cold batteries start at 0.9-1.7 Ah: 1.4 Ah
+    would end their life within a few cycles; v5.34.0 bug: B0046-48 at 11-18 cycles). NaN when the control-bar
+    threshold is undefined for this battery."""
     d = CT_RAW[CT_RAW["Cell_ID"] == c]
     c_bol = float(d["C_bol_Ah"].iloc[0]) if len(d) and "C_bol_Ah" in d else float("nan")
     if not np.isfinite(c_bol) or c_bol <= 0:
         return float("nan")
     if rule == "nasa":
-        s = te.DEFAULT_EOL_AH / c_bol
-        return float(s) if s < 0.98 else 0.80
+        return float(min(te.DEFAULT_EOL_AH / c_bol, 0.80))
     s = te.soh_eol_for(c_bol, eol_ah)
     return float(s) if np.isfinite(s) and s < 0.98 else float("nan")
 
@@ -7302,18 +7302,35 @@ def fig_m3_options(r: pd.DataFrame, P: Palette, c: str) -> go.Figure:
     return style_fig(fig, P, 420, f"Operation options for {c} (tested combinations at its temperature)")
 
 
+@st.cache_data(show_spinner=False, max_entries=2)
+def m3_depth_cached(_ct: pd.DataFrame, key: str, cells: Tuple[str, ...]) -> pd.DataFrame:
+    """Within-battery depth table from the raw telemetry (saved in the result backup)."""
+    return backed("m3depth", lambda: te.m3_depth_table(store, _ct, list(cells)), _ct, cells)
+
+
 def m3_operation_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
     section("Mission 3 · 1. Operation: which current and cut-off?")
     st.markdown("Aggressive operation earns more per hour but ages the battery faster. For the selected battery, "
-                "every discharge current and cut-off **NASA ran at its temperature** is compared. Energy in, energy "
-                "out and hours per cycle are **measured** on the batteries run that way; ageing comes from the "
-                "shared physics, scaled to this battery's measured fade. Temperature is the battery's environment, "
-                "not a control.")
+                "every discharge current and cut-off **NASA ran at its temperature** is compared. Energy and hours "
+                "per cycle are **measured inside the batteries** from the raw discharge traces: each battery's Ah, Wh "
+                "and hours down to every voltage it reached, normalised by its own Ah to 2.7 V, so cell-to-cell "
+                "differences cannot pose as a depth effect. Ageing comes from the shared physics, scaled to this "
+                "battery's measured fade. Cut-off = measured end-of-discharge voltage (about 0.1 V below NASA's "
+                "nominal setting). Temperature is the battery's environment, not a control.")
     h = fleet.get("main")
     if h is None:
         st.warning("The shared physics is not available: " + (fleet.get("errors") or {}).get("main", "not built"))
         return
     ident = te.whatif_identifiability(h, te.condition_groups(CT_RAW))
+    if store is None:
+        depth = None
+    else:
+        with st.spinner("Measuring Ah, energy and time to each depth inside every battery (raw data, once)…"):
+            try:
+                depth = m3_depth_cached(CT_RAW, DATA_KEY_RAW, tuple(sorted(h["data"])))
+            except Exception as exc:
+                report_error("Depth measurement failed; economics fall back to between-battery values", exc, debug)
+                depth = None
     with st.expander("What NASA lets the twin vary (identifiability)", icon=":material/rule:"):
         show_table(ident.drop(columns=["key"]).set_index("condition"))
     eol_c = m3_soh_eol_for(cell, p["rule"])
@@ -7325,7 +7342,7 @@ def m3_operation_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
     else:
         e = te.M3OperationEconomics(buy_price_ratio=p["buy"], battery_cost_cycles=p["cost"], soh_eol=eol_c)
         try:
-            r = te.m3_operation_study(h, ct, cell, e, te.condition_groups(CT_RAW))
+            r = te.m3_operation_study(h, ct, cell, e, te.condition_groups(CT_RAW), depth)
         except Exception as exc:
             report_error("Operation study failed", exc, debug)
             r = pd.DataFrame()
@@ -7340,7 +7357,8 @@ def m3_operation_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
             k[2].metric("Fade scale k", f"{best['fade scale k']:.2f}",
                         help="Measured fade / physics fade for this battery (the physics alone is optimistic).")
             show(fig_m3_options(r, P, cell), key="m3_opt_fig", data=r)
-            cols = ["I_dis", "V_cut", "own", "tested on", "Wh out per cycle", "hours per cycle", "efficiency",
+            cols = ["I_dis", "V_cut", "own", "economics", "economics from", "Wh out per cycle", "hours per cycle",
+                    "efficiency",
                     "cycles to EOL", "J_op per hour", "profit rate (per hour)", "vs own (per hour)", "flags"]
             show_table(r[cols].style.format({"Wh out per cycle": "{:.2f}", "hours per cycle": "{:.2f}",
                                              "efficiency": "{:.3f}", "J_op per hour": "{:.3f}",
@@ -7357,7 +7375,8 @@ def m3_operation_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
             for cost, buy, eol in itertools.product((30, 60, 120), (0.2, 0.4, 0.6), (0.7, 0.8)):
                 try:
                     r = te.m3_operation_study(h, ct, c, te.M3OperationEconomics(battery_cost_cycles=cost,
-                                                                               buy_price_ratio=buy, soh_eol=eol), groups)
+                                                                               buy_price_ratio=buy, soh_eol=eol), groups,
+                                              depth)
                 except Exception:
                     continue
                 if len(r):

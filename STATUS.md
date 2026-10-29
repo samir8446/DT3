@@ -1,4 +1,4 @@
-# STATUS · handover for a new conversation · engine/app v5.34.0 · 2026-10-28
+# STATUS · handover for a new conversation · engine/app v5.35.0 · 2026-10-29
 
 Read this first. It replaces every earlier STATUS.md. Full change history: README.md.
 
@@ -9,11 +9,11 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.34.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.34.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.35.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.35.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
-  tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (4), v5.34.0
+  tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6), v5.35.0
 - requirements.txt: streamlit>=1.46,<1.66 (st.components.v1.html is deprecated; verified with 1.65), xgboost, lightgbm
 - battery-twin.zip: complete local package (INSTALL.bat one-click Windows installer -> %USERPROFILE%\battery-twin-app,
   Desktop shortcut "Battery Digital Twin"; setup/run scripts for Windows and Mac; .streamlit/config.toml upload 1 GB)
@@ -665,11 +665,29 @@ Runner-up in brackets. Near-ties (<0.05 pts): Hot forecast, Hot measured, Mixed 
 - Checks: AppTest of the page (build, option study, all-battery sweep, replacement study with both EOL rules, price
   change, Study results), all pages, 21 tests, md_check 0.
 
+## 5az. First NASA run of Mission 3 in the app (v5.34.0) -> two errors found, fixed in v5.35.0
+- Replacement study: twin 10 % of the possible gain (vs 42 % in 5aw) because the "NASA convention" rule gave Cold
+  batteries starting at 1.5-1.7 Ah a 1.4 Ah threshold (~88-90 % SOH): EOL at 11-18 cycles (B0046 18, B0047 11,
+  B0048 17 instead of 44/30/46), before the forecast starts. Fix: 1.4 Ah but never above 80 % of initial capacity
+  (reproduces 5as: Reference 1.4 Ah, Cold 80 %). The v5.34.0 replacement numbers are INVALID.
+- Operation study: each battery's best option was another battery's operation (B0005 own 2.7 V -> 2.4 V from
+  B0006/B0018; B0006/B0018 own ~2.4 V -> 2.7 V from B0005/B0036): option economics came from 1-2 other cells, so
+  cell-to-cell differences posed as a depth effect (2.4 V delivered MORE energy than 2.1 V: 6.87 vs 6.76 Wh; B0006
+  starts at 2.04 Ah, B0007 at 1.89). The v5.34.0 operation numbers are INVALID.
+  Also seen: fade scale k 0.14-3.06 (physics level far off for some cells, e.g. Pulsed 0.14-0.57, B0041 3.06);
+  "current: limited" flags on 108 of 1278 rows; cut-off labels are measured end-of-discharge voltages (~0.1 V below
+  NASA's nominal 2.0/2.2/2.5/2.7).
+- Fix (engine): m3_depth_table reads the raw discharge traces (first 10 valid cycles) and measures INSIDE each battery
+  the Ah, Wh and hours down to every voltage it reached (1.8-2.8 V). Option economics = this battery's own Ah to
+  2.7 V x the peers' (same temperature, same current, reached that depth) Ah / Wh / hours per Ah-to-2.7 V; charge
+  energy from peers' efficiency, charge time per Ah and Ah moved per Ah. Falls back to between-battery values (shown
+  as "economics: between batteries") when the depth table is missing. App: depth table cached + in result backup.
+- Tests 23: depth table monotone and matching capacity; option economics follow the target battery, not the peers.
+
 ## 6. Next steps (Mission 3, option B)
-1. USER: upload v5.34.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_operation.py);
-   in the app: Operations & control -> build fleet parts -> "Run for every battery and price setting" (download CSV)
-   -> "Run the replacement study" (NASA convention; download CSV); send both CSVs + screenshot of the
-   identifiability table and the replacement summary.
+1. USER: upload v5.35.0 (twin_engine.py, app.py, tests/test_integrated_twin.py, tests/test_m3_operation.py);
+   Operations & control -> build fleet parts -> operation "Run for every battery..." (CSV) -> replacement study
+   (NASA convention, CSV); screenshots: B0005 options table, replacement summary, identifiability expander.
 2. Stage 3: joint operation x replacement, lifecycle profit, benefit; fixed forecast start (live definition, 5aw).
 3. Writing (after the twin is finished, user decision): Mission 2 chapter, physics-phase chapter, Mission 3 chapter.
 4. Optional: Mixed assessment run for PINN all inputs; PyBaMM benchmark.
