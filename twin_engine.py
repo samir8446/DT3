@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.38.0"
+ENGINE_VERSION = "5.39.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -8413,8 +8413,9 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
         raise ValueError("the PINN models the evolution of the battery over throughput: forecast mode only")
     t0 = time.time()
     p = {"hidden": 32, "iterations": 1500, "learning_rate": 5e-3, "physics_weight": 1.0, **(model_params or {})}
-    v2 = bool(p.get("v2", False))
-    if v2:                                                 # PINN v2: pooled over every constant-condition battery
+    v2 = bool(p.get("v2", False))                          # v2 features: cut-off input + depth term + causal anchor
+    pooled = bool(p.get("pooled", v2))                     # v2 also pools; "PINN-v2-group" keeps the group (5bn)
+    if pooled:                                             # PINN v2: pooled over every constant-condition battery
         pool = sorted({c for g in NASA_PHYSICS_GROUPS for c in protocol_cells(ct, g)} - {cell_id})
     else:
         pool = [c for c in (train_cells if train_cells is not None else v2_training_pool(ct, cell_id)) if c != cell_id]
@@ -8499,6 +8500,9 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
     name = "PINN · physics-informed" if lam_w > 0 else "PINN · same network without physics"
     if v2:
         name = "PINN v2 · pooled, cut-off, causal anchor" if lam_w > 0 else "PINN v2 · same network without physics"
+        if not pooled:
+            name = ("PINN v2 within group · cut-off, causal anchor" if lam_w > 0
+                    else "PINN v2 within group · without physics")
         if lam_w > 0:
             learned["Depth sensitivity of LAM (a_V)"] = ph.get("a_V", float("nan"))
     out = TrajectoryForecast(name, "forecast", cell_id, n0, n_grid, soh, lo, hi, metrics,
@@ -8514,7 +8518,9 @@ PINN_MODELS = {"PINN": "PINN · physics-informed (mechanism equations enforced)"
                "PINN-full": "PINN · all inputs (measured state + conditions, mechanism equations enforced)",
                "PINN-full-ablation": "All-inputs network without physics (ablation)",
                "PINN-v2": "PINN v2 · pooled over all constant-condition batteries, cut-off input + depth term, causal anchor",
-               "PINN-v2-ablation": "PINN v2 network without physics (ablation)"}
+               "PINN-v2-ablation": "PINN v2 network without physics (ablation)",
+               "PINN-v2-group": "PINN v2 features (cut-off input + depth term, causal anchor), trained within the group",
+               "PINN-v2-group-ablation": "PINN v2 within group without physics (ablation)"}
 MODEL_SPECS.update({
     "PINN": ModelSpec("PINN", "Physics-informed network", "Mechanism states learned with the degradation equations enforced.",
                       (_P("hidden", "Hidden units", "int", 32, 8, 64), _P("iterations", "Training iterations", "int", 1500, 300, 4000),
@@ -8531,10 +8537,12 @@ def train_pinn_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
                      mode: str = "forecast", train_cells: Optional[Sequence[str]] = None, eol_ah: float = DEFAULT_EOL_AH,
                      model_params: Optional[Dict[str, Any]] = None, **kw: Any) -> "TrajectoryForecast":
     prm = dict(model_params or {})
-    if kind in ("PINN-ablation", "PINN-full-ablation", "PINN-v2-ablation"):
+    if kind in ("PINN-ablation", "PINN-full-ablation", "PINN-v2-ablation", "PINN-v2-group-ablation"):
         prm["physics_weight"] = 0.0
-    if kind in ("PINN-v2", "PINN-v2-ablation"):
+    if kind in ("PINN-v2", "PINN-v2-ablation", "PINN-v2-group", "PINN-v2-group-ablation"):
         prm["v2"] = True
+    if kind in ("PINN-v2-group", "PINN-v2-group-ablation"):
+        prm["pooled"] = False
     if kind in ("PINN-full", "PINN-full-ablation"):
         prm["full_inputs"] = True
     return train_pinn_level(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, **kw)
@@ -8568,7 +8576,8 @@ def tune_level_model(ct, imp, cell_id, n0, model_name, mode="forecast", train_ce
 
 for _k, _lab in (("PINN", "PINN · physics-informed"), ("PINN-ablation", "PINN · same network without physics"),
                  ("PINN-full", "PINN · all inputs"), ("PINN-full-ablation", "PINN · all inputs, without physics"),
-                 ("PINN-v2", "PINN v2 · pooled + cut-off"), ("PINN-v2-ablation", "PINN v2 · without physics")):
+                 ("PINN-v2", "PINN v2 · pooled + cut-off"), ("PINN-v2-ablation", "PINN v2 · without physics"),
+                 ("PINN-v2-group", "PINN v2 within group"), ("PINN-v2-group-ablation", "PINN v2 within group · no physics")):
     PROTOCOL_MODELS[f"pinn:{_k}"] = ("Physics-informed (PINN)", _lab)
 import dataclasses as _dc
 for _k, _base, _desc in (("PINN-full", "PINN", "Mechanism equations enforced; inputs: conditions + the battery's measured "
@@ -8577,7 +8586,10 @@ for _k, _base, _desc in (("PINN-full", "PINN", "Mechanism equations enforced; in
                          ("PINN-v2", "PINN", "Trained on every constant-condition battery (leave-one-battery-out), with "
                           "the discharge cut-off as input and a depth term in the LAM law; anchored on the "
                           "regeneration-robust causal SOH."),
-                         ("PINN-v2-ablation", "PINN-ablation", "The same v2 network and data without the physics.")):
+                         ("PINN-v2-ablation", "PINN-ablation", "The same v2 network and data without the physics."),
+                         ("PINN-v2-group", "PINN", "v2 features (cut-off input + LAM depth term, regeneration-robust "
+                          "causal anchor) with v1's within-group training: isolates them from pooling."),
+                         ("PINN-v2-group-ablation", "PINN-ablation", "The same within-group v2 network without the physics.")):
     if _base in MODEL_SPECS and _k not in MODEL_SPECS:
         MODEL_SPECS[_k] = _dc.replace(MODEL_SPECS[_base], name=_k, blurb=_desc)
 _protocol_forecast_l3 = _protocol_forecast

@@ -149,7 +149,7 @@ def test_hybrid_portable_pickles(demo):
 def test_app_requires_this_engine():
     app = (ROOT / "app.py").read_text(encoding="utf-8")
     req = re.search(r'REQUIRED_ENGINE = "([^"]+)"', app).group(1)
-    assert req == te.ENGINE_VERSION == "5.38.0"
+    assert req == te.ENGINE_VERSION == "5.39.0"
     for f in ("integrated_snapshot", "integrated_timeline", "whatif_projection", "whatif_identifiability",
               "hybrid_portable"):
         assert f in app and hasattr(te, f)

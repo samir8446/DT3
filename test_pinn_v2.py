@@ -47,3 +47,12 @@ def test_causal_anchor_ignores_a_regeneration_bump(demo):
     assert causal["soh"][-1] <= plain["soh"][-1] - 0.005        # the bump lifts the old anchor, not the causal one
     assert causal["soh"][-1] == pytest.approx(clean["soh"][-1], abs=0.006)
     assert "xV" not in plain and "xV" not in causal              # depth input only added inside v2 training
+
+
+def test_v2_within_group_keeps_the_group_pool(demo):
+    ct, imp = demo
+    f = te.train_pinn_model(ct, imp, "S001", 36, "PINN-v2-group", train_cells=["S002", "S005", "S008"],
+                            model_params={"iterations": 120})
+    assert sorted(f.train_cells) == ["S002", "S005", "S008"]     # v1's within-group pool
+    assert "Depth sensitivity of LAM (a_V)" in f.inputs_at_origin  # v2 features on
+    assert "within group" in f.model

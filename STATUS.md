@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.38.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.38.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.39.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.39.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
   tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6) + test_m3_lifecycle.py (3), v5.37.0 (27 tests)
@@ -922,6 +922,26 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - To run on NASA: accuracy assessment, origin 30 %, Reference / Hot / Cold, levels "PINN (original inputs) +
   ablation" and "PINN v2 + ablation"; judge vs PINN v1, its ablation and the frozen models (4.47 / 0.95 / 2.77),
   incl. bias.
+
+## 5bn. PINN v2 on NASA (v5.38.0, origin 30 %) -> NOT ADOPTED (full pooling = negative transfer)
+- Mean RMSE (bias), SOH pts: Reference v1 5.61 (+0.9) / v1-abl 6.32 / v2 5.80 (+0.9) / v2-abl 9.07 / frozen MLP 4.47;
+  Hot v1 0.98 / 0.93 / v2 13.48 (-12.7) / 3.15 / DT 0.95; Cold v1 8.44 (-5.5) / 4.79 / v2 7.38 (-4.0) / 4.13 / GP 2.77.
+- Per battery: v2 better on B0018 (5.96 vs 9.28) and B0041 (2.89 vs 8.77); worse on B0036 (3.78 vs 1.10), B0048,
+  all Hot (7.3-17.7). B0045 still fails (14.8).
+- Cause: pooling itself (the no-physics twin also worsens when pooled: Hot 0.93 -> 3.15, Reference 6.32 -> 9.07):
+  groups age differently (cold plating, hot short lives); 4-5 distinct condition sets are too few for one network to
+  separate them from 3 condition inputs. Literature recommends PARTIAL (hierarchical) pooling, not full pooling.
+- v2's own CV RMSE ~19 in every group (v1 1-12): internal CV flagged v2 before the test -> CV selection would reject it.
+- Confounded design: pooling + cut-off input + causal anchor changed together; candidate clean ablation "v2 within
+  group" (cut-off + anchor, v1 training pool).
+
+## 5bo. PINN v2 within group (v5.39.0): clean ablation of 5bn
+- New level "Level 4 · PINN v2 within group (cut-off + causal anchor) + ablation" (pinn:PINN-v2-group, -ablation):
+  v2 features (cut-off input + LAM depth term, regeneration-robust causal anchor) with v1's within-group training.
+  Engine: v2 switch split into features ("v2") and pooling ("pooled", default = v2); PINN v1 frozen values and PINN v2
+  output unchanged (verified); tests 31.
+- To run: Reference / Hot / Cold, origin 30 %, level "PINN v2 within group + ablation" (v1 and v2 results of 5bn can be
+  reused). Reading: v2-group vs v1 = effect of cut-off + anchor; v2 vs v2-group = effect of pooling.
 
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
