@@ -1,9 +1,15 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.37.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.38.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## PINN v2 (v5.38.0)
+
+1. Assessment level "PINN v2 + ablation": pooled leave-one-battery-out training over all constant-condition
+   batteries, cut-off voltage input with a LAM depth term, regeneration-robust causal anchor. PINN v1 unchanged.
+2. Models & forecasting: resistance diagnostic with magnitude check (app); tests 30 (tests/test_pinn_v2.py).
 
 ## Mission 3 corrections after the first lifecycle run (v5.37.0)
 

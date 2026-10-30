@@ -48,7 +48,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.37.0"
+REQUIRED_ENGINE = "5.38.0"
 if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
@@ -5490,7 +5490,9 @@ def assessment_section() -> None:
                       "Level 3 · DL forecast": [f"dl:{k}" for k in te.DL_MODELS],
                       "Level 3 · DL measured": [f"dlm:{k}" for k in te.DL_MODELS],
                       "Level 4 · PINN (original inputs) + ablation": ["pinn:PINN", "pinn:PINN-ablation"],
-                      "Level 4 · PINN all inputs + ablation": ["pinn:PINN-full", "pinn:PINN-full-ablation"]}
+                      "Level 4 · PINN all inputs + ablation": ["pinn:PINN-full", "pinn:PINN-full-ablation"],
+                      "Level 4 · PINN v2 (pooled + cut-off + causal anchor) + ablation": ["pinn:PINN-v2",
+                                                                                           "pinn:PINN-v2-ablation"]}
         levels = st.multiselect("Levels (baselines are always included: the verdict needs them)", list(level_keys),
                                 default=list(level_keys), key="acc_levels")
         keys = ["persistence", "trend", "shape"] + [k for lv in levels for k in level_keys[lv]]

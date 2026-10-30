@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.37.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.37.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.38.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.38.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
   tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6) + test_m3_lifecycle.py (3), v5.37.0 (27 tests)
@@ -892,6 +892,36 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   AND median measured/needed >= 0.5. Checked against a hand calculation (S002: 224 mV). Bug caught in testing:
   monotone curve used a running minimum instead of maximum (fixed).
   Demo: needed R growth 97-715 % vs measured 37-62 % -> not supported (the literature critique in action).
+
+## 5bl. Step 0 on NASA: resistance-driven knee RULED OUT (v5.37.0 app, 20 batteries)
+- Statistical test passes (LOBO, x = I x (R - R0) removes 58 % / 38 % / 55 % of the remaining error in Cold / Hot /
+  Reference, positive in every fit) BUT magnitude fails: measured / needed voltage drop median 0.02 / 0.04 / 0.03.
+  Load-step resistance grew only 1-29 % (x = 2-58 mV); removing the unexplained capacity through the cut-off needs
+  hundreds of mV (25-50x more). Verdict: not supported. The literature caveat (needs hundreds of % R growth) holds
+  for NASA LCO at 1-4 A.
+- Reading: resistance growth CO-VARIES with the unexplained loss (shared cause; resistance = indicator, as in Mission 1)
+  but does not CAUSE it through the cut-off. The magnitude check prevented building PINN v2 on a physically too-small
+  mechanism (thesis point: statistical support is not physical support).
+- Gap is battery-specific, not a uniform missing acceleration: positive B0005 (+8), B0006 (+20), B0018 (+8), B0041
+  (+15), B0045 (+13); negative B0036 (-13), B0046-48 (-6 to -14), Pulsed (-2 to -5); Hot within +-3.
+- Data quirk: B0033 x = -71 mV (noisy early load-step R); High current not scored (2 batteries).
+
+## 5bm. PINN v2 (v5.38.0; user choice A, points 1 + 2)
+- New assessment level "Level 4 · PINN v2 (pooled + cut-off + causal anchor) + ablation" (pinn:PINN-v2, pinn:PINN-v2-ablation):
+  (1) pooled: trains on EVERY constant-condition battery except the forecast one (leave-one-battery-out; the group's
+  train list is ignored), so temperature / current / cut-off effects become learnable; (2) cut-off input xV =
+  max(0, 2.7 - V_min median)/0.7 and LAM depth term exp(a_V xV) in the physics residual (a_V reported);
+  (3) regeneration-robust causal anchor: forecast battery (and CV cut batteries) use SOH_causal (trailing median 5 +
+  running minimum, past cycles only) instead of the 3-cycle rolling median, so a regeneration bump at the origin
+  cannot lift the forecast. Ablation = same network/data without physics.
+- Rest-time term (Saha & Goebel) NOT implemented: the parquet conversion keeps only time within cycles, not the cycle
+  start timestamps of the .mat files; adding them to the conversion would allow it later.
+- PINN v1 byte-identical: demo forecast and CV error equal before/after; frozen-value test added
+  (tests/test_pinn_v2.py, 3 tests; 30 tests total). Demo (S001): v1 RMSE 0.0031, v2 0.0041, v2 ablation 0.0109; v2
+  ~1.5x v1 time per battery.
+- To run on NASA: accuracy assessment, origin 30 %, Reference / Hot / Cold, levels "PINN (original inputs) +
+  ablation" and "PINN v2 + ablation"; judge vs PINN v1, its ablation and the frozen models (4.47 / 0.95 / 2.77),
+  incl. bias.
 
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
