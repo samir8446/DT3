@@ -849,6 +849,50 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   the Integrated twin (shares its saved results when settings match).
 - To run on NASA: replacement study -> compare twin + alarm (+ age limit) with 5be (B0006 FLEET 54, B0041 59, B0045 21).
 
+## 5bj. PINN improvement · review of the code and step 0 diagnostic (2026-10-29, app-only)
+- PINN v1 as built: trained WITHIN the group (3-4 other batteries + the target's cycles to the origin); inputs
+  throughput + temperature, cold flag, current, which are CONSTANT inside a group -> the condition physics cannot be
+  learned in the assessment, batteries differ only by a battery code from their first 30 %; the cut-off voltage (varies
+  inside every group, identified by the shared physics) is neither an input nor in the equations (B0045, worst battery,
+  is the 2.0 V Cold cell); physics = soft residual penalty, its parameters re-learned on 3-4 batteries per run.
+- Correction: "physics in the structure" was already tested (5ac-5af: shared physics, hybrids, v3, speed factor):
+  all optimistic because every equation decelerates and nothing accelerates late in life. Shared root cause.
+- Hypothesis for the missing acceleration AND the missing cut-off: capacity is measured under load to a fixed cut-off;
+  resistance growth adds a voltage drop x = I x (R - R0) that reaches the cut-off earlier (resistance-driven knee;
+  Attia et al., J. Electrochem. Soc. 2022 knee review, to verify before citing).
+- Step 0 (app, Models & forecasting -> "Diagnostic · is the loss the physics misses driven by resistance?"): physics
+  gap = SOH physics v2 - SOH measured; leave-one-battery-out OLS per group: throughput + throughput^2 vs + x.
+  Supported in a group if the x term removes >= 15 % of the remaining error AND its effect is positive in every
+  leave-one-out fit; verdict over groups (>= 2 supported / 1 partly / none). Criteria calibrated by simulation (150 runs
+  per setting): detection 76-98 %, false alarm 0-4 % with 3-5 batteries (a first design with an R^2 gain >= 0.05 and a
+  rank correlation >= 0.5 failed its own positive control and gave spurious correlations: replaced).
+  Demo: not supported (correct: synthetic data has no resistance-driven loss).
+- Next: NASA run of the diagnostic. Supported -> PINN v2 (cut-off input + resistance observation term, pooled training,
+  5-seed ensemble). Not supported -> next candidate: reversible rest-dependent term (regeneration).
+
+## 5bk. Literature review (Advanced Research, 2026-10-29) and step 0 magnitude check (app-only)
+- Review findings: (1) most likely cause of late-life optimism = missing OBSERVATION law: capacity measured under load
+  to a fixed cut-off; linear R or LLI growth alone can give a measured knee through the OCV curve shape ("threshold"
+  pathway; Attia et al. 2022 JES 169:060517; Mandli et al. 2019 IJER 43:2044). Shown on NMC/graphite, NOT on
+  LCO/NASA; critique: may need resistance growth of hundreds of %. (2) Regeneration: rest time as exogenous input,
+  transient additive observation term (Saha & Goebel 2009 PHM: C_{k+1} = eta C_k + b1 exp(-b2/dt_k); Olivares et al.
+  2013 IEEE TIM; Qin et al. 2016 Energies 9:896; Energies 2024 17:1679). (3) Architectures: physics in the structure
+  (Nascimento, Corbetta, Kulkarni, Viana 2021 JPS 513:230526 / PHM 2021 / Sci Rep 2023 13:13856, NASA, hybrid RNN
+  cell + fleet prior, code public), UDE (Bills et al. 2020 Cellfit; Kuzhiyil et al. 2025 Appl. Energy), GP discrepancy
+  (Fogelquist & Lin), adaptive loss weights (Wen et al. 2024 IEEE T-IV; Kendall et al. CVPR 2018), hierarchical
+  Bayesian pooling (Guo, Li & Pecht 2015 JPS 281:173). PINN4SOH (Wang et al. 2024 Nat Commun 15:4332) = estimation,
+  not forecasting. (4) No published NASA PINN uses LOBO forecasting from 30 % of life; sub-1 % errors use
+  within-battery splits or past capacity as input -> our protocol is stricter (state in the thesis).
+- Recommended PINN v2: latent Q_max(k), R(k) with existing physics -> measured capacity through the battery's own
+  discharge curve, current and cut-off; rest-time regeneration term; one model over all groups with condition
+  covariates (hierarchical); bounded UDE correction; GP discrepancy; metrics add late-life RMSE and signed bias.
+- Step 0 extended (app): per battery the extra voltage drop NEEDED to remove the unexplained capacity, read on its
+  own early discharge curve (Q(V) 3.95-3.10 V + raw depth table 2.8-1.8 V, gap interpolated), vs MEASURED x =
+  I x (R - R0); "measured / needed" and "R growth needed (%)". Group supported only if the statistical test passes
+  AND median measured/needed >= 0.5. Checked against a hand calculation (S002: 224 mV). Bug caught in testing:
+  monotone curve used a running minimum instead of maximum (fixed).
+  Demo: needed R growth 97-715 % vs measured 37-62 % -> not supported (the literature critique in action).
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

@@ -6253,6 +6253,168 @@ def fig_hybrid_traj(tr: pd.DataFrame, P: Palette, cell: str) -> go.Figure:
     return style_fig(fig, P, 430, f"Hybrid fit of {cell}: physics mechanisms, network correction and measurement")
 
 
+def _lobo_r2(df: pd.DataFrame, cols: List[str]) -> Tuple[float, np.ndarray]:
+    """Leave-one-battery-out R² of an OLS of 'gap' on cols (+ intercept), and the last column's coefficient in every
+    leave-one-out fit (its stability across batteries)."""
+    pred, last = np.full(len(df), np.nan), []
+    for b in df["battery"].unique():
+        tr, te_ = df["battery"] != b, df["battery"] == b
+        X = np.column_stack([np.ones(tr.sum())] + [df.loc[tr, c].to_numpy(float) for c in cols])
+        beta = np.linalg.lstsq(X, df.loc[tr, "gap"].to_numpy(float), rcond=None)[0]
+        Xt = np.column_stack([np.ones(te_.sum())] + [df.loc[te_, c].to_numpy(float) for c in cols])
+        pred[te_.to_numpy()] = Xt @ beta
+        last.append(beta[-1])
+    y = df["gap"].to_numpy(float)
+    return float(1 - np.nansum((y - pred) ** 2) / np.nansum((y - y.mean()) ** 2)), np.array(last)
+
+
+def _bol_discharge_curve(c: str, depth: Optional[pd.DataFrame]) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Beginning-of-life discharge curve of battery c: Ah delivered from full charge down to each voltage (median of
+    its first 10 valid cycles; voltage as a running minimum). 3.95-3.10 V from the cycle table's Q(V) features,
+    2.8-1.8 V from the within-battery depth table; 3.10-2.8 V interpolated. Returns (V ascending, Q)."""
+    g = CT_RAW[(CT_RAW["Cell_ID"] == c) & ~CT_RAW["outlier"]].sort_values("n").head(10)
+    if not len(g) or not all(col in g for col in te.QV_COLS):
+        return None
+    pts = [(float(v), float(q)) for v, q in zip(te.QV_GRID, g[te.QV_COLS].median()) if np.isfinite(q)]
+    if depth is not None and len(depth):
+        pts += [(float(r.V), float(r.Ah)) for r in depth[depth["battery"] == c].itertuples()]
+    if len(pts) < 5:
+        return None
+    pts.sort()                                             # V ascending -> Q should decrease
+    V = np.array([p_[0] for p_ in pts])
+    Q = np.maximum.accumulate(np.array([p_[1] for p_ in pts])[::-1])[::-1]   # monotone: more Ah at lower voltage
+    return V, Q
+
+
+def physics_gap_section() -> None:
+    """Step 0 of the PINN improvement plan (STATUS 5bj): is the capacity loss the physics misses driven by resistance
+    growth? NASA measures capacity under load to a fixed cut-off: a growing resistance makes the voltage reach the
+    cut-off earlier, an ACCELERATING loss of measured capacity that no material-degradation equation contains."""
+    section("Diagnostic · is the loss the physics misses driven by resistance?")
+    st.markdown("Every physics model so far is **optimistic late in life**: its equations slow down, real batteries "
+                "speed up. Hypothesis: capacity is measured **under load to a fixed cut-off voltage**, so as resistance "
+                "grows the extra voltage drop **x = current × (R − R at start)** reaches the cut-off earlier. Test: does "
+                "x explain the **physics gap** (SOH predicted by the shared physics − SOH measured) **beyond "
+                "throughput alone**, and do batteries with more resistance growth have a larger gap?")
+    fleet = st.session_state.get("itw_fleet") or {}
+    h = fleet.get("main")
+    cells_an = tuple(sorted({c for g in te.NASA_PHYSICS_GROUPS for c in te.protocol_cells(CT_RAW, g)}))
+    if h is None:
+        if not st.button("Run the resistance diagnostic", key="gap_go", icon=":material/troubleshoot:",
+                         help="Uses the shared physics (version 2, as the Integrated twin; saved in the backup)."):
+            placeholder("Press the button (or build the twin's fleet-wide parts on the Integrated twin page first).")
+            return
+        with st.spinner("Fitting the shared physics (saved, so only once)…"):
+            try:
+                h = hybrid_cached(CT_RAW, imp, DATA_KEY_RAW, cells_an, 30, "Re", 0.3, 2)
+            except Exception as exc:
+                report_error("Shared physics unavailable", exc, debug)
+                return
+    groups = te.condition_groups(CT_RAW)
+    depth = None
+    if store is not None:
+        try:
+            depth = m3_depth_cached(CT_RAW, DATA_KEY_RAW, tuple(sorted(h["data"])))
+        except Exception:
+            depth = None
+    rows, ends = [], []
+    for c, cd in h["data"].items():
+        tr = te.hybrid_trajectory(h, c)
+        r = CT_RAW[(CT_RAW["Cell_ID"] == c) & ~CT_RAW["outlier"]][["n", "R_dc_ohm"]].dropna().sort_values("n")
+        if len(r) < 8 or not len(tr):
+            continue
+        rs = r.set_index("n")["R_dc_ohm"].rolling(7, center=True, min_periods=1).median()
+        r0 = float(rs.head(5).median())
+        d = tr[["n", "SOH observed", "SOH physics"]].copy()
+        d["R"] = np.interp(d["n"], rs.index.to_numpy(float), rs.to_numpy(float))
+        d["x (V)"] = float(cd["I_dis"]) * (d["R"] - r0)
+        d["gap"] = d["SOH physics"] - d["SOH observed"]
+        d["throughput (Ah)"] = np.interp(d["n"], np.asarray(cd["n"], float), np.asarray(cd["a"], float)) * te.PINN_A_SCALE
+        g = str(groups.loc[c, "Group"]) if c in groups.index else "?"
+        d["battery"], d["group"] = c, g
+        rows.append(d)
+        tail = d.tail(5)
+        gap_end, x_end, i_dis = float(tail["gap"].mean()), float(tail["x (V)"].mean()), float(cd["I_dis"])
+        # magnitude check (literature caveat: resistance knees may need very large resistance growth): the extra
+        # voltage drop that would remove the unexplained capacity, read on this battery's own early discharge curve
+        need_mv, need_r = np.nan, np.nan
+        cur = _bol_discharge_curve(c, depth)
+        c_bol = float(CT_RAW.loc[CT_RAW["Cell_ID"] == c, "C_bol_Ah"].iloc[0]) if "C_bol_Ah" in CT_RAW else np.nan
+        v_cut = float(CT_RAW[(CT_RAW["Cell_ID"] == c) & ~CT_RAW["outlier"]].sort_values("n").head(10)["V_min_V"].median())
+        if cur is not None and gap_end > 0 and np.isfinite(c_bol) and np.isfinite(v_cut):
+            V, Q = cur
+            q_cut = float(np.interp(v_cut, V, Q))
+            q_star = q_cut - gap_end * c_bol
+            if q_star > Q.min():
+                v_star = float(np.interp(q_star, Q[::-1], V[::-1]))
+                need_mv = 1000 * max(v_star - v_cut, 0.0)
+                need_r = 100 * (need_mv / 1000) / (i_dis * r0) if r0 > 0 and i_dis > 0 else np.nan
+        ends.append({"group": g, "battery": c, "gap at end (SOH pts)": 100 * gap_end,
+                     "R growth (%)": 100 * (tail["R"].mean() / r0 - 1), "x at end (mV)": 1000 * x_end,
+                     "x needed (mV)": need_mv, "measured / needed": (1000 * x_end / need_mv) if need_mv > 0 else np.nan,
+                     "R growth needed (%)": need_r,
+                     "within-battery rank corr.": d["gap"].corr(d["x (V)"], method="spearman")})
+    if not rows:
+        st.info("No battery has both a physics trajectory and DC resistance data.")
+        return
+    D, E = pd.concat(rows, ignore_index=True), pd.DataFrame(ends)
+    res = []
+    for g, dg in list(D.groupby("group")) + [("all", D)]:
+        eg = E if g == "all" else E[E["group"] == g]
+        if dg["battery"].nunique() < 3:
+            continue
+        dg = dg.assign(a2=dg["throughput (Ah)"] ** 2)
+        r_time, _ = _lobo_r2(dg, ["throughput (Ah)", "a2"])
+        r_both, bx = _lobo_r2(dg, ["throughput (Ah)", "a2", "x (V)"])
+        reduction = 1 - (1 - r_both) / (1 - r_time) if r_time < 1 else 0.0
+        X = np.column_stack([np.ones(len(dg)), dg["throughput (Ah)"], dg["a2"], dg["x (V)"]])
+        beta = np.linalg.lstsq(X, dg["gap"].to_numpy(float), rcond=None)[0]
+        rho = eg["gap at end (SOH pts)"].corr(eg["x at end (mV)"], method="spearman") if len(eg) >= 4 else np.nan
+        res.append({"group": g, "batteries": dg["battery"].nunique(),
+                    "measured / needed (median)": float(eg["measured / needed"].median())
+                    if eg["measured / needed"].notna().any() else np.nan,
+                    "across batteries: rank corr. (gap vs x)": rho,
+                    "R² throughput only (leave-one-out)": r_time, "R² + resistance term": r_both,
+                    "unexplained error removed by resistance": reduction,
+                    "effect positive in every leave-one-out fit": bool((bx > 0).all()),
+                    "gap per 10 mV of x (SOH pts)": 100 * beta[3] * 0.01})
+    R = pd.DataFrame(res).set_index("group")
+    grp = R.drop(index="all", errors="ignore")
+    # criteria calibrated by simulation (3-5 batteries): detect a real effect 76-98 %, false alarm 0-4 % (STATUS 5bj)
+    ok = grp[(grp["unexplained error removed by resistance"] >= 0.15)
+             & grp["effect positive in every leave-one-out fit"]
+             & (grp["measured / needed (median)"].fillna(0) >= 0.5)]  # and the measured drop is large enough
+    verdict = ("supported" if len(ok) >= 2 else "partly supported" if len(ok) == 1 else "not supported")
+    col = {"supported": "#2E9E6E", "partly supported": "#E69F00", "not supported": "#9AA3AD"}[verdict]
+    st.markdown(f"<div style='padding:10px 14px;border-radius:8px;background:{col}22;border-left:6px solid {col}'>"
+                f"<b>Hypothesis {verdict}</b> · groups meeting both tests: "
+                f"{html.escape(', '.join(ok.index) or 'none')} (the resistance term removes ≥ 15 % of the error "
+                f"left by throughput alone, leave-one-battery-out, its effect is positive in every fit, and the "
+                f"measured voltage drop covers ≥ 50 % of the drop needed)</div>", unsafe_allow_html=True)
+    st.caption("Magnitude check: the voltage drop needed is read on each battery's own early discharge curve "
+               "(3.95-3.10 V from the Q(V) features, 2.8-1.8 V from the raw traces, 3.10-2.8 V interpolated) as the "
+               "rise of the effective cut-off that removes the capacity the physics misses. Measured = I x (R - R at "
+               "start) from the load-step resistance, which misses part of the charge-transfer loss: hence the factor 2.")
+    show_table(R.style.format("{:.2f}", na_rep="—", subset=[c for c in R.columns if c not in
+                                                             ("batteries", "effect positive in every leave-one-out fit")])
+               .format("{:.0f}", subset=["batteries"]),
+               note="Leave-one-battery-out: each battery's gap is predicted from the others, so a term only helps if it "
+                    "generalises across batteries. Throughput and its square stand for 'time' (both grow over life). "
+                    "The rank correlation across batteries is descriptive only: with 3-5 batteries it is unreliable.")
+    fig = go.Figure()
+    for g, dg in D.groupby("group"):
+        fig.add_trace(go.Scatter(x=1000 * dg["x (V)"], y=100 * dg["gap"], mode="markers", name=g, opacity=0.55,
+                                 marker=dict(size=5), text=dg["battery"],
+                                 hovertemplate="%{text} · x %{x:.0f} mV · gap %{y:.1f} pts<extra></extra>"))
+    fig.update_xaxes(title_text="Extra voltage drop x = I × (R − R at start) (mV)")
+    fig.update_yaxes(title_text="Physics gap: SOH physics − SOH measured (points)")
+    show(style_fig(fig, P, 460, "Does the physics gap grow with the resistance-driven voltage drop?"), key="gap_fig", data=D)
+    show_table(E.set_index(["group", "battery"]).style.format("{:.2f}", na_rep="—"))
+    st.session_state["gap_diag"] = {"summary": R, "per_battery": E, "verdict": verdict}
+    download("Download the diagnostic (CSV)", D.to_csv(index=False).encode(),
+             f"physics_gap_resistance__v{te.ENGINE_VERSION}.csv", "text/csv", key="gap_csv")
+
+
 def hybrid_section() -> None:
     section("Level 4 · Hybrid · Shared physics (the explanation) + a small neural network (what the physics misses)")
     st.markdown(
@@ -6377,6 +6539,7 @@ def view_models() -> None:
     pinn_section()
     nasa_physics_section()
     hybrid_section()
+    physics_gap_section()
     ladder_leaderboard()
     assessment_section()
 
