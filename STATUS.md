@@ -1044,6 +1044,10 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   and Cold batteries, population 6 x 4 generations, several presses of 10-20 min (B0005 first); (3) scorecard with
   the GA-PINN core; key question: does B0005 select sei_p < 1 or accel on, and does its error drop below the frozen
   model's 7.7 cycles.
+- Fix (app-only, after the first NASA GA run): the Integrated twin failed with the GA winner's key
+  ('pinn:PINN-ga|h48|lr0.01|w0.3|p0|a0|it900' = B0005's winner) because 7 display lookups used the fixed model
+  registry; now model_label() (GA genes read from the key). "Which model does what" describes the active core and its
+  retraining. GA table robust to incomplete entries. Reproduced with the exact key on all twin pages.
 
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->

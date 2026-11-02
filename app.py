@@ -2446,6 +2446,19 @@ def frozen_study_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: st
     return te.frozen_update_study(_ct, _imp, cell, list(train), group, soh_eol, intervals, anchors, horizon, eol_ah)
 
 
+def model_label(k: Optional[str]) -> str:
+    """Display name of a protocol model key; GA-PINN winners carry their genes in the key (not in the registry)."""
+    if not k:
+        return "—"
+    if k in te.PROTOCOL_MODELS:
+        return te.PROTOCOL_MODELS[k][1]
+    if "PINN-ga|" in k:
+        g = te.ga_pinn_genome(k)
+        return (f"GA-PINN · h{g['hidden']}, λ {g['physics_weight']:g}, SEI p {g['sei_p']:g}, "
+                f"acceleration {'on' if g['accel'] else 'off'}")
+    return k
+
+
 TWIN_CORES = ("Frozen data model (Mission 2)", "PINN twin core", "GA-PINN core")
 PINN_CORES = TWIN_CORES[1:]
 
@@ -3649,7 +3662,7 @@ def view_replay() -> None:
             f1, f2, f3 = st.columns([1.3, 1.2, 2.0], vertical_alignment="center")
             use_fz = f1.toggle(f"Frozen {grp_c} model", value=True, key="rp_fz",
                                help=f"The assessment winner of the {grp_c} group: forecast "
-                                    f"{te.PROTOCOL_MODELS[fz[0]][1]}, SOH-now {te.PROTOCOL_MODELS[fz[1]][1]} "
+                                    f"{model_label(fz[0])}, SOH-now {model_label(fz[1])} "
                                     f"({te.FROZEN_SOURCE}). It is retrained on the group's other batteries plus this "
                                     "battery's history up to now, and its forecast is re-anchored every cycle to the "
                                     "current SOH.")
@@ -3661,7 +3674,7 @@ def view_replay() -> None:
                                    "field mode, no capacity measured after the start; the frozen SOH-now model "
                                    "estimates it from the operando signals and retraining sees only those estimates. "
                                    "None: the model's own forecast.")
-            st.caption(f"Forecast: {te.PROTOCOL_MODELS[fz[0]][1]} · SOH-now: {te.PROTOCOL_MODELS[fz[1]][1]} · "
+            st.caption(f"Forecast: {model_label(fz[0])} · SOH-now: {model_label(fz[1])} · "
                        f"retrained on {len(train_c)} other {grp_c} batteries plus this one's history"
                        + (" · switch on Reference-condition SOH in the control bar to replay this battery as it was "
                           "assessed" if grp_c == "Mixed conditions" and not st.session_state.get("ref_soh") else ""))
@@ -3669,7 +3682,7 @@ def view_replay() -> None:
         "Live models", list(te.LIVE_MODELS),
         default=[m for m in ("twin", "mech", "pf", "trend", "frozen", "ens") if m in te.LIVE_MODELS], key="rp_models",
         format_func=lambda m: (te.LIVE_MODELS[m] if m != "frozen" else
-                               (f"Frozen {grp_c} model · {te.PROTOCOL_MODELS[fz[0]][1]}" if use_fz else
+                               (f"Frozen {grp_c} model · {model_label(fz[0])}" if use_fz else
                                 "Frozen model · not running for this battery")),
         help="ECM twin: physics + operando voltage. Particle filter: power law with the fleet prior, robust to knees. "
              "Adaptive trend KF: level-slope-curvature filter that bends quickly when fade accelerates. Hierarchical "
@@ -4880,7 +4893,7 @@ def frozen_update_section() -> None:
     if why_not:
         st.info(why_not + " Select a battery of another group in the control bar.", icon=":material/info:")
         return
-    st.caption(f"{grp_c} group · forecast: {te.PROTOCOL_MODELS[fz[0]][1]} · SOH-now: {te.PROTOCOL_MODELS[fz[1]][1]} · "
+    st.caption(f"{grp_c} group · forecast: {model_label(fz[0])} · SOH-now: {model_label(fz[1])} · "
                f"default settings.")
     c1, c2, c3, c4 = st.columns([1.4, 1.6, 0.8, 1.3])
     ivals = c1.multiselect("Retrain every (cycles)", [5, 10, 20, 50, 0], default=[5, 10, 20, 50, 0], key="fzu_ivals",
@@ -5552,7 +5565,7 @@ def assessment_section() -> None:
         keys = st.multiselect("Models (level 1 baselines, 2 machine learning, 3 deep learning, 4 physics-informed)", options,
                               default=["trend", "shape"] + [f"traj:{m}" for m in ("Bayesian Ridge", "Random Forest", "SVM")
                                                             if m in av] + ["dl:GRU"],
-                              key="acc_models", format_func=lambda k: te.PROTOCOL_MODELS[k][1])
+                              key="acc_models", format_func=lambda k: model_label(k))
     view = (lambda r: te.select_by_cv(r, 2, keys)[0]) if cv_mode else (lambda r: r)
     cells_g = tuple(te.protocol_cells(CT_RAW, grp))
     tasks = [(c, o, k) for c in cells_g for o in sorted(origins) for k in keys]
@@ -5570,7 +5583,7 @@ def assessment_section() -> None:
         t_start = time.time()
         for i, (c, o, k) in enumerate(tasks):
             prog.progress(i / max(len(tasks), 1),
-                          text=f"{i}/{len(tasks)} · {te.PROTOCOL_MODELS[k][1]} on {c} from {100 * o:.0f}% · "
+                          text=f"{i}/{len(tasks)} · {model_label(k)} on {c} from {100 * o:.0f}% · "
                                f"{time.time() - t_start:.0f}s")
             parts.append(assess_task_cached(store, ct_run, imp, dkey, cells_g, k, float(o), c, float(eol_ah)))
             if i % 3 == 2 or i == len(tasks) - 1:
@@ -7249,10 +7262,18 @@ def fig_twin_whatif(d: pd.DataFrame, summ: Dict[str, Any], P: Palette, c: str, s
 
 
 def twin_model_card(grp_c: Optional[str], fz: Optional[Tuple[str, str]], fleet: Optional[Dict[str, Any]]) -> None:
-    fc = (f"{te.PROTOCOL_MODELS[fz[0]][1]} (frozen {grp_c} model; test RMSE "
-          f"{te.FROZEN_SCORES.get(grp_c, float('nan')):.2f} SOH pts at 30 % of life)") if fz else "none for this group"
-    rows = [("Forecast SOH and end of life", fc, "Starts at 30 % of the training batteries' median life (known at deployment), re-anchored every cycle to the "
-             "measured capacity (Mission 2 update study: anchoring matters, retraining barely does)."),
+    if not fz:
+        fc = "none for this group"
+    elif twin_core() == TWIN_CORES[0]:
+        fc = (f"{model_label(fz[0])} (frozen {grp_c} model; test RMSE "
+              f"{te.FROZEN_SCORES.get(grp_c, float('nan')):.2f} SOH pts at 30 % of life)")
+    else:
+        fc = f"{model_label(fz[0])} ({twin_core()}, {grp_c}; compared in the twin scorecard below)"
+    _rf_ = core_refit()
+    fdesc = ("Starts at 30 % of the training batteries' median life (known at deployment), re-anchored every cycle to "
+             "the measured capacity" + (f"; retrained every {_rf_} cycles (sidebar)." if _rf_ else
+                                        " (Mission 2 update study: anchoring matters, retraining barely does)."))
+    rows = [("Forecast SOH and end of life", fc, fdesc),
             ("Anomalies", "FLEET (ageing speed vs the fleet) + OWN (fade slope vs its own past), common-cause check, "
              "end-of-life event", "Validated 11/11 on simulated knees and regeneration; causal."),
             ("Explanation", "Hybrid: shared physics (frozen) + bounded network; physics version 2 = split, version 3 = "
@@ -7822,6 +7843,9 @@ def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
         r = store_.get(c)
         if not r:
             rows.append({"battery": c, "status": "not started"})
+            continue
+        if not r.get("fitness") or "train" not in r:
+            rows.append({"battery": c, "status": "incomplete (press Run / continue)"})
             continue
         fit = r["fitness"]
         start = ga_fitness_cached(CT_RAW, imp, DATA_KEY, c, r["train"], r["n0"], float(eol_ah), start_key)["fitness"]
