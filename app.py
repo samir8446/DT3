@@ -2445,6 +2445,13 @@ def twin_core() -> str:
     return st.session_state.get("twin_core", TWIN_CORES[0])
 
 
+def core_refit(core: Optional[str] = None) -> int:
+    """Retrain interval of the twin's core (0 = trained once at the live start). Only the PINN core uses it: its
+    battery code is learned from the battery's own cycles, so retraining lets it see a fade that speeds up (B0005,
+    STATUS 5bs); the frozen data model stays as validated in Mission 2 (trained once, re-anchored)."""
+    return int(st.session_state.get("pinn_refit", 0)) if (core or twin_core()) == TWIN_CORES[1] else 0
+
+
 def frozen_context(c: str, core: Optional[str] = None) -> Tuple[Optional[str], Optional[Tuple[str, str]], List[str]]:
     """Group of a battery (recorded conditions), its frozen models, and the group's other batteries. core: the twin's
     forecaster (sidebar "Twin core model"); the PINN core replaces the group's frozen forecaster, trained the same way
@@ -2669,6 +2676,10 @@ with st.sidebar:
              help="Used by the Live twin, the Integrated twin and Mission 3. The PINN core is trained once at the live "
                   "start and re-anchored every cycle, like the frozen model; compare both with the twin scorecard "
                   "(Integrated twin page). The Model updating page always uses the frozen model (Mission 2).")
+    st.selectbox("PINN core: retrain every N cycles", [0, 10, 20, 30], key="pinn_refit",
+                 format_func=lambda v: "never (trained once at the live start)" if v == 0 else f"every {v} cycles",
+                 help="Only for the PINN core. Retraining lets its battery code follow a fade that speeds up; each "
+                      "retraining costs one PINN training (minutes on NASA the first time, then saved).")
     if st.session_state.get("demo"):
         if st.button("Leave synthetic demo"):
             st.session_state["demo"] = False
@@ -7095,7 +7106,7 @@ def twin_battery_parts(c: str) -> Dict[str, Any]:
         with st.spinner(f"Streaming {c} through the twin core ({twin_core()}, {grp_c}; saved, so it runs only once)…"):
             ns, nm = te.frozen_live_window(ct, c, train_c)
             out["frames"], out["track"] = frozen_cached(ct, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1],
-                                                        float(soh_eol), 0, "capacity", float(eol_ah), ns, nm)
+                                                        float(soh_eol), core_refit(), "capacity", float(eol_ah), ns, nm)
     except Exception as exc:
         out["error"] = str(exc)
     return out
@@ -7300,8 +7311,10 @@ def view_twin() -> None:
                 "it behaves abnormally, why it has lost capacity, and how other operating conditions would change "
                 "that. Each task comes from the model that proved best at it (Mission 3, option B). Move *today* "
                 "to replay the battery's life: the forecast and the detector see nothing after it.")
-    st.caption(f"Twin core model: **{twin_core()}** (change it in the sidebar). The forecast, the watch status and "
-               f"the downloaded timeline all come from this core.")
+    _rf = core_refit()
+    st.caption(f"Twin core model: **{twin_core()}**" + (f", retrained every {_rf} cycles" if _rf else "")
+               + " (change it in the sidebar). The forecast, the watch status and the downloaded timeline all come "
+                 "from this core.")
     grp_c, fz, _ = frozen_context(cell)
     fleet = twin_fleet_parts(build=False)
     with st.expander("Which model does what", icon=":material/account_tree:"):
@@ -7466,6 +7479,7 @@ def view_twin() -> None:
     tl = te.integrated_timeline(soh_eol_c, meas, frames, an, common, t_main, t_check, watch, watch_q)
     download("Download this battery's twin timeline (CSV)",
              tl.assign(battery=cell, group=grp_c, **{"app version": te.ENGINE_VERSION, "twin core": twin_core(),
+                                                    "core retrain every": core_refit(),
                                                     "end of life": _twin_eol_label(),
                                                     "watch uses": basis}).to_csv(index=False).encode(),
              f"integrated_twin_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="itw_csv")
@@ -7651,7 +7665,8 @@ def m3_lives(fleet: Dict[str, Any], rule: str, core: Optional[str] = None
             continue
         try:
             ns, nm = te.frozen_live_window(ct, c, train_c)
-            frames, _ = frozen_cached(ct, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1], float(eol_c), 0, "capacity",
+            frames, _ = frozen_cached(ct, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1], float(eol_c),
+                                      core_refit(core), "capacity",
                                       float(eol_ah), ns, nm)
         except Exception as exc:
             notes.append(f"{c}: forecast failed ({exc})")
@@ -7702,6 +7717,9 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
     """Which forecaster makes the better digital twin? Seven criteria agreed before running (STATUS 5bq), computed
     for the frozen data model and the PINN core on every battery that reached end of life (leave-one-out choices)."""
     section("Twin scorecard · frozen data model vs PINN core")
+    if core_refit(TWIN_CORES[1]):
+        st.caption(f"PINN core retrained every {core_refit(TWIN_CORES[1])} cycles (sidebar); the frozen model is trained "
+                   "once, as validated in Mission 2.")
     st.markdown("Seven criteria fixed **before** running: (1) end-of-life forecast error over the battery's life, "
                 "(2) late-life bias, (3) decision value in the replacement study, (4) honest uncertainty (band "
                 "coverage), (5) physical consistency, (6) one model for forecast, explanation and what-if, (7) speed. "
@@ -7710,7 +7728,7 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
         placeholder("Build the integrated twin first (button at the top of this page).")
         return
     rule = M3_EOL_RULES.get(st.session_state.get("m3_eol", list(M3_EOL_RULES)[0]), "nasa")
-    skey = (DATA_KEY, rule, float(eol_ah))
+    skey = (DATA_KEY, rule, float(eol_ah), core_refit(TWIN_CORES[1]))
     saved = st.session_state.get("twin_scorecard")
     if st.button("Score both twin cores", key="score_go", icon=":material/scoreboard:", type="primary",
                  help="Streams every battery that reached end of life through both cores (the PINN core trains once "
@@ -7723,7 +7741,8 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
                 grp_c, fz, train_c = frozen_context(c, core)
                 ns, nm = te.frozen_live_window(CT_RAW, c, train_c)
                 frames, _ = frozen_cached(CT_RAW, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1],
-                                          float(m3_soh_eol_for(c, rule)), 0, "capacity", float(eol_ah), ns, nm)
+                                          float(m3_soh_eol_for(c, rule)), core_refit(core), "capacity",
+                                          float(eol_ah), ns, nm)
                 sc = _scorecard_battery(tl, e, frames)
                 if sc:
                     rows.append({"core": core, "group": grp, "battery": c, **sc})
@@ -7821,7 +7840,7 @@ def m3_maintenance_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
                 "alarm, FLEET or OWN, also triggers the order), **best fixed age** (the usual practice) and **run to end of "
                 "life** (always unplanned). Margin and age are chosen on the *other* batteries (leave-one-out). "
                 "Revenue per cycle is proportional to SOH, so performance loss counts.")
-    key = (DATA_KEY, p["rule"], float(eol_ah), twin_core())
+    key = (DATA_KEY, p["rule"], float(eol_ah), twin_core(), core_refit())
     saved = st.session_state.get("m3_lives")
     if st.button("Run the replacement study (all batteries that reached end of life)", key="m3_maint_go",
                  type="primary", icon=":material/build:",

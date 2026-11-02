@@ -995,6 +995,19 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   on the Integrated twin page, "twin core" column in the timeline CSV, spinner names the core. Re-download needed
   with the sidebar on "PINN twin core".
 
+## 5bs. B0005 with the PINN core: systematic slow slope (not a seed); retraining option (app-only)
+- PINN-core timeline (twin core confirmed in CSV): EOL forecast 235 at cycle 56 (true 126), 193 at 72, 162 at 88,
+  153 at 100, 125 at 124 -> smooth, monotone convergence = systematic, not a diverging seed (mean |error| 45.3).
+- Cause: forecast fade ~0.10 SOH pts/cycle at cycle 56 vs actual ~0.25 afterwards; B0005 fades slowly before the
+  live start (~0.13 pts/cycle) then ~2x faster: the PINN's battery code learns "slow" and the decelerating SEI law
+  extrapolates it; trained once and only re-anchored, its slope never corrects. Textbook case of the missing
+  late-life acceleration (5bj).
+- App-only option: sidebar "PINN core: retrain every N cycles" (never / 10 / 20 / 30; default never = results of
+  5br unchanged); used by the Integrated twin, Mission 3 and the scorecard (cache keys include it; frozen model stays
+  trained once). Demo check: retrain every 30 -> fitted at 36, 66, 96.
+- Next: scorecard with retrain every 20; structural fix = acceleration term (GA-PINN physics-form genes / symbolic
+  regression), B0005 as the key test case.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).
