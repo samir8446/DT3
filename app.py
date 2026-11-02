@@ -7982,7 +7982,9 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
                     score = dict(vals)
                 order = sorted(score, key=score.get)
                 tol = 0.01 if cname[:1] in ("3", "4", "5") else 0.25
-                row["better"] = "tie" if abs(score[order[1]] - score[order[0]]) < tol else order[0]
+                tied = [k for k in order if abs(score[k] - score[order[0]]) < tol]
+                row["better"] = ("tie" if len(tied) == len(order) else
+                                 order[0] if len(tied) == 1 else " = ".join(tied))   # e.g. both PINN cores beat frozen
             out.append(row)
     S = pd.DataFrame(out)
     S.loc[S["criterion"].str.startswith("2 ·"), "criterion"] = "2 · late-life bias, size (cycles; |bias|)"

@@ -1049,6 +1049,21 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   registry; now model_label() (GA genes read from the key). "Which model does what" describes the active core and its
   retraining. GA table robust to incomplete entries. Reproduced with the exact key on all twin pages.
 
+## 5bv. GA-PINN first NASA results (v5.41.0; GA finished for B0005 only, B0006 generation 1)
+- B0005 GA (15 evaluations): winner h48 | lr 0.01 | lambda 0.3 | SEI p 0 | accel off | it 900; nested fitness
+  11.72 (current settings) -> 4.68 (-60 %); validation late bias -8.21 -> +0.44 pts. Test on B0005 itself (twin,
+  retrain 20): EOL error 25.14 -> 23.91 cycles, late-life bias -2.96 -> -0.61 cycles. Small transfer: nested LOBO can
+  only tune for what the training batteries (B0006/7/18) show; B0005's slow-then-2x-faster fade is specific to it.
+- PHYSICAL FINDING: all top-10 genomes use SEI p = 0 (steady SEI growth); every p = 1 genome (diffusion-limited,
+  decelerating) ranks near the bottom (fitness 8.9-11.7); lambda 0.3 preferred; acceleration term mixed. The data
+  rejects the decelerating SEI law for NASA Reference cells (confirms 5bj by systematic search).
+- Scorecard all 8 (frozen / PINN / GA-PINN; GA-PINN = PINN core except B0005): EOL error 6.05 / 6.46 / 6.31;
+  |late bias| 2.75 / 1.36 / 1.06; coverage 1.00 / 0.96 / 0.95; calibrated 0.79 / 0.78 / 0.77; decision values equal.
+- App fix: "better" label names all tied leaders (e.g. "PINN twin core = GA-PINN core" in Cold, 2.52 vs frozen 4.60);
+  previously printed "tie".
+- Next: finish GA for the other 7 batteries; proposal: self-tuning twin = at each retraining choose genes by causal
+  backtest on the battery's OWN recent cycles (adapts to battery-specific acceleration like B0005, no future data).
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).
