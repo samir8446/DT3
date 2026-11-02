@@ -48,7 +48,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.40.0"
+REQUIRED_ENGINE = "5.41.0"
 if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
@@ -2419,6 +2419,14 @@ def live_cached(_ekf: te.EKFResult, _ct: pd.DataFrame, _imp: Optional[pd.DataFra
                   models, frozen_cfg, _extra)
 
 
+@st.cache_data(show_spinner=False, max_entries=4096)
+def ga_fitness_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str, train: Tuple[str, ...],
+                      n0: int, eol_ah: float, genome: Tuple[Tuple[str, Any], ...]) -> Dict[str, float]:
+    """One GA-PINN evaluation (nested leave-one-out fitness), saved on disk: a stopped search resumes from here."""
+    return backed("gapinn", lambda: te.ga_pinn_fitness(_ct, _imp, cell, n0, list(train), eol_ah, dict(genome)),
+                  _ct, _imp, cell, train, n0, eol_ah, genome)
+
+
 @st.cache_data(show_spinner=False, max_entries=16)
 def frozen_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cell: str, train: Tuple[str, ...],
                   fkey: str, mkey: str, soh_eol: float, refit: int, anchor: str, eol_ah: float,
@@ -2438,7 +2446,8 @@ def frozen_study_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: st
     return te.frozen_update_study(_ct, _imp, cell, list(train), group, soh_eol, intervals, anchors, horizon, eol_ah)
 
 
-TWIN_CORES = ("Frozen data model (Mission 2)", "PINN twin core")
+TWIN_CORES = ("Frozen data model (Mission 2)", "PINN twin core", "GA-PINN core")
+PINN_CORES = TWIN_CORES[1:]
 
 
 def twin_core() -> str:
@@ -2449,7 +2458,13 @@ def core_refit(core: Optional[str] = None) -> int:
     """Retrain interval of the twin's core (0 = trained once at the live start). Only the PINN core uses it: its
     battery code is learned from the battery's own cycles, so retraining lets it see a fade that speeds up (B0005,
     STATUS 5bs); the frozen data model stays as validated in Mission 2 (trained once, re-anchored)."""
-    return int(st.session_state.get("pinn_refit", 0)) if (core or twin_core()) == TWIN_CORES[1] else 0
+    return int(st.session_state.get("pinn_refit", 0)) if (core or twin_core()) in PINN_CORES else 0
+
+
+def ga_winner_key(c: str) -> Optional[str]:
+    """Protocol key of battery c's GA-PINN winner (GA-PINN section, Integrated twin page), if its search finished."""
+    r = (st.session_state.get("ga_pinn") or {}).get(c) or {}
+    return r.get("best_key") if r.get("done") else None
 
 
 def frozen_context(c: str, core: Optional[str] = None) -> Tuple[Optional[str], Optional[Tuple[str, str]], List[str]]:
@@ -2459,8 +2474,11 @@ def frozen_context(c: str, core: Optional[str] = None) -> Tuple[Optional[str], O
     groups = te.condition_groups(CT_RAW)
     grp_c = str(groups.loc[c, "Group"]) if c in groups.index else None
     fz = te.frozen_models_for(grp_c)
-    if fz and (core or twin_core()) == TWIN_CORES[1]:
+    core_ = core or twin_core()
+    if fz and core_ == TWIN_CORES[1]:
         fz = (te.PINN_TWIN_KEY, fz[1])
+    elif fz and core_ == TWIN_CORES[2]:                    # GA-PINN winner; the default PINN core until its search ends
+        fz = (ga_winner_key(c) or te.PINN_TWIN_KEY, fz[1])
     train_c = [x for x in te.protocol_cells(CT_RAW, grp_c) if x != c] if fz else []
     return grp_c, fz, train_c
 
@@ -7358,6 +7376,15 @@ def view_twin() -> None:
     t_main = te.hybrid_trajectory(fleet["main"], cell) if fleet.get("main") and cell in fleet["main"]["data"] else None
     t_check = te.hybrid_trajectory(fleet["check"], cell) if fleet.get("check") and cell in fleet["check"]["data"] else None
     frames = bp["frames"]
+    s_cal = ((st.session_state.get("twin_scorecard") or {}).get("scales") or {}).get((twin_core(), cell))
+    if frames and s_cal is not None and abs(s_cal - 1.0) > 1e-9 and st.toggle(
+            f"Calibrated band (width × {s_cal:g}, learned on the other batteries of the group)", key="itw_cal",
+            help="From the twin scorecard (4b): the band width that gives 80 % coverage on the OTHER batteries of "
+                 "this group, applied to this battery. Changes the band, the early/late end-of-life and the status."):
+        frames = {k_: (fr[0], np.asarray(fr[1], float),
+                       np.asarray(fr[1], float) - s_cal * (np.asarray(fr[1], float) - np.asarray(fr[2], float)),
+                       np.asarray(fr[1], float) + s_cal * (np.asarray(fr[3], float) - np.asarray(fr[1], float)))
+                  + tuple(fr[4:]) for k_, fr in frames.items()}
 
     ns = meas["n"].astype(int).tolist()
     c1, c2, c3, c4 = st.columns([3.0, 1.1, 1.1, 1.5], vertical_alignment="bottom")
@@ -7484,6 +7511,7 @@ def view_twin() -> None:
                                                     "watch uses": basis}).to_csv(index=False).encode(),
              f"integrated_twin_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="itw_csv")
     twin_whatif(fleet, cell, soh_eol_c)
+    ga_pinn_section(fleet)
     twin_scorecard_section(fleet)
 
 
@@ -7713,39 +7741,173 @@ def _group_share(per: pd.DataFrame, policy: str, cells: List[str]) -> float:
     return float((pol - base).sum() / room) if room > 0 else np.nan
 
 
-def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
-    """Which forecaster makes the better digital twin? Seven criteria agreed before running (STATUS 5bq), computed
-    for the frozen data model and the PINN core on every battery that reached end of life (leave-one-out choices)."""
-    section("Twin scorecard · frozen data model vs PINN core")
-    if core_refit(TWIN_CORES[1]):
-        st.caption(f"PINN core retrained every {core_refit(TWIN_CORES[1])} cycles (sidebar); the frozen model is trained "
-                   "once, as validated in Mission 2.")
-    st.markdown("Seven criteria fixed **before** running: (1) end-of-life forecast error over the battery's life, "
-                "(2) late-life bias, (3) decision value in the replacement study, (4) honest uncertainty (band "
-                "coverage), (5) physical consistency, (6) one model for forecast, explanation and what-if, (7) speed. "
-                "Same batteries, same live window, same re-anchoring for both cores.")
+def _band_coverage(frames: Dict[int, Any], e: float, soh_eol: float, s: float = 1.0) -> float:
+    """Share of forecast cycles (before end of life) whose end-of-life band contains the real end of life, with the
+    band's half-widths scaled by s (calibration, STATUS 5bu)."""
+    hits = []
+    for n, fr in (frames or {}).items():
+        if n >= e:
+            continue
+        fut, med, lo, hi = (np.asarray(x, float) for x in fr[:4])
+        if not len(fut):
+            continue
+        lo_s, hi_s = med - s * (med - lo), med + s * (hi - med)
+        below_lo, below_hi = np.nonzero(lo_s <= soh_eol)[0], np.nonzero(hi_s <= soh_eol)[0]
+        early = fut[below_lo[0]] if len(below_lo) else np.inf
+        late = fut[below_hi[0]] if len(below_hi) else np.inf
+        hits.append(early <= e <= late)
+    return float(np.mean(hits)) if hits else np.nan
+
+
+BAND_SCALES = tuple(np.round(np.arange(0.1, 1.51, 0.05), 2))
+
+
+def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
+    """Professor's proposal (STATUS 5bu): a genetic algorithm searches the PINN configuration and the FORM of its
+    physics for each battery, scored by nested leave-one-out on the training batteries only."""
+    section("GA-PINN · genetic algorithm over the PINN and its physics")
+    st.markdown("For each battery, a genetic algorithm searches six genes: **hidden size**, **learning rate**, "
+                "**physics weight λ**, **SEI law exponent p** (1 = slows down as the layer grows, 0 = steady), an "
+                "**acceleration term** (loss of active material speeds up with the total damage: the knee) and "
+                "**training length**. Fitness = validation RMSE + 0.5 × |late-life bias| + small physics and time "
+                "terms, computed by **nested leave-one-out**: only the training batteries' futures are scored, never "
+                "the battery itself. The current twin-core settings are always in the first population. Evaluations "
+                "are saved, so a stopped search continues where it stopped.")
     if not fleet or "scan" not in fleet:
         placeholder("Build the integrated twin first (button at the top of this page).")
         return
     rule = M3_EOL_RULES.get(st.session_state.get("m3_eol", list(M3_EOL_RULES)[0]), "nasa")
-    skey = (DATA_KEY, rule, float(eol_ah), core_refit(TWIN_CORES[1]))
+    lives, _ = m3_lives(fleet, rule, TWIN_CORES[0])
+    cands = sorted(lives)
+    if not cands:
+        st.info("No battery reached end of life under the Mission 3 end-of-life rule.")
+        return
+    c1, c2, c3 = st.columns(3)
+    pop = c1.number_input("Population", 4, 12, 6, key="ga_pop")
+    gens = c2.number_input("Generations", 2, 8, 4, key="ga_gens")
+    mins = c3.number_input("Time budget per press (minutes)", 2, 60, 10, key="ga_mins")
+    sel = st.multiselect("Batteries", cands, default=cands, key="ga_cells")
+    store_ = st.session_state.setdefault("ga_pinn", {})
+    if st.button("Run / continue GA-PINN", key="ga_go", icon=":material/genetics:", type="primary"):
+        deadline = time.time() + 60 * float(mins)
+        msg = st.empty()
+        for c in sel:
+            prev = store_.get(c) or {}
+            if prev.get("done") and prev.get("settings") == (int(pop), int(gens)):
+                continue
+            grp_c, fz, train_c = frozen_context(c, TWIN_CORES[0])
+            ns, _ = te.frozen_live_window(CT_RAW, c, train_c)
+            count = {"n": 0}
+
+            def evaluate(g: Dict[str, Any], c=c, train_c=train_c, ns=ns) -> float:
+                count["n"] += 1
+                msg.caption(f"{c}: evaluation {count['n']} (genome {te.ga_pinn_key(g).split('|', 1)[1]})")
+                return ga_fitness_cached(CT_RAW, imp, DATA_KEY, c, tuple(train_c), int(ns), float(eol_ah),
+                                         tuple(sorted(g.items())))["fitness"]
+            try:
+                run = te.ga_pinn_run(evaluate, int(pop), int(gens), seed=0, deadline=deadline)
+            except Exception as exc:
+                report_error(f"GA-PINN failed for {c}", exc, debug)
+                break
+            run["settings"], run["train"], run["n0"] = (int(pop), int(gens)), tuple(train_c), int(ns)
+            store_[c] = run
+            if not run["done"]:
+                st.info(f"Time budget reached during {c} (generation {run['generation'] + 1} of {int(gens)}). "
+                        "Press again to continue: finished evaluations are reused.")
+                break
+        msg.empty()
+    rows, hist, evals = [], [], []
+    start_key = tuple(sorted(te.GA_PINN_START.items()))
+    for c in sel:
+        r = store_.get(c)
+        if not r:
+            rows.append({"battery": c, "status": "not started"})
+            continue
+        fit = r["fitness"]
+        start = ga_fitness_cached(CT_RAW, imp, DATA_KEY, c, r["train"], r["n0"], float(eol_ah), start_key)["fitness"]
+        best_k = min(fit, key=fit.get) if fit else None
+        bg = r["genomes"][best_k] if best_k else {}
+        rows.append({"battery": c, "status": "done" if r["done"] else f"generation {r['generation'] + 1}",
+                     "evaluations": len(fit), "fitness, current settings": start,
+                     "fitness, best": fit[best_k] if best_k else np.nan,
+                     "improvement (%)": 100 * (1 - fit[best_k] / start) if best_k and start > 0 else np.nan,
+                     "hidden": bg.get("hidden"), "learning rate": bg.get("learning_rate"),
+                     "λ physics": bg.get("physics_weight"), "SEI p": bg.get("sei_p"),
+                     "acceleration": ("on" if bg.get("accel") else "off") if bg else None,
+                     "iterations": bg.get("iterations")})
+        for h in r["history"]:
+            hist.append({"battery": c, **h})
+        for k_, g in r["genomes"].items():
+            d = ga_fitness_cached(CT_RAW, imp, DATA_KEY, c, r["train"], r["n0"], float(eol_ah), tuple(sorted(g.items())))
+            evals.append({"battery": c, "genome": te.ga_pinn_key(g).split("|", 1)[1], **d})
+    R = pd.DataFrame(rows).set_index("battery")
+    show_table(R.style.format("{:.3g}", subset=[c for c in R.columns if R[c].dtype.kind == "f"], na_rep="—"),
+               note="Lower fitness is better. A finished search becomes the GA-PINN core of that battery (sidebar: "
+                    "Twin core model → GA-PINN core); unfinished batteries use the default PINN core.")
+    if hist:
+        H = pd.DataFrame(hist)
+        fig = go.Figure()
+        for c, dh in H.groupby("battery"):
+            fig.add_trace(go.Scatter(x=dh["generation"] + 1, y=dh["best fitness"], mode="lines+markers", name=c))
+        fig.update_xaxes(title_text="Generation", dtick=1)
+        fig.update_yaxes(title_text="Best fitness (lower is better)")
+        show(style_fig(fig, P, 360, "GA-PINN: best fitness per generation"), key="ga_fig", data=H)
+    if evals:
+        download("Download all GA-PINN evaluations (CSV)", pd.DataFrame(evals).to_csv(index=False).encode(),
+                 f"ga_pinn_evaluations__v{te.ENGINE_VERSION}.csv", "text/csv", key="ga_csv")
+
+
+def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
+    """Which forecaster makes the better digital twin? Seven criteria agreed before running (STATUS 5bq), computed
+    for every twin core on every battery that reached end of life (leave-one-out choices); 4b = band coverage after
+    leave-one-out calibration of the band width (5bu)."""
+    section("Twin scorecard · frozen data model vs PINN core vs GA-PINN core")
+    st.markdown("Seven criteria fixed **before** running: (1) end-of-life forecast error over the battery's life, "
+                "(2) late-life bias, (3) decision value in the replacement study, (4) honest uncertainty (band "
+                "coverage; 4b after calibration), (5) physical consistency, (6) one model for forecast, explanation "
+                "and what-if, (7) speed. Same batteries, same live window, same re-anchoring for every core. "
+                "Calibration (4b): the band width of each battery is scaled by a factor learned on the **other** "
+                "batteries of its group so that their coverage is 80 %.")
+    if core_refit(TWIN_CORES[1]):
+        st.caption(f"PINN cores retrained every {core_refit(TWIN_CORES[1])} cycles (sidebar); the frozen model is "
+                   "trained once, as validated in Mission 2.")
+    if not fleet or "scan" not in fleet:
+        placeholder("Build the integrated twin first (button at the top of this page).")
+        return
+    rule = M3_EOL_RULES.get(st.session_state.get("m3_eol", list(M3_EOL_RULES)[0]), "nasa")
+    ga_sig = tuple(sorted((c, r.get("best_key")) for c, r in (st.session_state.get("ga_pinn") or {}).items()
+                          if r.get("done")))
+    skey = (DATA_KEY, rule, float(eol_ah), core_refit(TWIN_CORES[1]), ga_sig)
     saved = st.session_state.get("twin_scorecard")
-    if st.button("Score both twin cores", key="score_go", icon=":material/scoreboard:", type="primary",
-                 help="Streams every battery that reached end of life through both cores (the PINN core trains once "
-                      "per battery: minutes on NASA the first time, then saved)."):
-        res = {}
+    if st.button("Score the twin cores", key="score_go", icon=":material/scoreboard:", type="primary",
+                 help="Streams every battery that reached end of life through every core (PINN cores train once per "
+                      "battery, or at each retraining: minutes on NASA the first time, then saved)."):
+        res, scales = {}, {}
         for core in TWIN_CORES:
             lives, notes = m3_lives(fleet, rule, core)
-            rows = []
+            rows, kept = [], []
             for c, (tl, grp, e) in lives.items():
                 grp_c, fz, train_c = frozen_context(c, core)
                 ns, nm = te.frozen_live_window(CT_RAW, c, train_c)
-                frames, _ = frozen_cached(CT_RAW, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1],
-                                          float(m3_soh_eol_for(c, rule)), core_refit(core), "capacity",
-                                          float(eol_ah), ns, nm)
+                eol_c = float(m3_soh_eol_for(c, rule))
+                frames, _ = frozen_cached(CT_RAW, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1], eol_c,
+                                          core_refit(core), "capacity", float(eol_ah), ns, nm)
                 sc = _scorecard_battery(tl, e, frames)
                 if sc:
-                    rows.append({"core": core, "group": grp, "battery": c, **sc})
+                    rows.append({"core": core, "group": grp, "battery": c, "model key": fz[0], **sc})
+                    kept.append((c, grp, e, eol_c, frames))
+            for c, grp, e, eol_c, frames in kept:     # 4b: band scale learned on the OTHER batteries of the group
+                others = [x for x in kept if x[1] == grp and x[0] != c]
+                if others:
+                    covs = [np.nanmean([_band_coverage(o[4], o[2], o[3], s) for o in others]) for s in BAND_SCALES]
+                    s_c = float(BAND_SCALES[int(np.nanargmin(np.abs(np.array(covs) - 0.8)))])
+                else:
+                    s_c = 1.0
+                scales[(core, c)] = s_c
+                for r_ in rows:
+                    if r_["battery"] == c:
+                        r_["4b · band coverage, calibrated"] = _band_coverage(frames, e, eol_c, s_c)
+                        r_["band scale (calibrated)"] = s_c
             per = te.m3_maintenance_study(lives, te.M3Economics())[0] if len(lives) >= 3 else pd.DataFrame()
             first = next(iter(lives), None)
             secs = np.nan
@@ -7759,24 +7921,24 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
                 except Exception:
                     pass
             res[core] = {"rows": pd.DataFrame(rows), "per": per, "secs": secs, "notes": notes}
-        saved = {"key": skey, "res": res}
+        saved = {"key": skey, "res": res, "scales": scales}
         st.session_state["twin_scorecard"] = saved
     if not saved or saved.get("key") != skey:
-        placeholder("Press the button to score both cores (the frozen core reuses Mission 3's saved results).")
+        placeholder("Press the button to score the cores (cores already streamed reuse their saved results).")
         return
     res = saved["res"]
     allrows = pd.concat([r["rows"] for r in res.values()], ignore_index=True)
     if allrows.empty:
-        st.info("No battery reached end of life with both cores available.")
+        st.info("No battery reached end of life with a core available.")
         return
     crit = [c for c in allrows.columns if c[:1].isdigit()]
-    lower_better = {"1 · end-of-life error (cycles)": True, "5 · impossible forecasts (share)": True}
+    cores = [c for c in TWIN_CORES if c in res]
     out = []
     for g, dg in list(allrows.groupby("group")) + [("all", allrows)]:
         for cname in crit + ["3 · decision value: twin + age limit (share of gain)",
                              "3 · decision value: twin alone (share of gain)"]:
-            row = {"group": g, "criterion": cname}
-            for core in TWIN_CORES:
+            row: Dict[str, Any] = {"group": g, "criterion": cname}
+            for core in cores:
                 if cname.startswith("3 ·"):
                     per = res[core]["per"]
                     cells = list(dg[dg["core"] == core]["battery"])
@@ -7786,28 +7948,35 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
                     row[core] = float(dg[dg["core"] == core][cname].abs().mean())   # closer to 0 is better
                 else:
                     row[core] = float(dg[dg["core"] == core][cname].mean())
-            a, b = row[TWIN_CORES[0]], row[TWIN_CORES[1]]
-            if np.isfinite(a) and np.isfinite(b):
-                low = lower_better.get(cname, cname.startswith("2 ·"))
-                if cname.startswith("4 ·"):           # coverage: closer to the nominal 0.8 is better
-                    a, b = abs(a - 0.8), abs(b - 0.8)
-                    low = True
-                row["better"] = "tie" if abs(a - b) < 1e-9 else (TWIN_CORES[0] if (a < b) == low else TWIN_CORES[1])
+            vals = {k: row[k] for k in cores if np.isfinite(row[k])}
+            if len(vals) >= 2:
+                if cname.startswith("4"):              # coverage: closest to the nominal 0.8 wins
+                    score = {k: abs(v - 0.8) for k, v in vals.items()}
+                elif cname.startswith("3 ·"):
+                    score = {k: -v for k, v in vals.items()}
+                else:                                  # 1, 2, 5: lower is better
+                    score = dict(vals)
+                order = sorted(score, key=score.get)
+                tol = 0.01 if cname[:1] in ("3", "4", "5") else 0.25
+                row["better"] = "tie" if abs(score[order[1]] - score[order[0]]) < tol else order[0]
             out.append(row)
     S = pd.DataFrame(out)
     S.loc[S["criterion"].str.startswith("2 ·"), "criterion"] = "2 · late-life bias, size (cycles; |bias|)"
-    show_table(S.set_index(["group", "criterion"]).style.format("{:.2f}", subset=list(TWIN_CORES), na_rep="—"),
-               note="Lower is better for 1, 2 (size of the bias) and 5; higher for 3; for 4 the closest to the band's "
-                    "nominal 80 % wins. Decision value uses the default economics; the replacement margin and age are "
-                    "chosen leave-one-out.")
-    t7 = {core: res[core]["secs"] for core in TWIN_CORES}
+    show_table(S.set_index(["group", "criterion"]).style.format("{:.2f}", subset=cores, na_rep="—"),
+               note="Ties: within 0.25 cycles (1, 2) or 1 percentage point (3, 4, 5). Lower is better for 1, 2 (size "
+                    "of the bias) and 5; higher for 3; for 4 and 4b the closest to the band's nominal 80 % wins. "
+                    "Decision value uses the default economics; replacement margin and age chosen leave-one-out. "
+                    "GA-PINN core: batteries whose search has not finished use the default PINN core (column "
+                    "'model key' in the per-battery table).")
+    t7 = {core: res[core]["secs"] for core in cores}
     st.markdown(f"**6 · One model for forecast, explanation and what-if:** {TWIN_CORES[0]}: no (forecast only; "
-                f"explanation and what-if come from the separate shared physics) · {TWIN_CORES[1]}: yes (its "
-                f"mechanism states explain the fade, its condition inputs give the what-if).  \n"
-                f"**7 · Speed:** every cycle is a re-anchoring for both (instant); one training at the live start: "
-                + " · ".join(f"{k}: {v:.0f} s" if np.isfinite(v) else f"{k}: —" for k, v in t7.items()))
+                f"explanation and what-if come from the separate shared physics) · {TWIN_CORES[1]} and "
+                f"{TWIN_CORES[2]}: yes (mechanism states explain the fade, condition inputs give the what-if).  \n"
+                f"**7 · Speed:** every cycle is a re-anchoring for every core (instant); one training at the live "
+                f"start: " + " · ".join(f"{k}: {v:.0f} s" if np.isfinite(v) else f"{k}: —" for k, v in t7.items()))
     with st.expander("Per battery"):
-        show_table(allrows.set_index(["core", "group", "battery"]).style.format("{:.2f}"))
+        show_table(allrows.set_index(["core", "group", "battery"]).style.format(
+            "{:.2f}", subset=[c for c in allrows.columns if allrows[c].dtype.kind == "f"]))
     download("Download the scorecard (CSV)", S.to_csv(index=False).encode(),
              f"twin_scorecard__v{te.ENGINE_VERSION}.csv", "text/csv", key="score_csv")
     download("Download the per-battery scores (CSV)", allrows.to_csv(index=False).encode(),

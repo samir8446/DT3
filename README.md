@@ -1,9 +1,17 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.40.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.41.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## GA-PINN and band calibration (v5.41.0)
+
+1. Integrated twin: GA-PINN section, a genetic algorithm over the PINN's settings and the form of its physics (SEI
+   law exponent, late-life acceleration term), nested leave-one-out fitness, resumable; third twin core
+   "GA-PINN core".
+2. Twin scorecard for three cores, with band coverage after leave-one-out calibration (4b); "Calibrated band" toggle
+   on the Integrated twin page.
 
 ## PINN as the twin's core (v5.40.0)
 

@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.40.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.40.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.41.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.41.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
   tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6) + test_m3_lifecycle.py (3), v5.37.0 (27 tests)
@@ -1007,6 +1007,43 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   trained once). Demo check: retrain every 30 -> fitted at 36, 66, 96.
 - Next: scorecard with retrain every 20; structural fix = acceleration term (GA-PINN physics-form genes / symbolic
   regression), B0005 as the key test case.
+
+## 5bt. Scorecard with the PINN core retrained every 20 cycles (v5.40.0)
+- EOL error per battery (frozen / PINN once / PINN retrain-20): B0005 7.74 / 45.31 / 25.14; B0006 11.53 / 8.37 / 9.63;
+  B0018 6.12 / 4.90 / 4.33; B0041 2.86 / 1.86 / 1.86; B0045 1.57 / 2.00 / 2.00; B0046 5.55 / 2.73 / 2.82;
+  B0047 4.75 / 1.25 / 1.25; B0048 8.29 / 4.54 / 4.67.
+- All 8 (frozen / PINN retrain-20): (1) EOL error 6.05 / 6.46; (2) |late bias| 2.75 / 1.35; (3) decision value
+  twin + age limit 0.686 / 0.686, twin alone 0.471 / 0.472 (Reference twin alone 0.956 / 0.958: B0005 no longer
+  replaced late); (4) coverage 1.00 / 0.96 (both too wide vs 0.8); (5) 0 / 0; (6) no / yes; (7) fast / slower.
+- Verdict: PINN core better or equal on 5 of 7 criteria; more accurate on 6/8 batteries; half the late-life bias;
+  same decisions; loses (1) by 0.4 cycles (B0005 only) and (7). Remaining target: B0005 (fade ~2x faster after the
+  live start) -> GA-PINN with physics-form genes (acceleration term), nested LOBO fitness.
+- App: scorecard "better" column now uses tie tolerances (0.25 cycles; 1 percentage point for shares).
+
+## 5bu. GA-PINN (professor's proposal), third twin core, band calibration (v5.41.0)
+- Engine: PINN genes behind parameters (default = unchanged; v1, v2, v2-group and twin core verified byte-identical):
+  "sei_p" (SEI law 1/(L+0.005)^p; 1 = v1, 0.5, 0 = linear) and "accel" (LAM rate x exp(k_acc x total damage),
+  k_acc learnable, reported as "Damage acceleration (k_acc)"). train_pinn_level now attaches cv_late_bias (mean
+  held-out error, last third of horizon; + = optimistic) and phys_res (final physics residual).
+- GA: genes hidden {16,32,48}, learning rate {0.002,0.005,0.01}, lambda_phys {0.3,1,3}, sei_p {1,0.5,0}, accel {0,1},
+  iterations {600,900}; first population contains the current twin-core settings; elitism 2, tournament 2, uniform
+  crossover, mutation 0.25; deterministic per seed (cached evaluations -> exact resume; deadline stops a run).
+  Fitness (nested LOBO, the PINN's 2-fold CV on the TRAINING batteries cut at the live start; target future never
+  used) = RMSE_val (pts) + 0.5 |late bias| (pts) + 0.05 log10(1 + physics residual) + 0.002 x seconds.
+  Winner key pinn:PINN-ga|h..|lr..|w..|p..|a..|it.. -> 3-seed ensemble like the twin core.
+- App: Integrated twin page "GA-PINN" section (population, generations, time budget per press, batteries; Run /
+  continue; per-battery table: fitness current vs best, improvement, winning genes; fitness-per-generation chart;
+  CSV of all evaluations; evaluations backed on disk). Third core "GA-PINN core" (sidebar) = each battery's GA winner
+  (default PINN core until its search finishes). Scorecard now scores all three cores, best-of-three with tie
+  tolerances, plus 4b "band coverage, calibrated": band half-widths scaled by the factor that gives 80 % coverage on
+  the OTHER batteries of the group (grid 0.1-1.5), applied to the battery. Integrated twin: "Calibrated band" toggle
+  when the scorecard has a scale for (core, battery).
+- Demo (synthetic; not evidence): GA keeps the start settings (no acceleration in synthetic data); bands ~2x too wide
+  for every core (scale ~0.5), calibration brings coverage 1.00 -> 0.70-0.77. Tests 35. End-to-end AppTest 308 s.
+- To run on NASA: (1) optional: sidebar retrain every 10 + scorecard (user's step 2); (2) GA-PINN section, Reference
+  and Cold batteries, population 6 x 4 generations, several presses of 10-20 min (B0005 first); (3) scorecard with
+  the GA-PINN core; key question: does B0005 select sei_p < 1 or accel on, and does its error drop below the frozen
+  model's 7.7 cycles.
 
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->

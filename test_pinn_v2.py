@@ -79,3 +79,28 @@ def test_twin_core_is_a_seed_ensemble_usable_by_the_twin_stream(demo):
     frames, track = te.frozen_stream(ct, imp, "S001", ["S002", "S005", "S008"], te.PINN_TWIN_KEY, None, 0.8, 0,
                                      "capacity")
     assert track.attrs["refits"] == 1 and len(frames) > 10               # trained once, re-anchored every cycle
+
+
+def test_ga_pinn_key_roundtrip_and_search():
+    g = {**te.GA_PINN_START, "sei_p": 0.5, "accel": 1, "iterations": 600}
+    back = te.ga_pinn_genome(te.ga_pinn_key(g))
+    assert back["sei_p"] == 0.5 and back["accel"] is True and back["iterations"] == 600 and back["hidden"] == 32
+    toy = lambda g: (g["hidden"] - 48) ** 2 / 100 + g["sei_p"] + (0 if g["accel"] else 1) + abs(g["physics_weight"] - 1)
+    r1 = te.ga_pinn_run(toy, pop_size=6, generations=6, seed=1)
+    r2 = te.ga_pinn_run(toy, pop_size=6, generations=6, seed=1)
+    assert r1["best_fitness"] <= toy(te.GA_PINN_START)                  # never worse than the starting settings
+    assert r1["best_key"] == r2["best_key"] and r1["fitness"] == r2["fitness"]   # deterministic -> resumable
+    part = te.ga_pinn_run(toy, pop_size=6, generations=6, seed=1, deadline=0.0)
+    assert part["done"] is False
+
+
+def test_ga_pinn_fitness_is_nested_and_winner_trains(demo):
+    ct, imp = demo
+    r = te.ga_pinn_fitness(ct, imp, "S001", 36, ["S002", "S005", "S008"], te.DEFAULT_EOL_AH,
+                           {**te.GA_PINN_START, "iterations": 300})
+    assert np.isfinite(r["fitness"]) and np.isfinite(r["RMSE_val (pts)"])
+    g = {**te.GA_PINN_START, "sei_p": 0.0, "accel": 1, "iterations": 300}
+    f = te._protocol_forecast(te.ga_pinn_key(g), None, ct, imp, "S001", 36, ["S002", "S005", "S008"],
+                              te.DEFAULT_EOL_AH)
+    assert f.model.startswith("GA-PINN") and np.isfinite(f.soh).all()
+    assert "Damage acceleration (k_acc)" in f.inputs_at_origin

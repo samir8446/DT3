@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.40.0"
+ENGINE_VERSION = "5.41.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -8321,6 +8321,10 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
             "c": Tensor([[math.log(2.0)]]), "g": Tensor([[math.log(1.0)]])}
     if depth_on:
         phys["a_V"] = Tensor([[0.5]])                      # LAM depth sensitivity (as the shared physics' a_V)
+    sei_p = float(p.get("sei_p", 1.0))                     # GA-PINN gene: SEI law 1/(L+0.005)^p (1 = v1 law)
+    accel = bool(p.get("accel", False))                    # GA-PINN gene: LAM accelerates with the total damage
+    if accel:
+        phys["k_acc"] = Tensor([[math.log(5.0)]])          # learnable snowball strength (knee pathway, 5bj)
     params = [W1, Wz, b1, W2, b2, W3, b3, Z, Wm] + list(phys.values())
     sel = [Tensor(np.eye(3)[:, [j]]) for j in range(3)]
 
@@ -8343,6 +8347,7 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
     xV = Tensor(Xc[:, [4]]) if depth_on else None
     opt = Adam(params, lr=float(p["learning_rate"]))
     lam_w = float(p["physics_weight"])
+    last_res = float("nan")
     hist: List[float] = []
     for it in range(int(p["iterations"])):
         S, _ = states(Xd, OHd)
@@ -8354,14 +8359,20 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
             S2, _ = states(Xc2, OHc)
             m = (zr @ Wm).exp()
             dsei, dpl, dlam = ((S2[j] - S1[j]) * (1 / hstep) for j in range(3))
-            f_sei = phys["k_sei"].exp() * (m @ sel[0]) * (phys["b_T"] * xT).exp() / (S1[0] + 0.005)
+            if sei_p == 1.0:
+                f_sei = phys["k_sei"].exp() * (m @ sel[0]) * (phys["b_T"] * xT).exp() / (S1[0] + 0.005)
+            else:
+                f_sei = phys["k_sei"].exp() * (m @ sel[0]) * (phys["b_T"] * xT).exp() / ((S1[0] + 0.005).log() * sei_p).exp()
             f_pl = phys["k_pl"].exp() * (m @ sel[1]) * (phys["b_C"] * xC + phys["a_I"] * xI).exp() \
                 * (1.0 + phys["c"].exp() * S1[2] * 20.0)
             f_lam = phys["k_lam"].exp() * (m @ sel[2]) * (phys["a_L"] * xI).exp()
             if depth_on:
                 f_lam = f_lam * (phys["a_V"] * xV).exp()
+            if accel:
+                f_lam = f_lam * (phys["k_acc"].exp() * (S1[0] + S1[1] + S1[2])).exp()
             res = ((dsei - f_sei).square() + (dpl - f_pl).square() + (dlam - f_lam).square()).mean() * (1 / 0.05 ** 2)
             loss = loss + res * lam_w
+            last_res = float(res.data)
         loss = loss + (Z.square()).mean() * 1e-2
         for q in params:
             q.grad = np.zeros_like(q.data)
@@ -8380,7 +8391,7 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
         S, _ = states(X, np.eye(nb)[np.full(len(a), i)])
         return observe(S)[0].data[:, 0], [s_.data[:, 0] for s_ in S]
 
-    return {"predict": predict, "phys": {k: float(v.data[0, 0]) for k, v in phys.items()}}
+    return {"predict": predict, "phys": {k: float(v.data[0, 0]) for k, v in phys.items()}, "phys_res": last_res}
 
 
 def _pinn_cut(ct: pd.DataFrame, c: str, share: float, causal: bool = False, burn_in: int = 0
@@ -8481,6 +8492,8 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
     if errs:
         E = np.vstack(errs)
         cv = float(np.sqrt(np.mean(E[:, 1] ** 2)))
+        late_ = E[E[:, 0] >= (2 / 3) * E[:, 0].max()]          # GA-PINN fitness: bias late in the held-out futures
+        cv_late = float(late_[:, 1].mean()) if len(late_) else float("nan")
         bins = np.array([0, 20, 40, 80, 1e9])
         q = [float(np.quantile(np.abs(E[(E[:, 0] > a) & (E[:, 0] <= b_), 1]), level)) if ((E[:, 0] > a) & (E[:, 0] <= b_)).sum() >= 5
              else np.nan for a, b_ in zip(bins[:-1], bins[1:])]
@@ -8512,12 +8525,19 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
                     else "PINN v2 within group · without physics")
         if burn > 0:
             name = "PINN twin core · cut-off, burn-in anchor"
+        if "sei_p" in p or "accel" in p:                   # GA-PINN genome (5bu)
+            name = (f"GA-PINN · h{int(p.get('hidden', 32))}, λ {float(p['physics_weight']):g}, SEI p "
+                    f"{float(p.get('sei_p', 1.0)):g}, acceleration {'on' if p.get('accel') else 'off'}")
+            if lam_w > 0 and "k_acc" in ph:
+                learned["Damage acceleration (k_acc)"] = math.exp(ph["k_acc"])
         if lam_w > 0:
             learned["Depth sensitivity of LAM (a_V)"] = ph.get("a_V", float("nan"))
     out = TrajectoryForecast(name, "forecast", cell_id, n0, n_grid, soh, lo, hi, metrics,
                              ["throughput", "cell temperature (Arrhenius)", "cold term", "current", "battery code"],
                              learned, pd.DataFrame(), cells, cv, time.time() - t0)
     out.mechanisms = {"n": n_f, **mech}
+    out.cv_late_bias = cv_late if errs else float("nan")       # SOH fraction, + = forecast too high (optimistic)
+    out.phys_res = float(fit.get("phys_res", float("nan")))
     return out
 
 
@@ -8555,6 +8575,9 @@ def train_pinn_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
         prm["v2"] = True
     if kind in ("PINN-v2-group", "PINN-v2-group-ablation"):
         prm["pooled"] = False
+    if kind.startswith("PINN-ga|"):                        # GA-PINN winner (STATUS 5bu): genome in the key
+        prm.update({"v2": True, "pooled": False, "burn_in": 3, **ga_pinn_genome(kind)})
+        return _pinn_ensemble(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, **kw)
     if kind == "PINN-twin":                                # the digital twin's PINN core (STATUS 5bq)
         prm.update({"v2": True, "pooled": False, "burn_in": 3})
         return _pinn_ensemble(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, **kw)
@@ -8585,6 +8608,100 @@ def _pinn_ensemble(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, **kw) -
     if all(m is not None for m in mech):
         out.mechanisms = {"n": mech[0]["n"], **{k: np.mean([m[k] for m in mech], axis=0) for k in mech[0] if k != "n"}}
     return out
+
+
+# -----------------------------------------------------------------------------
+# GA-PINN (STATUS 5bu): a genetic algorithm searches the PINN configuration AND the form of its physics
+# -----------------------------------------------------------------------------
+GA_PINN_GENES: Dict[str, Tuple[Any, ...]] = {
+    "hidden": (16, 32, 48),                     # neurons per layer
+    "learning_rate": (0.002, 0.005, 0.01),
+    "physics_weight": (0.3, 1.0, 3.0),          # lambda_phys
+    "sei_p": (1.0, 0.5, 0.0),                   # SEI law 1/(L+0.005)^p: 1 = diffusion-limited (decelerates), 0 = linear
+    "accel": (0, 1),                            # LAM accelerates with the total damage (knee / snowball term)
+    "iterations": (600, 900),                   # training length
+}
+GA_PINN_START = {"hidden": 32, "learning_rate": 0.005, "physics_weight": 1.0, "sei_p": 1.0, "accel": 0,
+                 "iterations": 900}            # the current twin core's settings: always in the first population
+_GA_TAGS = (("hidden", "h"), ("learning_rate", "lr"), ("physics_weight", "w"), ("sei_p", "p"), ("accel", "a"),
+            ("iterations", "it"))
+
+
+def ga_pinn_key(g: Dict[str, Any]) -> str:
+    """Protocol key of a GA-PINN genome, e.g. pinn:PINN-ga|h32|lr0.005|w1|p0.5|a1|it900."""
+    return "pinn:PINN-ga|" + "|".join(f"{tag}{g[k]:g}" for k, tag in _GA_TAGS)
+
+
+def ga_pinn_genome(kind_or_key: str) -> Dict[str, Any]:
+    parts = kind_or_key.split("PINN-ga|", 1)[1].split("|")
+    out: Dict[str, Any] = {}
+    for (k, tag), s in zip(_GA_TAGS, parts):
+        v = float(s[len(tag):])
+        out[k] = int(v) if k in ("hidden", "accel", "iterations") else v
+    out["accel"] = bool(out["accel"])
+    return out
+
+
+def ga_pinn_fitness(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str, n0: int, train_cells: Sequence[str],
+                    eol_ah: float, genome: Dict[str, Any]) -> Dict[str, float]:
+    """Fitness of one genome for one target battery, NESTED leave-one-out: the PINN's own cross-validation cuts the
+    TRAINING batteries at the forecast origin and scores their futures; the target's future is never used.
+    fitness = RMSE_val (SOH pts) + 0.5 |late-life bias| (pts) + 0.05 log10(1 + physics residual) + 0.002 x seconds."""
+    prm = {"v2": True, "pooled": False, "burn_in": 3, **genome, "accel": bool(genome["accel"])}
+    t0 = time.time()
+    f = train_pinn_level(ct, imp, cell_id, n0, "forecast", list(train_cells), eol_ah, prm, seed=0, cv_folds=2)
+    secs = time.time() - t0
+    cv, late = 100 * float(f.cv_rmse), 100 * float(getattr(f, "cv_late_bias", float("nan")))
+    res = float(getattr(f, "phys_res", float("nan")))
+    fit = (cv + 0.5 * (abs(late) if np.isfinite(late) else 0.0)
+           + (0.05 * math.log10(1 + res) if np.isfinite(res) and res >= 0 else 0.0) + 0.002 * secs)
+    return {"fitness": fit if np.isfinite(cv) else float("inf"), "RMSE_val (pts)": cv,
+            "late bias (pts)": late, "physics residual": res, "seconds": secs}
+
+
+def ga_pinn_run(evaluate: Callable[[Dict[str, Any]], float], pop_size: int = 6, generations: int = 4, seed: int = 0,
+                deadline: Optional[float] = None, elite: int = 2, p_mut: float = 0.25) -> Dict[str, Any]:
+    """Genetic algorithm over GA_PINN_GENES. Deterministic for a given seed and fitness values, so with cached
+    evaluations a stopped run resumes exactly (it replays the cached part). Stops at `deadline` (time.time())."""
+    rng = np.random.default_rng(seed)
+    names = list(GA_PINN_GENES)
+    key = lambda g: tuple(g[k] for k in names)
+    rand = lambda: {k: GA_PINN_GENES[k][int(rng.integers(len(GA_PINN_GENES[k])))] for k in names}
+    pop, seen = [dict(GA_PINN_START)], {key(GA_PINN_START)}
+    while len(pop) < pop_size:
+        g = rand()
+        if key(g) not in seen:
+            pop.append(g); seen.add(key(g))
+    fit: Dict[Tuple[Any, ...], float] = {}
+    genomes: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+    history: List[Dict[str, Any]] = []
+    for gen in range(generations):
+        for g in pop:
+            if key(g) not in fit:
+                if deadline is not None and time.time() > deadline:
+                    return {"done": False, "generation": gen, "history": history, "fitness": fit, "genomes": genomes}
+                fit[key(g)], genomes[key(g)] = float(evaluate(g)), dict(g)
+        ranked = sorted(pop, key=lambda g: fit[key(g)])
+        history.append({"generation": gen, "best fitness": fit[key(ranked[0])],
+                        "mean fitness": float(np.mean([fit[key(g)] for g in pop])), "best": ga_pinn_key(ranked[0])})
+        if gen == generations - 1:
+            break
+        new = [dict(g) for g in ranked[:elite]]
+        tries = 0
+        while len(new) < pop_size and tries < 200:
+            tries += 1
+            a, b = (min((pop[int(i)] for i in rng.integers(len(pop), size=2)), key=lambda g: fit[key(g)])
+                    for _ in range(2))
+            child = {k: (a[k] if rng.random() < 0.5 else b[k]) for k in names}
+            for k in names:
+                if rng.random() < p_mut:
+                    child[k] = GA_PINN_GENES[k][int(rng.integers(len(GA_PINN_GENES[k])))]
+            if key(child) not in {key(x) for x in new}:
+                new.append(child)
+        pop = new
+    best = min(fit, key=fit.get)
+    return {"done": True, "generation": generations, "history": history, "fitness": fit, "genomes": genomes,
+            "best": genomes[best], "best_key": ga_pinn_key(genomes[best]), "best_fitness": fit[best]}
 
 
 _tune_level_model_base = tune_level_model
