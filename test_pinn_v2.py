@@ -56,3 +56,26 @@ def test_v2_within_group_keeps_the_group_pool(demo):
     assert sorted(f.train_cells) == ["S002", "S005", "S008"]     # v1's within-group pool
     assert "Depth sensitivity of LAM (a_V)" in f.inputs_at_origin  # v2 features on
     assert "within group" in f.model
+
+
+def test_twin_core_burn_in_anchor_ignores_low_first_cycle(demo):
+    ct, _ = demo
+    d = ct.copy()
+    first = d[(d.Cell_ID == "S001") & ~d.outlier].n.min()
+    d.loc[(d.Cell_ID == "S001") & (d.n == first), "SOH"] -= 0.12          # NASA-like low first cycle (5bp)
+    locked = te._pinn_battery(d, "S001", n_max=36, causal=True)            # v2 anchor: locks onto it
+    burned = te._pinn_battery(d, "S001", n_max=36, causal=True, burn_in=3)
+    clean = te._pinn_battery(ct, "S001", n_max=36, causal=True, burn_in=3)
+    assert burned["soh"][-1] > locked["soh"][-1] + 0.03
+    assert burned["soh"][-1] == pytest.approx(clean["soh"][-1], abs=0.006)
+
+
+def test_twin_core_is_a_seed_ensemble_usable_by_the_twin_stream(demo):
+    ct, imp = demo
+    f = te._protocol_forecast(te.PINN_TWIN_KEY, None, ct, imp, "S001", 36, ["S002", "S005", "S008"],
+                              te.DEFAULT_EOL_AH)
+    assert "3-seed ensemble" in f.model and hasattr(f, "mechanisms")
+    assert (f.lo <= f.soh + 1e-9).all() and (f.hi >= f.soh - 1e-9).all()
+    frames, track = te.frozen_stream(ct, imp, "S001", ["S002", "S005", "S008"], te.PINN_TWIN_KEY, None, 0.8, 0,
+                                     "capacity")
+    assert track.attrs["refits"] == 1 and len(frames) > 10               # trained once, re-anchored every cycle

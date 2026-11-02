@@ -1,9 +1,16 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.39.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.40.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## PINN as the twin's core (v5.40.0)
+
+1. Sidebar "Twin core model": frozen data model or PINN twin core (cut-off input, burn-in causal anchor, 3-seed
+   ensemble) for the Live twin, Integrated twin and Mission 3.
+2. Integrated twin: "Twin scorecard" comparing both cores on seven agreed criteria (forecast error, late-life bias,
+   decision value, band coverage, physical consistency, one-model capability, speed).
 
 ## PINN v2 within group (v5.39.0)
 

@@ -48,7 +48,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.39.0"
+REQUIRED_ENGINE = "5.40.0"
 if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
@@ -2438,11 +2438,22 @@ def frozen_study_cached(_ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: st
     return te.frozen_update_study(_ct, _imp, cell, list(train), group, soh_eol, intervals, anchors, horizon, eol_ah)
 
 
-def frozen_context(c: str) -> Tuple[Optional[str], Optional[Tuple[str, str]], List[str]]:
-    """Group of a battery (recorded conditions), its frozen models, and the group's other batteries."""
+TWIN_CORES = ("Frozen data model (Mission 2)", "PINN twin core")
+
+
+def twin_core() -> str:
+    return st.session_state.get("twin_core", TWIN_CORES[0])
+
+
+def frozen_context(c: str, core: Optional[str] = None) -> Tuple[Optional[str], Optional[Tuple[str, str]], List[str]]:
+    """Group of a battery (recorded conditions), its frozen models, and the group's other batteries. core: the twin's
+    forecaster (sidebar "Twin core model"); the PINN core replaces the group's frozen forecaster, trained the same way
+    (once, at the live start) and re-anchored every cycle (STATUS 5bq)."""
     groups = te.condition_groups(CT_RAW)
     grp_c = str(groups.loc[c, "Group"]) if c in groups.index else None
     fz = te.frozen_models_for(grp_c)
+    if fz and (core or twin_core()) == TWIN_CORES[1]:
+        fz = (te.PINN_TWIN_KEY, fz[1])
     train_c = [x for x in te.protocol_cells(CT_RAW, grp_c) if x != c] if fz else []
     return grp_c, fz, train_c
 
@@ -2653,6 +2664,11 @@ with st.sidebar:
         master_sha = st.text_input("Telemetry SHA-256 pin (optional)", value=_secret("MASTER_PARQUET_SHA256"),
                                    help="Full-file digest; the download is rejected if it differs.")
         imp_url = st.text_input("EIS URL", value=_secret("IMPEDANCE_PARQUET_URL"))
+    st.markdown("### Twin core model")
+    st.radio("Forecaster inside the twin", TWIN_CORES, key="twin_core",
+             help="Used by the Live twin, the Integrated twin and Mission 3. The PINN core is trained once at the live "
+                  "start and re-anchored every cycle, like the frozen model; compare both with the twin scorecard "
+                  "(Integrated twin page). The Model updating page always uses the frozen model (Mission 2).")
     if st.session_state.get("demo"):
         if st.button("Leave synthetic demo"):
             st.session_state["demo"] = False
@@ -4830,7 +4846,7 @@ def frozen_update_section() -> None:
                 "forecast to the current SOH, taken from the measured capacity (lab) or estimated by the frozen "
                 "SOH-now model (field: no capacity measured after the start). 'Never retrain, no anchor' is exactly the "
                 "assessment forecast. Scores are causal: each forecast is compared only with cycles measured after it.")
-    grp_c, fz, train_c = frozen_context(cell)
+    grp_c, fz, train_c = frozen_context(cell, core=TWIN_CORES[0])   # Mission 2 study: always the frozen model
     why_not = frozen_unavailable_reason(cell, grp_c, fz, train_c)
     if why_not:
         st.info(why_not + " Select a battery of another group in the control bar.", icon=":material/info:")
@@ -5494,7 +5510,8 @@ def assessment_section() -> None:
                       "Level 4 · PINN v2 (pooled + cut-off + causal anchor) + ablation": ["pinn:PINN-v2",
                                                                                            "pinn:PINN-v2-ablation"],
                       "Level 4 · PINN v2 within group (cut-off + causal anchor) + ablation": [
-                          "pinn:PINN-v2-group", "pinn:PINN-v2-group-ablation"]}
+                          "pinn:PINN-v2-group", "pinn:PINN-v2-group-ablation"],
+                      "Level 4 · PINN twin core (cut-off, burn-in anchor, 3 seeds)": ["pinn:PINN-twin"]}
         levels = st.multiselect("Levels (baselines are always included: the verdict needs them)", list(level_keys),
                                 default=list(level_keys), key="acc_levels")
         keys = ["persistence", "trend", "shape"] + [k for lv in levels for k in level_keys[lv]]
@@ -7451,6 +7468,7 @@ def view_twin() -> None:
                                                     "watch uses": basis}).to_csv(index=False).encode(),
              f"integrated_twin_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="itw_csv")
     twin_whatif(fleet, cell, soh_eol_c)
+    twin_scorecard_section(fleet)
 
 
 # =============================================================================
@@ -7605,7 +7623,8 @@ def m3_operation_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
                  f"m3_operation_study__v{te.ENGINE_VERSION}.csv", "text/csv", key="m3_ops_csv")
 
 
-def m3_lives(fleet: Dict[str, Any], rule: str) -> Tuple[Dict[str, Tuple[pd.DataFrame, str, float]], List[str]]:
+def m3_lives(fleet: Dict[str, Any], rule: str, core: Optional[str] = None
+             ) -> Tuple[Dict[str, Tuple[pd.DataFrame, str, float]], List[str]]:
     """Integrated timelines of every constant-condition battery that reached end of life (frozen forecast stream,
     detector), as the twin saw them cycle by cycle."""
     lives, notes = {}, []
@@ -7623,7 +7642,7 @@ def m3_lives(fleet: Dict[str, Any], rule: str) -> Tuple[Dict[str, Tuple[pd.DataF
         if e_meas is None:
             notes.append(f"{c}: did not reach end of life in its record")
             continue
-        grp_c, fz, train_c = frozen_context(c)
+        grp_c, fz, train_c = frozen_context(c, core)
         why = frozen_unavailable_reason(c, grp_c, fz, train_c)
         if why:
             notes.append(f"{c}: {why}")
@@ -7641,6 +7660,137 @@ def m3_lives(fleet: Dict[str, Any], rule: str) -> Tuple[Dict[str, Tuple[pd.DataF
         lives[c] = (tl, str(groups.loc[c, "Group"]) if c in groups.index else "?", float(e_meas))
     bar.empty()
     return lives, notes
+
+
+def _scorecard_battery(tl: pd.DataFrame, e: float, frames: Dict[int, Any]) -> Optional[Dict[str, float]]:
+    """Criteria 1, 2, 4, 5 of the twin scorecard for one battery (STATUS 5bq): only cycles before its end of life."""
+    d = tl[np.isfinite(tl["EOL forecast"]) & (tl["cycle"] < e)]
+    if not len(d):
+        return None
+    err = d["EOL forecast"] - e
+    start = float(d["cycle"].min())
+    late = d[d["cycle"] >= start + (2 / 3) * (e - start)]
+    a = d["EOL early"].fillna(-np.inf).to_numpy(float)
+    b = d["EOL late"].fillna(np.inf).to_numpy(float)
+    cov = float(((np.minimum(a, b) <= e) & (e <= np.maximum(a, b))).mean())
+    viol, n_fr = 0, 0
+    for n, fr in (frames or {}).items():
+        if n >= e:
+            continue
+        med = np.asarray(fr[1], float)
+        if not len(med):
+            continue
+        n_fr += 1
+        if np.nanmax(med - np.minimum.accumulate(med)) > 0.005 or np.nanmax(med) > 1.02:
+            viol += 1                                  # capacity growing back, or above a new battery
+    return {"1 · end-of-life error (cycles)": float(err.abs().mean()),
+            "2 · late-life bias (cycles, + = late)": float((late["EOL forecast"] - e).mean()) if len(late) else np.nan,
+            "4 · band coverage": cov, "5 · impossible forecasts (share)": viol / max(n_fr, 1)}
+
+
+def _group_share(per: pd.DataFrame, policy: str, cells: List[str]) -> float:
+    base = per[per["policy"] == "run to end of life"].set_index("battery")["profit rate"].reindex(cells)
+    best = per[per["policy"] == "perfect knowledge"].set_index("battery")["profit rate"].reindex(cells)
+    pol = per[per["policy"] == policy].set_index("battery")["profit rate"].reindex(cells)
+    room = float((best - base).sum())
+    return float((pol - base).sum() / room) if room > 0 else np.nan
+
+
+def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
+    """Which forecaster makes the better digital twin? Seven criteria agreed before running (STATUS 5bq), computed
+    for the frozen data model and the PINN core on every battery that reached end of life (leave-one-out choices)."""
+    section("Twin scorecard · frozen data model vs PINN core")
+    st.markdown("Seven criteria fixed **before** running: (1) end-of-life forecast error over the battery's life, "
+                "(2) late-life bias, (3) decision value in the replacement study, (4) honest uncertainty (band "
+                "coverage), (5) physical consistency, (6) one model for forecast, explanation and what-if, (7) speed. "
+                "Same batteries, same live window, same re-anchoring for both cores.")
+    if not fleet or "scan" not in fleet:
+        placeholder("Build the integrated twin first (button at the top of this page).")
+        return
+    rule = M3_EOL_RULES.get(st.session_state.get("m3_eol", list(M3_EOL_RULES)[0]), "nasa")
+    skey = (DATA_KEY, rule, float(eol_ah))
+    saved = st.session_state.get("twin_scorecard")
+    if st.button("Score both twin cores", key="score_go", icon=":material/scoreboard:", type="primary",
+                 help="Streams every battery that reached end of life through both cores (the PINN core trains once "
+                      "per battery: minutes on NASA the first time, then saved)."):
+        res = {}
+        for core in TWIN_CORES:
+            lives, notes = m3_lives(fleet, rule, core)
+            rows = []
+            for c, (tl, grp, e) in lives.items():
+                grp_c, fz, train_c = frozen_context(c, core)
+                ns, nm = te.frozen_live_window(CT_RAW, c, train_c)
+                frames, _ = frozen_cached(CT_RAW, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1],
+                                          float(m3_soh_eol_for(c, rule)), 0, "capacity", float(eol_ah), ns, nm)
+                sc = _scorecard_battery(tl, e, frames)
+                if sc:
+                    rows.append({"core": core, "group": grp, "battery": c, **sc})
+            per = te.m3_maintenance_study(lives, te.M3Economics())[0] if len(lives) >= 3 else pd.DataFrame()
+            first = next(iter(lives), None)
+            secs = np.nan
+            if first is not None:                     # criterion 7: one training at the live start, timed afresh
+                grp_c, fz, train_c = frozen_context(first, core)
+                ns, _ = te.frozen_live_window(CT_RAW, first, train_c)
+                t0 = time.time()
+                try:
+                    te._protocol_forecast(fz[0], None, CT_RAW, imp, first, int(ns), list(train_c), float(eol_ah))
+                    secs = time.time() - t0
+                except Exception:
+                    pass
+            res[core] = {"rows": pd.DataFrame(rows), "per": per, "secs": secs, "notes": notes}
+        saved = {"key": skey, "res": res}
+        st.session_state["twin_scorecard"] = saved
+    if not saved or saved.get("key") != skey:
+        placeholder("Press the button to score both cores (the frozen core reuses Mission 3's saved results).")
+        return
+    res = saved["res"]
+    allrows = pd.concat([r["rows"] for r in res.values()], ignore_index=True)
+    if allrows.empty:
+        st.info("No battery reached end of life with both cores available.")
+        return
+    crit = [c for c in allrows.columns if c[:1].isdigit()]
+    lower_better = {"1 · end-of-life error (cycles)": True, "5 · impossible forecasts (share)": True}
+    out = []
+    for g, dg in list(allrows.groupby("group")) + [("all", allrows)]:
+        for cname in crit + ["3 · decision value: twin + age limit (share of gain)",
+                             "3 · decision value: twin alone (share of gain)"]:
+            row = {"group": g, "criterion": cname}
+            for core in TWIN_CORES:
+                if cname.startswith("3 ·"):
+                    per = res[core]["per"]
+                    cells = list(dg[dg["core"] == core]["battery"])
+                    pol = "twin + age limit" if "age limit" in cname else "twin-informed"
+                    row[core] = _group_share(per, pol, cells) if len(per) and cells else np.nan
+                elif cname.startswith("2 ·"):
+                    row[core] = float(dg[dg["core"] == core][cname].abs().mean())   # closer to 0 is better
+                else:
+                    row[core] = float(dg[dg["core"] == core][cname].mean())
+            a, b = row[TWIN_CORES[0]], row[TWIN_CORES[1]]
+            if np.isfinite(a) and np.isfinite(b):
+                low = lower_better.get(cname, cname.startswith("2 ·"))
+                if cname.startswith("4 ·"):           # coverage: closer to the nominal 0.8 is better
+                    a, b = abs(a - 0.8), abs(b - 0.8)
+                    low = True
+                row["better"] = "tie" if abs(a - b) < 1e-9 else (TWIN_CORES[0] if (a < b) == low else TWIN_CORES[1])
+            out.append(row)
+    S = pd.DataFrame(out)
+    S.loc[S["criterion"].str.startswith("2 ·"), "criterion"] = "2 · late-life bias, size (cycles; |bias|)"
+    show_table(S.set_index(["group", "criterion"]).style.format("{:.2f}", subset=list(TWIN_CORES), na_rep="—"),
+               note="Lower is better for 1, 2 (size of the bias) and 5; higher for 3; for 4 the closest to the band's "
+                    "nominal 80 % wins. Decision value uses the default economics; the replacement margin and age are "
+                    "chosen leave-one-out.")
+    t7 = {core: res[core]["secs"] for core in TWIN_CORES}
+    st.markdown(f"**6 · One model for forecast, explanation and what-if:** {TWIN_CORES[0]}: no (forecast only; "
+                f"explanation and what-if come from the separate shared physics) · {TWIN_CORES[1]}: yes (its "
+                f"mechanism states explain the fade, its condition inputs give the what-if).  \n"
+                f"**7 · Speed:** every cycle is a re-anchoring for both (instant); one training at the live start: "
+                + " · ".join(f"{k}: {v:.0f} s" if np.isfinite(v) else f"{k}: —" for k, v in t7.items()))
+    with st.expander("Per battery"):
+        show_table(allrows.set_index(["core", "group", "battery"]).style.format("{:.2f}"))
+    download("Download the scorecard (CSV)", S.to_csv(index=False).encode(),
+             f"twin_scorecard__v{te.ENGINE_VERSION}.csv", "text/csv", key="score_csv")
+    download("Download the per-battery scores (CSV)", allrows.to_csv(index=False).encode(),
+             f"twin_scorecard_batteries__v{te.ENGINE_VERSION}.csv", "text/csv", key="score_csv2")
 
 
 def m3_policy_summary(per: pd.DataFrame) -> pd.DataFrame:
@@ -7669,7 +7819,7 @@ def m3_maintenance_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
                 "alarm, FLEET or OWN, also triggers the order), **best fixed age** (the usual practice) and **run to end of "
                 "life** (always unplanned). Margin and age are chosen on the *other* batteries (leave-one-out). "
                 "Revenue per cycle is proportional to SOH, so performance loss counts.")
-    key = (DATA_KEY, p["rule"], float(eol_ah))
+    key = (DATA_KEY, p["rule"], float(eol_ah), twin_core())
     saved = st.session_state.get("m3_lives")
     if st.button("Run the replacement study (all batteries that reached end of life)", key="m3_maint_go",
                  type="primary", icon=":material/build:",

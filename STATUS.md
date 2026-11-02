@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.39.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.39.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.40.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.40.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
   tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6) + test_m3_lifecycle.py (3), v5.37.0 (27 tests)
@@ -942,6 +942,40 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   output unchanged (verified); tests 31.
 - To run: Reference / Hot / Cold, origin 30 %, level "PINN v2 within group + ablation" (v1 and v2 results of 5bn can be
   reused). Reading: v2-group vs v1 = effect of cut-off + anchor; v2 vs v2-group = effect of pooling.
+
+## 5bp. PINN v2 within group on NASA (v5.39.0) -> CORRECTION of 5bn
+- Mean RMSE (bias, CV): Reference v1 5.61 / v2-group 5.83 (+2.2, 8.7) / v2 pooled 5.80 / v2-group-abl 5.06 /
+  frozen 4.47; Hot v1 0.98 / v2-group 13.73 (-12.9, 14.1) / v2 13.48 / v2-group-abl 3.78 / 0.95; Cold v1 8.44 /
+  v2-group 6.67 (-3.1, 9.8) / v2 7.38 / v2-group-abl 5.16 / 2.77.
+- CORRECTION: the Hot collapse is NOT pooling (v2-group fails the same way). Cause = the causal anchor design:
+  SOH_causal = running minimum of a trailing median from cycle 1; every Hot battery's first cycle reads 91-94 % (NASA
+  first-cycle artefact, next cycle ~101 %), so the anchor locks 3-7 points low (B0029 at cycle 12: measured 97.0,
+  v1 anchor 97.3, v2 anchor 93.0; B0031 98.2 vs 91.9). The 5bn "negative transfer" explanation is retracted.
+- Pooling effect (v2 vs v2-group, physics on): ~none (5.80 vs 5.83, 13.48 vs 13.73, 7.38 vs 6.67).
+- Cut-off input + anchor (v2-group vs v1): Cold better (8.44 -> 6.67; B0041 8.77 -> 3.28, B0047 9.27 -> 6.44),
+  Reference unchanged, Hot invalid (anchor bug). Still far from the frozen models.
+- Next: fix the anchor (running minimum only after a burn-in of the first cycles) and rerun v2-group once; then close.
+
+## 5bq. PINN as the twin's core + twin scorecard (v5.40.0)
+- Goal set by the user: the PINN must be the best model FOR THE DIGITAL TWIN. Seven criteria agreed BEFORE running
+  (all weighted): (1) end-of-life forecast error over live cycles, (2) late-life bias, (3) decision value (replacement
+  study share of perfect-knowledge gain), (4) band coverage (closest to nominal 80 %), (5) physical consistency (share
+  of forecasts rising > 0.5 pt above their running minimum or above 102 %), (6) one model for forecast + explanation
+  + what-if, (7) speed (training once at the live start; every cycle = re-anchoring).
+- Engine: kind "PINN-twin" (pinn:PINN-twin, te.PINN_TWIN_KEY): v2 features within group + causal anchor with a
+  3-cycle BURN-IN (running minimum starts after cycle 3: NASA's low first cycle cannot lock it, fixes 5bp) + 3-seed
+  ensemble (seed 0 runs the CV band; band widened by the seed spread; metrics recomputed). Also an assessment level.
+  PINN v1/v2/v2-group unchanged (verified); cv_folds=0 now allowed.
+- App: sidebar "Twin core model" (Frozen data model (Mission 2) / PINN twin core) used by Live twin, Integrated twin
+  and Mission 3 (cache key includes the core); Model updating always frozen (Mission 2). The PINN core goes through
+  the same frozen_stream: trained once at the live start (frozen_live_window), re-anchored every cycle.
+  Integrated twin page: "Twin scorecard" section scores both cores on every battery that reached end of life,
+  per group, with the better core marked; CSVs.
+- Demo (synthetic, not evidence): 3 batteries; PINN core EOL error 2.2 vs frozen 10.2 cycles; training 28 s vs 1 s.
+- Tests 33 (burn-in anchor; ensemble usable by the twin stream).
+- To run on NASA: Integrated twin -> Build -> "Score both twin cores" (PINN core trains once per battery, minutes the
+  first time, then saved). Then decide; next lever if it loses on 1-2: late-life acceleration term (symbolic
+  regression on the physics gap), or a physics-regularised version of the winning network.
 
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->

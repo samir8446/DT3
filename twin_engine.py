@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.39.0"
+ENGINE_VERSION = "5.40.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -8194,8 +8194,8 @@ PINN_TERMS = {"k_sei": "SEI growth rate", "k_pl": "Plating rate", "k_lam": "LAM 
               "c": "Plating-LAM coupling (knee)", "g": "Film resistance per LLI"}
 
 
-def _pinn_battery(ct: pd.DataFrame, c: str, n_max: Optional[int] = None, causal: bool = False
-                  ) -> Optional[Dict[str, Any]]:
+def _pinn_battery(ct: pd.DataFrame, c: str, n_max: Optional[int] = None, causal: bool = False,
+                  burn_in: int = 0) -> Optional[Dict[str, Any]]:
     d = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
     if n_max is not None:
         d = d[d["n"] <= n_max]
@@ -8206,6 +8206,11 @@ def _pinn_battery(ct: pd.DataFrame, c: str, n_max: Optional[int] = None, causal:
         return None
     if n_max is None:
         soh = dc["SOH_clean"].to_numpy(float)
+    elif causal and burn_in > 0:                       # twin core: the running minimum starts after a burn-in, so
+        tr_ = dc["SOH"].rolling(5, min_periods=1).median().to_numpy(float)   # NASA's low first cycle cannot lock it
+        soh = tr_.copy()                               # (5bp: Hot first cycles 91-94 %, next ~101 %)
+        if len(tr_) > burn_in:
+            soh[burn_in:] = np.minimum.accumulate(tr_[burn_in:])
     elif causal:                                       # PINN v2: trailing median + running minimum, past cycles only:
         soh = dc["SOH_causal"].to_numpy(float)         # a regeneration bump at the origin cannot lift the anchor
     else:
@@ -8378,7 +8383,7 @@ def _pinn_fit(bats: List[Dict[str, Any]], p: Dict[str, Any], seed: int = 0) -> D
     return {"predict": predict, "phys": {k: float(v.data[0, 0]) for k, v in phys.items()}}
 
 
-def _pinn_cut(ct: pd.DataFrame, c: str, share: float, causal: bool = False
+def _pinn_cut(ct: pd.DataFrame, c: str, share: float, causal: bool = False, burn_in: int = 0
               ) -> Optional[Tuple[Dict[str, Any], pd.DataFrame, int]]:
     """A battery seen only up to `share` of its life (like the predicted battery), collocation to its last cycle."""
     g = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
@@ -8386,7 +8391,7 @@ def _pinn_cut(ct: pd.DataFrame, c: str, share: float, causal: bool = False
         return None
     n_last = int(g["n"].max())
     cut = int(max(10, round(share * n_last)))
-    b = _pinn_battery(ct, c, n_max=cut, causal=causal)
+    b = _pinn_battery(ct, c, n_max=cut, causal=causal, burn_in=burn_in)
     if b is None:
         return None
     b["cut"] = cut
@@ -8415,6 +8420,7 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
     p = {"hidden": 32, "iterations": 1500, "learning_rate": 5e-3, "physics_weight": 1.0, **(model_params or {})}
     v2 = bool(p.get("v2", False))                          # v2 features: cut-off input + depth term + causal anchor
     pooled = bool(p.get("pooled", v2))                     # v2 also pools; "PINN-v2-group" keeps the group (5bn)
+    burn = int(p.get("burn_in", 0))                        # twin core: anchor burn-in (5bp)
     if pooled:                                             # PINN v2: pooled over every constant-condition battery
         pool = sorted({c for g in NASA_PHYSICS_GROUPS for c in protocol_cells(ct, g)} - {cell_id})
     else:
@@ -8425,10 +8431,10 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
     good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
     n_last = int(good["n"].max())
     share = n0 / max(n_last, 1)
-    tcut = _pinn_cut(ct, cell_id, share, causal=v2)
+    tcut = _pinn_cut(ct, cell_id, share, causal=v2, burn_in=burn)
     if tcut is None or len(full) < 2:
         raise ValueError("PINN: needs at least 2 training batteries and 8 valid cycles before the origin")
-    tgt = _pinn_battery(ct, cell_id, n_max=n0, causal=v2)
+    tgt = _pinn_battery(ct, cell_id, n_max=n0, causal=v2, burn_in=burn)
     full_inputs = bool(p.get("full_inputs", False))
     if v2 and tgt is not None:                             # depth of discharge: the measured end-of-discharge voltage
         def _xv(c_: str) -> float:
@@ -8447,10 +8453,11 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
     # held-out forecasts for the band and the CV error
     rng = np.random.default_rng(seed)
     cells = list(full)
-    folds = np.array_split(rng.permutation(cells), min(cv_folds, len(cells))) if len(cells) >= 3 else []
+    folds = (np.array_split(rng.permutation(cells), min(cv_folds, len(cells)))
+             if len(cells) >= 3 and cv_folds > 0 else [])
     errs = []
     for k, fold in enumerate(folds):
-        cuts = [x for x in (_pinn_cut(ct, c, share, causal=v2) for c in fold) if x is not None]
+        cuts = [x for x in (_pinn_cut(ct, c, share, causal=v2, burn_in=burn) for c in fold) if x is not None]
         if v2:
             for b_, g_c, _ in cuts:
                 b_["xV"] = full[str(g_c["Cell_ID"].iloc[0])]["xV"]
@@ -8503,6 +8510,8 @@ def train_pinn_level(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
         if not pooled:
             name = ("PINN v2 within group · cut-off, causal anchor" if lam_w > 0
                     else "PINN v2 within group · without physics")
+        if burn > 0:
+            name = "PINN twin core · cut-off, burn-in anchor"
         if lam_w > 0:
             learned["Depth sensitivity of LAM (a_V)"] = ph.get("a_V", float("nan"))
     out = TrajectoryForecast(name, "forecast", cell_id, n0, n_grid, soh, lo, hi, metrics,
@@ -8520,7 +8529,10 @@ PINN_MODELS = {"PINN": "PINN · physics-informed (mechanism equations enforced)"
                "PINN-v2": "PINN v2 · pooled over all constant-condition batteries, cut-off input + depth term, causal anchor",
                "PINN-v2-ablation": "PINN v2 network without physics (ablation)",
                "PINN-v2-group": "PINN v2 features (cut-off input + depth term, causal anchor), trained within the group",
-               "PINN-v2-group-ablation": "PINN v2 within group without physics (ablation)"}
+               "PINN-v2-group-ablation": "PINN v2 within group without physics (ablation)",
+               "PINN-twin": "PINN twin core · cut-off input + depth term, burn-in causal anchor, 3-seed ensemble"}
+PINN_TWIN_KEY = "pinn:PINN-twin"
+PINN_TWIN_SEEDS = (0, 1, 2)
 MODEL_SPECS.update({
     "PINN": ModelSpec("PINN", "Physics-informed network", "Mechanism states learned with the degradation equations enforced.",
                       (_P("hidden", "Hidden units", "int", 32, 8, 64), _P("iterations", "Training iterations", "int", 1500, 300, 4000),
@@ -8543,9 +8555,36 @@ def train_pinn_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
         prm["v2"] = True
     if kind in ("PINN-v2-group", "PINN-v2-group-ablation"):
         prm["pooled"] = False
+    if kind == "PINN-twin":                                # the digital twin's PINN core (STATUS 5bq)
+        prm.update({"v2": True, "pooled": False, "burn_in": 3})
+        return _pinn_ensemble(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, **kw)
     if kind in ("PINN-full", "PINN-full-ablation"):
         prm["full_inputs"] = True
     return train_pinn_level(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, **kw)
+
+
+def _pinn_ensemble(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, **kw) -> "TrajectoryForecast":
+    """Average of PINN fits over PINN_TWIN_SEEDS (training variance, 5bj). Only the first seed runs the cross-validation
+    (its band); the band then widens by the seed-to-seed spread. Metrics recomputed on the averaged forecast."""
+    kw = {k: v for k, v in kw.items() if k != "seed"}
+    fits = []
+    for j, s in enumerate(PINN_TWIN_SEEDS):
+        fits.append(train_pinn_level(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, seed=s,
+                                     **({**kw, "cv_folds": 0} if j > 0 else kw)))
+    f0 = fits[0]
+    S = np.vstack([f.soh for f in fits])
+    soh, spread = S.mean(axis=0), S.std(axis=0)
+    lo = np.clip(np.minimum(f0.lo - f0.soh + soh - spread, soh), 0, 1.05)
+    hi = np.clip(np.maximum(f0.hi - f0.soh + soh + spread, soh), 0, 1.05)
+    good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
+    soh_eol = soh_eol_for(float(good["C_bol_Ah"].iloc[0]), eol_ah)
+    metrics = forecast_metrics(good["n"].to_numpy(), good["SOH"].to_numpy(), f0.n_grid, soh, n0, soh_eol, lo, hi, 0.2)
+    out = replace(f0, model=f"{f0.model} · {len(fits)}-seed ensemble", soh=soh, lo=lo, hi=hi,
+                              metrics=metrics, fit_seconds=float(sum(f.fit_seconds for f in fits)))
+    mech = [getattr(f, "mechanisms", None) for f in fits]
+    if all(m is not None for m in mech):
+        out.mechanisms = {"n": mech[0]["n"], **{k: np.mean([m[k] for m in mech], axis=0) for k in mech[0] if k != "n"}}
+    return out
 
 
 _tune_level_model_base = tune_level_model
@@ -8577,7 +8616,8 @@ def tune_level_model(ct, imp, cell_id, n0, model_name, mode="forecast", train_ce
 for _k, _lab in (("PINN", "PINN · physics-informed"), ("PINN-ablation", "PINN · same network without physics"),
                  ("PINN-full", "PINN · all inputs"), ("PINN-full-ablation", "PINN · all inputs, without physics"),
                  ("PINN-v2", "PINN v2 · pooled + cut-off"), ("PINN-v2-ablation", "PINN v2 · without physics"),
-                 ("PINN-v2-group", "PINN v2 within group"), ("PINN-v2-group-ablation", "PINN v2 within group · no physics")):
+                 ("PINN-v2-group", "PINN v2 within group"), ("PINN-v2-group-ablation", "PINN v2 within group · no physics"),
+                 ("PINN-twin", "PINN twin core")):
     PROTOCOL_MODELS[f"pinn:{_k}"] = ("Physics-informed (PINN)", _lab)
 import dataclasses as _dc
 for _k, _base, _desc in (("PINN-full", "PINN", "Mechanism equations enforced; inputs: conditions + the battery's measured "
@@ -8589,7 +8629,9 @@ for _k, _base, _desc in (("PINN-full", "PINN", "Mechanism equations enforced; in
                          ("PINN-v2-ablation", "PINN-ablation", "The same v2 network and data without the physics."),
                          ("PINN-v2-group", "PINN", "v2 features (cut-off input + LAM depth term, regeneration-robust "
                           "causal anchor) with v1's within-group training: isolates them from pooling."),
-                         ("PINN-v2-group-ablation", "PINN-ablation", "The same within-group v2 network without the physics.")):
+                         ("PINN-v2-group-ablation", "PINN-ablation", "The same within-group v2 network without the physics."),
+                         ("PINN-twin", "PINN", "The digital twin's PINN core: v2 within group with a burn-in on the "
+                          "causal anchor (NASA's low first cycle cannot lock it) and a 3-seed ensemble.")):
     if _base in MODEL_SPECS and _k not in MODEL_SPECS:
         MODEL_SPECS[_k] = _dc.replace(MODEL_SPECS[_base], name=_k, blurb=_desc)
 _protocol_forecast_l3 = _protocol_forecast
