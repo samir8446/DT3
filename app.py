@@ -7092,7 +7092,7 @@ def twin_battery_parts(c: str) -> Dict[str, Any]:
     if out["why_not"]:
         return out
     try:
-        with st.spinner(f"Streaming {c} through the frozen {grp_c} model (saved, so it runs only once)…"):
+        with st.spinner(f"Streaming {c} through the twin core ({twin_core()}, {grp_c}; saved, so it runs only once)…"):
             ns, nm = te.frozen_live_window(ct, c, train_c)
             out["frames"], out["track"] = frozen_cached(ct, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1],
                                                         float(soh_eol), 0, "capacity", float(eol_ah), ns, nm)
@@ -7300,6 +7300,8 @@ def view_twin() -> None:
                 "it behaves abnormally, why it has lost capacity, and how other operating conditions would change "
                 "that. Each task comes from the model that proved best at it (Mission 3, option B). Move *today* "
                 "to replay the battery's life: the forecast and the detector see nothing after it.")
+    st.caption(f"Twin core model: **{twin_core()}** (change it in the sidebar). The forecast, the watch status and "
+               f"the downloaded timeline all come from this core.")
     grp_c, fz, _ = frozen_context(cell)
     fleet = twin_fleet_parts(build=False)
     with st.expander("Which model does what", icon=":material/account_tree:"):
@@ -7463,7 +7465,7 @@ def view_twin() -> None:
 
     tl = te.integrated_timeline(soh_eol_c, meas, frames, an, common, t_main, t_check, watch, watch_q)
     download("Download this battery's twin timeline (CSV)",
-             tl.assign(battery=cell, group=grp_c, **{"app version": te.ENGINE_VERSION,
+             tl.assign(battery=cell, group=grp_c, **{"app version": te.ENGINE_VERSION, "twin core": twin_core(),
                                                     "end of life": _twin_eol_label(),
                                                     "watch uses": basis}).to_csv(index=False).encode(),
              f"integrated_twin_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="itw_csv")

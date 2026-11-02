@@ -977,6 +977,24 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   first time, then saved). Then decide; next lever if it loses on 1-2: late-life acceleration term (symbolic
   regression on the physics gap), or a physics-regularised version of the winning network.
 
+## 5br. Twin scorecard on NASA (v5.40.0): PINN core better in Cold, one Reference failure (B0005)
+- Cold (5): EOL error frozen 4.60 / PINN 2.48 cycles; |late bias| 2.19 / 0.53; decision value twin + age limit 0.62 /
+  0.62 (tie), twin alone 0.34 / 0.31. PINN better on 4/5 (B0046 5.55->2.73, B0047 4.75->1.25, B0048 8.29->4.54;
+  B0045 1.57->2.00).
+- Reference (3): EOL error 8.47 / 19.53 driven by B0005 (7.74 -> 45.31, late bias +11.5); PINN better on B0006
+  (11.53->8.37, bias +9.05 -> +0.20: removes the frozen model's optimism) and B0018 (6.12->4.90). Decision value
+  twin alone 0.956 / 0.651 (B0005 replaced late), twin + age limit 0.929 / 0.930.
+- All: PINN more accurate on 6/8 batteries; |late bias| 2.75 / 2.11; mean EOL error 6.05 / 8.87 (B0005).
+- Criterion 4 uninformative: coverage ~1.00 for both (nominal 0.8) -> both bands too wide (to calibrate).
+  Criterion 5: no impossible forecasts for either.
+- Next: diagnose B0005 with the PINN core timeline (suspects: slow early fade learned by the battery code + decelerating
+  physics; or one diverging seed -> median of seeds); then GA-PINN (professor's proposal) with nested LOBO fitness incl.
+  late-life bias and physics-form genes; band calibration.
+- B0005 timeline received (v5.40.0) was produced by the FROZEN core (mean |EOL error| 7.74 = the frozen score; the
+  PINN core scored 45.3): the page did not show which core was active. Fixed (app-only): caption "Twin core model"
+  on the Integrated twin page, "twin core" column in the timeline CSV, spinner names the core. Re-download needed
+  with the sidebar on "PINN twin core".
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).
