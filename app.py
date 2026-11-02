@@ -2471,7 +2471,7 @@ def core_refit(core: Optional[str] = None) -> int:
     """Retrain interval of the twin's core (0 = trained once at the live start). Only the PINN core uses it: its
     battery code is learned from the battery's own cycles, so retraining lets it see a fade that speeds up (B0005,
     STATUS 5bs); the frozen data model stays as validated in Mission 2 (trained once, re-anchored)."""
-    return int(st.session_state.get("pinn_refit", 0)) if (core or twin_core()) in PINN_CORES else 0
+    return int(st.session_state.get("pinn_refit", 20)) if (core or twin_core()) in PINN_CORES else 0
 
 
 def ga_winner_key(c: str) -> Optional[str]:
@@ -2707,9 +2707,10 @@ with st.sidebar:
              help="Used by the Live twin, the Integrated twin and Mission 3. The PINN core is trained once at the live "
                   "start and re-anchored every cycle, like the frozen model; compare both with the twin scorecard "
                   "(Integrated twin page). The Model updating page always uses the frozen model (Mission 2).")
-    st.selectbox("PINN core: retrain every N cycles", [0, 10, 20, 30], key="pinn_refit",
+    st.selectbox("PINN core: retrain every N cycles", [0, 10, 20, 30], key="pinn_refit", index=2,
                  format_func=lambda v: "never (trained once at the live start)" if v == 0 else f"every {v} cycles",
-                 help="Only for the PINN core. Retraining lets its battery code follow a fade that speeds up; each "
+                 help="Only for the PINN cores (default every 20 cycles: STATUS 5bt, B0005 45 -> 25 cycles). Retraining lets "
+                      "the battery code follow a fade that speeds up; each "
                       "retraining costs one PINN training (minutes on NASA the first time, then saved).")
     if st.session_state.get("demo"):
         if st.button("Leave synthetic demo"):

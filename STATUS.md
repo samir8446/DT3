@@ -1064,6 +1064,16 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - Next: finish GA for the other 7 batteries; proposal: self-tuning twin = at each retraining choose genes by causal
   backtest on the battery's OWN recent cycles (adapts to battery-specific acceleration like B0005, no future data).
 
+## 5bw. GA-PINN progress + retraining default (v5.41.0)
+- GA finished for B0005, B0006, B0018 (B0041 4 evaluations; B0045-48 not started). Winners: B0005 h48|lr0.01|w0.3|p0|
+  a0|it900; B0006 h48|lr0.005|w1|p1|a0|it600; B0018 h32|lr0.01|w0.3|p0|a1|it900; B0041 (partial) p0 + accel.
+  p = 0 in all top-5 genomes of B0005 and B0018, 3/5 of B0006.
+- That scorecard ran with retraining OFF (sidebar reset to "never" after the app reload: B0005 PINN 45.31 = trained-
+  once value), so it is not comparable with 5bt/5bv. Within it, GA-PINN improves on the PINN core wherever the GA
+  finished: B0005 45.31 -> 41.19, B0006 8.37 -> 7.97, B0018 4.90 -> 4.12. All: EOL error 6.05 / 8.87 / 8.21;
+  |late bias| 2.75 / 2.11 / 1.64; twin-alone decision 0.471 / 0.381 / 0.473.
+- App: default "PINN core: retrain every 20 cycles" (was never), so a reload cannot silently switch it off.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).
