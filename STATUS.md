@@ -9,8 +9,8 @@ mechanisms; M2 self-updating twin (can degradation be predicted, which variables
 M3 integrated operation and maintenance. Deliverable: a Streamlit app (app.py) + a tested engine (twin_engine.py).
 
 ## 2. Files and versions (always deliver both .py files from the same release)
-- twin_engine.py  ENGINE_VERSION = "5.41.0"   (all computation; no Streamlit)
-- app.py          REQUIRED_ENGINE = "5.41.0"  (exact version guard + required-function check)
+- twin_engine.py  ENGINE_VERSION = "5.42.0"   (all computation; no Streamlit)
+- app.py          REQUIRED_ENGINE = "5.42.0"  (exact version guard + required-function check)
 - tests/test_twin_engine.py: 80 tests (passing at v5.11.0; not rerun since, file not in the Project) +
   tests/test_cv_selection.py (5) + tests/test_frozen_live.py (10), passing at v5.15.0;
   tests/test_integrated_twin.py (12) + test_m3_maintenance.py (5) + test_m3_operation.py (6) + test_m3_lifecycle.py (3), v5.37.0 (27 tests)
@@ -1073,6 +1073,47 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   finished: B0005 45.31 -> 41.19, B0006 8.37 -> 7.97, B0018 4.90 -> 4.12. All: EOL error 6.05 / 8.87 / 8.21;
   |late bias| 2.75 / 2.11 / 1.64; twin-alone decision 0.471 / 0.381 / 0.473.
 - App: default "PINN core: retrain every 20 cycles" (was never), so a reload cannot silently switch it off.
+
+## 5bx. GA-PINN complete for all 8 batteries (131 evaluations)
+- Winners (h | lr | lambda | SEI p | accel | it; improvement of nested fitness vs current settings): B0005 48|0.01|0.3|
+  0|off|900 (60 %); B0006 48|0.005|1|1|off|600 (24 %); B0018 32|0.01|0.3|0|on|900 (51 %); B0041 32|0.01|0.3|0.5|on|900
+  (4.5 %); B0045 16|0.002|0.3|0|on|900 (51 %); B0046 16|0.002|0.3|0|on|600 (62 %); B0047 16|0.002|0.3|0|on|600 (55 %);
+  B0048 16|0.002|0.3|0|on|600 (60 %).
+- Mean within-battery fitness rank by gene (0 best), Reference / Cold: lambda 0.3 0.40/0.35, 1 0.64/0.63, 3 0.85/0.83
+  (strongest: lighter physics penalty); SEI p 0 0.48/0.55, 0.5 0.46/0.44, 1 0.67/0.51 (decelerating law rejected in
+  Reference, no preference in Cold); accel on 0.51/0.56, off 0.61/0.37 (helps Reference; all Cold winners use it but
+  not on average -> not robust in Cold); hidden 16 0.51/0.34 (Cold prefers small nets); iterations 600 0.41/0.43,
+  900 0.61/0.58. GA sampling is selection-biased: averages indicative, not a controlled experiment.
+- Next: scorecard with all GA winners and retrain 20 (first complete, consistent comparison).
+
+## 5by. COMPLETE twin scorecard: all 8 GA winners, PINN cores retrained every 20 cycles (v5.41.0)
+- All 8 (frozen / PINN / GA-PINN): (1) EOL error mean 6.05 / 6.46 / 6.25 (tie GA = frozen within 0.25), median
+  5.84 / - / 3.34; (2) |late bias| 2.75 / 1.36 / 0.99 (GA ~3x smaller than frozen); (3) decision value twin + age
+  limit 0.686 / 0.686 / 0.687, twin alone 0.471 / 0.472 / 0.478 (tie); (4) coverage 1.00 / 0.96 / 0.97; (4b)
+  calibrated 0.787 / 0.778 / 0.793 (GA = frozen); (5) 0 / 0 / 0; (6) no / yes / yes; (7) frozen fastest.
+- GA-PINN best or tied-best on 6 of 7 criteria (loses speed only) -> "best model for the digital twin" (criteria fixed
+  before running, all LOBO). GA-PINN vs frozen EOL error: better on 6/8 (B0006 11.53->9.32, B0018 6.12->3.90, B0041
+  2.86->1.86, B0046 5.55->2.77, B0047 4.75->2.25, B0048 8.29->4.17); worse B0045 (1.57->1.86) and B0005 (7.74->23.91).
+- Groups: Cold GA = PINN best on 1, 2, 4b; Reference frozen best on 1 (8.47 vs 12.38, B0005), GA best on 2.
+- Remaining weakness: B0005 (slow then ~2x faster fade, absent from its training batteries). Proposed next: self-tuning
+  twin (genes chosen at each retraining by causal backtest on the battery's own recent cycles).
+
+## 5bz. Self-tuning GA-PINN core (v5.42.0)
+- Aim: battery-specific acceleration (B0005) that no training battery shows, which nested-LOBO GA cannot learn.
+- Engine: kind pinn:PINN-self|<g1>~<g2>~... (te.pinn_self_key / pinn_self_candidates). At each (re)training point n0:
+  for each candidate genome, CAUSAL backtest on the battery's own last SELF_TUNE_WINDOW = 20 cycles (train as at
+  n0 - 20 with the training batteries + own cycles up to n0 - 20, re-anchor at n0 - 20, RMSE on own measured cycles in
+  (n0 - 20, n0]); needs >= 15 own cycles before n0 - 20 (else candidate 0). Switching margin SELF_TUNE_MARGIN = 0.20:
+  candidate 0 (GA winner) kept unless another backtests >= 20 % better (a first demo run without the margin switched
+  on noise: EOL error 4.36 vs 2.42 GA-PINN). Then 3-seed ensemble at n0; choice and scores reported.
+- Causality test: lowering the battery's SOH by 0.2 after n0 leaves the choice and the forecast at n0 identical.
+- Demo with the margin (synthetic, no acceleration): EOL error frozen 10.15, PINN 2.30, GA-PINN 2.42, self-tuning 2.64
+  (4.36 without the margin): noise-driven switching removed; small residual cost where nothing accelerates.
+- App: fourth core "Self-tuning GA-PINN core" = each battery's top-3 nested-GA genomes + the default settings (default
+  PINN core until its GA finishes); scorecard scores 4 cores; labels. GA-PINN and twin-core outputs unchanged.
+- Tests 36.
+- To run on NASA: sidebar retrain every 20 (default), then "Score the twin cores" (GA results reused; only the new core
+  trains: 4 backtests + ensemble per retraining). Key question: B0005's EOL error (frozen 7.74, GA-PINN 23.91).
 
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->

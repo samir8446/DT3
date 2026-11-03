@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.41.0"
+ENGINE_VERSION = "5.42.0"
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -8575,6 +8575,8 @@ def train_pinn_model(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str
         prm["v2"] = True
     if kind in ("PINN-v2-group", "PINN-v2-group-ablation"):
         prm["pooled"] = False
+    if kind.startswith("PINN-self|"):                      # self-tuning GA-PINN (STATUS 5bz)
+        return pinn_self_tuning(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, kind, **kw)
     if kind.startswith("PINN-ga|"):                        # GA-PINN winner (STATUS 5bu): genome in the key
         prm.update({"v2": True, "pooled": False, "burn_in": 3, **ga_pinn_genome(kind)})
         return _pinn_ensemble(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm, **kw)
@@ -8702,6 +8704,68 @@ def ga_pinn_run(evaluate: Callable[[Dict[str, Any]], float], pop_size: int = 6, 
     best = min(fit, key=fit.get)
     return {"done": True, "generation": generations, "history": history, "fitness": fit, "genomes": genomes,
             "best": genomes[best], "best_key": ga_pinn_key(genomes[best]), "best_fitness": fit[best]}
+
+
+SELF_TUNE_WINDOW = 20          # cycles of the battery's own recent past used to choose the genome
+SELF_TUNE_MIN_HISTORY = 15     # cycles of own history needed before the backtest origin
+SELF_TUNE_MARGIN = 0.20        # switch away from candidate 0 (the GA winner) only if >= 20 % lower backtest error
+
+
+def pinn_self_key(genomes: Sequence[Dict[str, Any]]) -> str:
+    """Protocol key of a self-tuning core: its candidate genomes, e.g. pinn:PINN-self|h48|...~h32|..."""
+    return "pinn:PINN-self|" + "~".join(ga_pinn_key(g).split("|", 1)[1] for g in genomes)
+
+
+def pinn_self_candidates(kind_or_key: str) -> List[Dict[str, Any]]:
+    body = kind_or_key.split("PINN-self|", 1)[1]
+    return [ga_pinn_genome("PINN-ga|" + s) for s in body.split("~") if s]
+
+
+def self_tuning_backtest(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str, n0: int,
+                         train_cells: Sequence[str], eol_ah: float, genome: Dict[str, Any],
+                         window: int = SELF_TUNE_WINDOW) -> float:
+    """CAUSAL backtest of one genome on the battery's own recent past: train as at n0 - window (training batteries +
+    the battery's cycles up to n0 - window), re-anchor at n0 - window, score RMSE (SOH pts) on its measured cycles in
+    (n0 - window, n0]. Uses nothing after n0."""
+    nb = int(n0) - int(window)
+    good = ct[(ct["Cell_ID"] == cell_id) & ~ct["outlier"]].sort_values("n")
+    if (good["n"] <= nb).sum() < SELF_TUNE_MIN_HISTORY:
+        return float("nan")
+    prm = {"v2": True, "pooled": False, "burn_in": 3, **genome, "accel": bool(genome["accel"])}
+    f = train_pinn_level(ct, imp, cell_id, nb, "forecast", list(train_cells), eol_ah, prm, seed=0, cv_folds=0)
+    past = good[good["n"] <= nb]
+    anchor = float(past["SOH"].tail(3).median())
+    win = good[(good["n"] > nb) & (good["n"] <= n0)]
+    if not len(win):
+        return float("nan")
+    f_nb = float(np.interp(nb, f.n_grid, f.soh))
+    pred = anchor + np.interp(win["n"].to_numpy(float), f.n_grid, f.soh) - f_nb
+    return float(100 * np.sqrt(np.mean((pred - win["SOH"].to_numpy(float)) ** 2)))
+
+
+def pinn_self_tuning(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str, n0: int, mode: str,
+                     train_cells: Sequence[str], eol_ah: float, prm: Dict[str, Any], kind: str, **kw
+                     ) -> "TrajectoryForecast":
+    """Self-tuning GA-PINN (STATUS 5bz): at each (re)training point n0, choose among the candidate genomes (the
+    battery's nested-GA best) the one that best forecast the battery's OWN last SELF_TUNE_WINDOW cycles (causal
+    backtest), then train it at n0 as a 3-seed ensemble. Candidate 0 (the GA winner) is kept unless another candidate
+    backtests at least SELF_TUNE_MARGIN better; falls back to candidate 0 without enough history."""
+    cands = pinn_self_candidates(kind)
+    scores = [self_tuning_backtest(ct, imp, cell_id, n0, train_cells, eol_ah, g) for g in cands]
+    finite = [i for i, s in enumerate(scores) if np.isfinite(s)]
+    pick = 0
+    if finite:                                             # hysteresis: noisy 20-cycle backtests must not trigger a
+        best = min(finite, key=lambda i: scores[i])        # switch; only clear evidence (e.g. a faster fade) does
+        if not np.isfinite(scores[0]) or scores[best] <= (1 - SELF_TUNE_MARGIN) * scores[0]:
+            pick = best
+    g = cands[pick]
+    prm2 = {**prm, "v2": True, "pooled": False, "burn_in": 3, **g}
+    out = _pinn_ensemble(ct, imp, cell_id, n0, mode, train_cells, eol_ah, prm2, **kw)
+    out.model = f"Self-tuning {out.model}"
+    out.inputs_at_origin = {**out.inputs_at_origin, "Self-tuning: chosen candidate": float(pick),
+                            **{f"Self-tuning backtest RMSE, candidate {i}": s for i, s in enumerate(scores)}}
+    out.self_choice = {"pick": pick, "genome": dict(g), "scores": scores}
+    return out
 
 
 _tune_level_model_base = tune_level_model

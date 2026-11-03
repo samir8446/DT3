@@ -48,7 +48,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.41.0"
+REQUIRED_ENGINE = "5.42.0"
 if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
@@ -2452,6 +2452,9 @@ def model_label(k: Optional[str]) -> str:
         return "—"
     if k in te.PROTOCOL_MODELS:
         return te.PROTOCOL_MODELS[k][1]
+    if "PINN-self|" in k:
+        return f"Self-tuning GA-PINN · {len(te.pinn_self_candidates(k))} candidates, chosen on its own last " \
+               f"{te.SELF_TUNE_WINDOW} cycles at each retraining"
     if "PINN-ga|" in k:
         g = te.ga_pinn_genome(k)
         return (f"GA-PINN · h{g['hidden']}, λ {g['physics_weight']:g}, SEI p {g['sei_p']:g}, "
@@ -2459,7 +2462,7 @@ def model_label(k: Optional[str]) -> str:
     return k
 
 
-TWIN_CORES = ("Frozen data model (Mission 2)", "PINN twin core", "GA-PINN core")
+TWIN_CORES = ("Frozen data model (Mission 2)", "PINN twin core", "GA-PINN core", "Self-tuning GA-PINN core")
 PINN_CORES = TWIN_CORES[1:]
 
 
@@ -2472,6 +2475,20 @@ def core_refit(core: Optional[str] = None) -> int:
     battery code is learned from the battery's own cycles, so retraining lets it see a fade that speeds up (B0005,
     STATUS 5bs); the frozen data model stays as validated in Mission 2 (trained once, re-anchored)."""
     return int(st.session_state.get("pinn_refit", 20)) if (core or twin_core()) in PINN_CORES else 0
+
+
+def self_tuning_key(c: str, k: int = 3) -> Optional[str]:
+    """Self-tuning core of battery c (STATUS 5bz): its k best nested-GA genomes + the default settings; at every
+    retraining the twin picks the one that best forecast the battery's own recent cycles (causal backtest)."""
+    r = (st.session_state.get("ga_pinn") or {}).get(c) or {}
+    if not r.get("done") or not r.get("fitness"):
+        return None
+    fit = r["fitness"]
+    cands = [dict(r["genomes"][g]) for g in sorted(fit, key=fit.get)[:k]]
+    start = dict(te.GA_PINN_START)
+    if all(te.ga_pinn_key(x) != te.ga_pinn_key(start) for x in cands):
+        cands.append(start)
+    return te.pinn_self_key(cands)
 
 
 def ga_winner_key(c: str) -> Optional[str]:
@@ -2492,6 +2509,8 @@ def frozen_context(c: str, core: Optional[str] = None) -> Tuple[Optional[str], O
         fz = (te.PINN_TWIN_KEY, fz[1])
     elif fz and core_ == TWIN_CORES[2]:                    # GA-PINN winner; the default PINN core until its search ends
         fz = (ga_winner_key(c) or te.PINN_TWIN_KEY, fz[1])
+    elif fz and core_ == TWIN_CORES[3]:                    # self-tuning among the GA's best (default until GA ends)
+        fz = (self_tuning_key(c) or te.PINN_TWIN_KEY, fz[1])
     train_c = [x for x in te.protocol_cells(CT_RAW, grp_c) if x != c] if fz else []
     return grp_c, fz, train_c
 
@@ -7886,7 +7905,7 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
     """Which forecaster makes the better digital twin? Seven criteria agreed before running (STATUS 5bq), computed
     for every twin core on every battery that reached end of life (leave-one-out choices); 4b = band coverage after
     leave-one-out calibration of the band width (5bu)."""
-    section("Twin scorecard · frozen data model vs PINN core vs GA-PINN core")
+    section("Twin scorecard · frozen data model vs PINN cores (PINN, GA-PINN, self-tuning GA-PINN)")
     st.markdown("Seven criteria fixed **before** running: (1) end-of-life forecast error over the battery's life, "
                 "(2) late-life bias, (3) decision value in the replacement study, (4) honest uncertainty (band "
                 "coverage; 4b after calibration), (5) physical consistency, (6) one model for forecast, explanation "
@@ -7993,12 +8012,14 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
                note="Ties: within 0.25 cycles (1, 2) or 1 percentage point (3, 4, 5). Lower is better for 1, 2 (size "
                     "of the bias) and 5; higher for 3; for 4 and 4b the closest to the band's nominal 80 % wins. "
                     "Decision value uses the default economics; replacement margin and age chosen leave-one-out. "
-                    "GA-PINN core: batteries whose search has not finished use the default PINN core (column "
+                    "GA-PINN and self-tuning cores: batteries whose search has not finished use the default PINN "
+                    "core (column "
                     "'model key' in the per-battery table).")
     t7 = {core: res[core]["secs"] for core in cores}
     st.markdown(f"**6 · One model for forecast, explanation and what-if:** {TWIN_CORES[0]}: no (forecast only; "
-                f"explanation and what-if come from the separate shared physics) · {TWIN_CORES[1]} and "
-                f"{TWIN_CORES[2]}: yes (mechanism states explain the fade, condition inputs give the what-if).  \n"
+                f"explanation and what-if come from the separate shared physics) · the PINN cores "
+                f"({', '.join(TWIN_CORES[1:])}): yes (mechanism states explain the fade, condition inputs give the "
+                f"what-if).  \n"
                 f"**7 · Speed:** every cycle is a re-anchoring for every core (instant); one training at the live "
                 f"start: " + " · ".join(f"{k}: {v:.0f} s" if np.isfinite(v) else f"{k}: —" for k, v in t7.items()))
     with st.expander("Per battery"):

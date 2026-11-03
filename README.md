@@ -1,9 +1,14 @@
-# Self-updating digital twin for Li-ion battery diagnostics (v5.41.0)
+# Self-updating digital twin for Li-ion battery diagnostics (v5.42.0)
 
 Streamlit platform and Python engine for the internship study on NASA Ames 18650 LiCoO₂/graphite ageing
 data. A physical cell and its virtual copy are synchronised cycle by cycle to diagnose ageing, forecast
 remaining life and optimise operation and maintenance.
 
+
+## Self-tuning GA-PINN (v5.42.0)
+
+1. Fourth twin core "Self-tuning GA-PINN core": at each retraining, chooses among the battery's best GA genomes by a
+   causal backtest on its own last 20 cycles (switching margin 20 %), for battery-specific acceleration.
 
 ## GA-PINN and band calibration (v5.41.0)
 

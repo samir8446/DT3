@@ -104,3 +104,21 @@ def test_ga_pinn_fitness_is_nested_and_winner_trains(demo):
                               te.DEFAULT_EOL_AH)
     assert f.model.startswith("GA-PINN") and np.isfinite(f.soh).all()
     assert "Damage acceleration (k_acc)" in f.inputs_at_origin
+
+
+def test_self_tuning_is_causal_and_picks_best_backtest(demo):
+    ct, imp = demo
+    cands = [{**te.GA_PINN_START, "iterations": 200},
+             {**te.GA_PINN_START, "sei_p": 0.0, "accel": 1, "iterations": 200},
+             {**te.GA_PINN_START, "physics_weight": 3.0, "learning_rate": 0.002, "iterations": 200}]
+    key = te.pinn_self_key(cands)
+    assert len(te.pinn_self_candidates(key)) == 3
+    f = te._protocol_forecast(key, None, ct, imp, "S001", 60, ["S002", "S005", "S008"], te.DEFAULT_EOL_AH)
+    sc = f.self_choice["scores"]
+    best = int(np.nanargmin(sc))
+    expected = best if sc[best] <= (1 - te.SELF_TUNE_MARGIN) * sc[0] else 0   # switching margin (hysteresis)
+    assert f.self_choice["pick"] == expected and f.model.startswith("Self-tuning")
+    d = ct.copy()                                                          # the battery's FUTURE changes ...
+    d.loc[(d.Cell_ID == "S001") & (d.n > 60), "SOH"] -= 0.2
+    g = te._protocol_forecast(key, None, d, imp, "S001", 60, ["S002", "S005", "S008"], te.DEFAULT_EOL_AH)
+    assert g.self_choice == f.self_choice and np.array_equal(g.soh, f.soh)   # ... the choice and forecast do not
