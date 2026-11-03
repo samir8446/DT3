@@ -1137,6 +1137,48 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   self-tuning 116 s.
 - NASA plan: restore GA from CSV, then score in several presses (optionally one or two cores per pass).
 
+## 5cc. FINAL GA-PINN results: four cores, GA restored, retrain every 20 (v5.42.0) -> GA-PINN chapter CLOSED
+- All 8 (frozen / PINN / GA-PINN / self-tuning): EOL error mean 6.05 / 6.46 / 6.25 / 6.25 (tie frozen = GA within 0.25),
+  median 5.84 / 3.58 / 3.33 / 3.33; |late bias| 2.75 / 1.36 / 0.99 / 0.99; decision value (age limit) 0.686 / 0.686 /
+  0.687 / 0.687, (alone) 0.471 / 0.472 / 0.478 / 0.478; calibrated coverage 0.787 / 0.778 / 0.793 / 0.793; impossible 0.
+  Reproduces 5by exactly (restore verified).
+- Self-tuning identical to GA-PINN on every battery: at no retraining did another candidate backtest >= 20 % better on
+  the battery's own last 20 cycles -> kept the GA winner. Negative result, documented; core kept as an option.
+- B0005 limit (GA-PINN 23.9 vs frozen 7.7 cycles): error concentrated in the early forecasts (cycles ~56-76), before
+  its faster fade appears in any available data (its own past or the training batteries); not predictable causally.
+- FINAL CLAIM: GA-PINN = best model for the digital twin, best or tied-best on 6 of 7 agreed criteria (loses speed);
+  more accurate on 6/8 batteries; ~3x smaller late-life bias; equal decisions; calibrated uncertainty; one model
+  for forecast + mechanisms + what-if. Physical findings 5bx (lambda 0.3; steady SEI law in Reference).
+- NEXT (agreed with the user): full review of the platform (inputs, outputs, models, equations, methods, validation,
+  numbers, limits; read from the code) -> review document + presentation for the professor, in ENGLISH.
+
+## 5cd. Full technical review for the professor (in progress, English)
+- Claude Doc "Self-Updating Digital Twin for Li-ion Batteries · Technical Review":
+  https://claude.ai/artifact/WvcXeY8kCmGDB8YAzKzS16 (sections: purpose, data, Mission 1, Mission 2, physics, PINN, twin
+  core, anomaly detection, Mission 3, validation and limits, open issues). Every statement checked against the code.
+- Done (2026-11-03): purpose; data (groups from NASA READMEs + recorded conditions, pipeline steps, SOH / cleaned /
+  causal / end-of-life definitions, limits); Mission 1 (12 indicators, Coble-Hines criteria, fitness = mean of 4,
+  PCA, mechanism proxies, half-cell fit, stress index, conditions table, limits).
+- Done (2026-11-03, second pass): Mission 2 (modes, inputs, model levels, protocol, frozen table, update study per
+  group; flagged: re-anchoring clearly supported in Reference only, not better than no anchor in Hot/Cold); physics
+  (v2/v3 equations, fit, hybrid, recovery test, forecasting results, option B); PINN (inputs, network, rate equations,
+  loss, training, variants table, anchor bug, resistance diagnostic; ablation evidence mixed across studies, shown).
+- Next: twin core (PINN core, GA-PINN, self-tuning, calibration, scorecard), anomaly detection, Mission 3,
+  validation and limits, open issues; then the presentation.
+
+## 5ce. GA-PINN as the default twin core for Mission 3; forecast plot; self-tuning removed from the choices
+- User request: keep the first PINN core and GA-PINN, drop the other PINN core option, use GA-PINN in Mission 3.
+- App: twin cores = Frozen data model (Mission 2) / PINN twin core / GA-PINN core (self-tuning removed from the
+  sidebar and the scorecard; engine kind pinn:PINN-self kept). Default core = GA-PINN (Live twin, Integrated twin,
+  Mission 3 maintenance and lifecycle; Model updating stays frozen; operation uses the physics ageing, unchanged).
+  Sidebar warns when GA results are not loaded (each battery then uses the PINN twin core).
+- Operations & control: new section "Mission 3 · Forecast behind the replacement decision" between operation and
+  maintenance: battery (those reaching end of life), cores to compare (default frozen + GA-PINN), today slider; plot of
+  measured SOH (seen / unseen), each core's forecast at today with 80 % band, predicted end-of-life diamonds,
+  threshold and real end of life; table of predicted vs real end of life and error. Uses the same saved streams.
+- Demo AppTest: page, build, plot (frozen + GA fallback) without errors.
+- Note: run "Score the twin cores" (or restore + Mission 3 build) after an app restart; GA results need the restore.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

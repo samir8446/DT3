@@ -2462,12 +2462,18 @@ def model_label(k: Optional[str]) -> str:
     return k
 
 
-TWIN_CORES = ("Frozen data model (Mission 2)", "PINN twin core", "GA-PINN core", "Self-tuning GA-PINN core")
+TWIN_CORES = ("Frozen data model (Mission 2)", "PINN twin core", "GA-PINN core")
+# the self-tuning GA-PINN core (STATUS 5bz) gave results identical to GA-PINN on NASA (5cc): removed from the choices,
+# its engine code (pinn:PINN-self) is kept and documented
 PINN_CORES = TWIN_CORES[1:]
 
 
 def twin_core() -> str:
-    return st.session_state.get("twin_core", TWIN_CORES[0])
+    return st.session_state.get("twin_core", TWIN_CORES[2])      # GA-PINN: best twin core (STATUS 5cc)
+
+
+def ga_loaded() -> bool:
+    return any(r.get("done") for r in (st.session_state.get("ga_pinn") or {}).values())
 
 
 def core_refit(core: Optional[str] = None) -> int:
@@ -2509,8 +2515,6 @@ def frozen_context(c: str, core: Optional[str] = None) -> Tuple[Optional[str], O
         fz = (te.PINN_TWIN_KEY, fz[1])
     elif fz and core_ == TWIN_CORES[2]:                    # GA-PINN winner; the default PINN core until its search ends
         fz = (ga_winner_key(c) or te.PINN_TWIN_KEY, fz[1])
-    elif fz and core_ == TWIN_CORES[3]:                    # self-tuning among the GA's best (default until GA ends)
-        fz = (self_tuning_key(c) or te.PINN_TWIN_KEY, fz[1])
     train_c = [x for x in te.protocol_cells(CT_RAW, grp_c) if x != c] if fz else []
     return grp_c, fz, train_c
 
@@ -2722,10 +2726,13 @@ with st.sidebar:
                                    help="Full-file digest; the download is rejected if it differs.")
         imp_url = st.text_input("EIS URL", value=_secret("IMPEDANCE_PARQUET_URL"))
     st.markdown("### Twin core model")
-    st.radio("Forecaster inside the twin", TWIN_CORES, key="twin_core",
+    st.radio("Forecaster inside the twin", TWIN_CORES, key="twin_core", index=2,
              help="Used by the Live twin, the Integrated twin and Mission 3. The PINN core is trained once at the live "
                   "start and re-anchored every cycle, like the frozen model; compare both with the twin scorecard "
                   "(Integrated twin page). The Model updating page always uses the frozen model (Mission 2).")
+    if twin_core() == TWIN_CORES[2] and not ga_loaded():
+        st.caption(":orange[GA-PINN results not loaded: restore them on the Integrated twin page (GA-PINN section). "
+                   "Until then every battery uses the PINN twin core.]")
     st.selectbox("PINN core: retrain every N cycles", [0, 10, 20, 30], key="pinn_refit", index=2,
                  format_func=lambda v: "never (trained once at the live start)" if v == 0 else f"every {v} cycles",
                  help="Only for the PINN cores (default every 20 cycles: STATUS 5bt, B0005 45 -> 25 cycles). Retraining lets "
@@ -7969,7 +7976,7 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
     """Which forecaster makes the better digital twin? Seven criteria agreed before running (STATUS 5bq), computed
     for every twin core on every battery that reached end of life (leave-one-out choices); 4b = band coverage after
     leave-one-out calibration of the band width (5bu)."""
-    section("Twin scorecard · frozen data model vs PINN cores (PINN, GA-PINN, self-tuning GA-PINN)")
+    section("Twin scorecard · frozen data model vs PINN twin core vs GA-PINN core")
     st.markdown("Seven criteria fixed **before** running: (1) end-of-life forecast error over the battery's life, "
                 "(2) late-life bias, (3) decision value in the replacement study, (4) honest uncertainty (band "
                 "coverage; 4b after calibration), (5) physical consistency, (6) one model for forecast, explanation "
@@ -8386,6 +8393,92 @@ def m3_lifecycle_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
              f"m3_lifecycle_study__v{te.ENGINE_VERSION}.csv", "text/csv", key="m3_life_csv")
 
 
+def m3_forecast_section(fleet: Dict[str, Any]) -> None:
+    """The forecaster behind the replacement decision (STATUS 5ce): one battery, one 'today', the end-of-life forecast
+    of the chosen cores against what happened. Uses the same saved streams as Mission 3 and the twin scorecard."""
+    section("Mission 3 · Forecast behind the replacement decision")
+    st.markdown(f"The maintenance and lifecycle studies below use the twin core chosen in the sidebar: "
+                f"**{twin_core()}**" + (f", retrained every {core_refit()} cycles" if core_refit() else "")
+                + ". Here you see its forecast for one battery at a chosen *today*, next to other cores, against "
+                  "what really happened. Nothing after *today* is used by any forecast.")
+    rule = M3_EOL_RULES.get(st.session_state.get("m3_eol", list(M3_EOL_RULES)[0]), "nasa")
+    cands = _score_cells(rule, TWIN_CORES[0])
+    if not cands:
+        st.info("No battery reached end of life under the Mission 3 end-of-life rule.")
+        return
+    c1, c2 = st.columns([1, 2])
+    cell = c1.selectbox("Battery", cands, key="m3f_cell")
+    cores = c2.multiselect("Cores to compare", list(TWIN_CORES), default=[TWIN_CORES[0], TWIN_CORES[2]],
+                           key="m3f_cores")
+    eol_c = float(m3_soh_eol_for(cell, rule))
+    meas = CT_RAW[(CT_RAW["Cell_ID"] == cell) & ~CT_RAW["outlier"]][["n", "SOH"]].dropna().sort_values("n")
+    e_true = te.eol_cycle_from_replay(meas.reset_index(drop=True), eol_c)
+    grp_c, fz0, train0 = frozen_context(cell, TWIN_CORES[0])
+    ns, nm = te.frozen_live_window(CT_RAW, cell, train0)
+    hi_ = int(e_true) if e_true else int(meas["n"].max())
+    today = st.slider("Today (cycle)", int(ns), max(int(ns) + 1, hi_), int(min(ns + 10, hi_)), key="m3f_today")
+    fkey = (DATA_KEY, rule, float(eol_ah), core_refit(TWIN_CORES[1]), cell, tuple(cores))
+    got = st.session_state.get("m3f_frames")
+    if st.button("Show the forecasts", key="m3f_go", icon=":material/show_chart:",
+                 help="Streams the battery through each core once (saved; PINN cores take minutes the first time "
+                      "unless the twin scorecard already streamed them)."):
+        got = {"key": fkey, "frames": {}}
+        for core in cores:
+            g_, fz, train_c = frozen_context(cell, core)
+            with st.spinner(f"{cell} · {core}…"):
+                try:
+                    fr, _ = frozen_cached(CT_RAW, imp, DATA_KEY, cell, tuple(train_c), fz[0], fz[1], eol_c,
+                                          core_refit(core), "capacity", float(eol_ah), ns, nm)
+                    got["frames"][core] = (fr, model_label(fz[0]))
+                except Exception as exc:
+                    st.warning(f"{core}: forecast failed ({exc})")
+        st.session_state["m3f_frames"] = got
+    if not got or got.get("key") != fkey:
+        placeholder("Choose a battery and the cores, then press the button.")
+        return
+    colors = {TWIN_CORES[0]: "#56B4E9", TWIN_CORES[1]: "#E69F00", TWIN_CORES[2]: "#009E73"}
+    fig = go.Figure()
+    past, fut_m = meas[meas["n"] <= today], meas[meas["n"] > today]
+    fig.add_trace(go.Scatter(x=past["n"], y=100 * past["SOH"], mode="markers", name="Measured (up to today)",
+                             marker=dict(size=5, color="#9AA3AD")))
+    fig.add_trace(go.Scatter(x=fut_m["n"], y=100 * fut_m["SOH"], mode="markers", name="Measured later (unseen)",
+                             marker=dict(size=5, color="#9AA3AD", opacity=0.35)))
+    rows = []
+    for core, (fr, label) in got["frames"].items():
+        ks = [k for k in fr if k <= today]
+        if not ks:
+            continue
+        fut, med, lo, hi = (np.asarray(x, float) for x in fr[max(ks)][:4])
+        col = colors.get(core, "#CC79A7")
+        fig.add_trace(go.Scatter(x=np.r_[fut, fut[::-1]], y=100 * np.r_[hi, lo[::-1]], fill="toself", opacity=0.15,
+                                 line=dict(width=0), fillcolor=col, name=f"{core} · 80 % band", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=fut, y=100 * med, mode="lines", line=dict(color=col, width=3), name=core))
+        hit = np.nonzero(med <= eol_c)[0]
+        e_pred = float(fut[hit[0]]) if len(hit) else np.nan
+        if np.isfinite(e_pred):
+            fig.add_trace(go.Scatter(x=[e_pred], y=[100 * eol_c], mode="markers", showlegend=False,
+                                     marker=dict(symbol="diamond", size=13, color=col),
+                                     hovertemplate=f"{core}: end of life at %{{x:.0f}}<extra></extra>"))
+        rows.append({"core": core, "model": label, "forecast made at cycle": max(ks),
+                     "predicted end of life (cycle)": e_pred, "real end of life (cycle)": e_true,
+                     "error (cycles, + = late)": (e_pred - e_true) if (e_true and np.isfinite(e_pred)) else np.nan})
+    fig.add_hline(y=100 * eol_c, line_dash="dash", line_color="#D55E00",
+                  annotation_text=f"end of life {100 * eol_c:.0f} %", annotation_position="bottom left")
+    fig.add_vline(x=today, line_dash="dot", line_color="#666", annotation_text="today")
+    if e_true:
+        fig.add_vline(x=e_true, line_dash="dash", line_color="#D55E00", annotation_text="real end of life",
+                      annotation_position="top left")
+    fig.update_xaxes(title_text="Cycle")
+    fig.update_yaxes(title_text="SOH (%)")
+    show(style_fig(fig, P, 480, f"{cell} · end-of-life forecast at cycle {today}"), key="m3f_fig")
+    if rows:
+        show_table(pd.DataFrame(rows).set_index("core").style.format(
+            {"predicted end of life (cycle)": "{:.0f}", "real end of life (cycle)": "{:.0f}",
+             "error (cycles, + = late)": "{:+.0f}"}, na_rep="—"),
+            note="Move today to replay the battery's life: each core's forecast uses only the cycles up to today. "
+                 "Diamonds: predicted end of life; dashed lines: threshold and real end of life.")
+
+
 def view_ops() -> None:
     recommendations("ops")
     anomaly_section()
@@ -8401,6 +8494,7 @@ def view_ops() -> None:
             placeholder("Mission 3 uses the twin's fleet-wide parts (shared physics, anomaly scan). Build them once.")
             return
     m3_operation_section(fleet, p)
+    m3_forecast_section(fleet)
     m3_maintenance_section(fleet, p)
     m3_lifecycle_section(fleet, p)
 
