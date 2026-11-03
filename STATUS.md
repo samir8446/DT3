@@ -1124,6 +1124,19 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   evaluation CSV use the restored values. Tested on the user's 131-evaluation CSV: all 8 winners match the GA table.
 - To do: restore from the latest evaluations CSV, then Score the twin cores (GA-PINN + self-tuning).
 
+## 5cb. Resumable twin scorecard (app-only)
+- On NASA, "Score the twin cores" ran until the platform stopped it, with no result: four cores x 8 batteries with
+  retraining every 20 cycles = several hundred PINN trainings in one press (fresh caches after the 5.42.0 release),
+  plus an extra full training per core for criterion 7; the table only appeared at the end.
+- Now: "Cores to score" (multiselect) + "Time budget per press" (default 15 min). Each press streams (core, battery) pairs
+  one at a time until the budget (a pair in progress finishes), records them, and says "k of N streamed, press again";
+  the table is computed once all are streamed (fast: everything saved). Criterion 7 = median time to stream one
+  battery (all trainings included), measured when first computed; no extra training. Streams shared with Mission 3.
+- Demo test (2-min budget): 5 presses, 5 -> 7 -> 9 -> 11 -> 12 of 12, then the table; scores identical to the one-shot
+  run (frozen 10.15 / PINN 2.30 / GA-PINN 2.42 / self-tuning 2.64); stream time per battery PINN 111 s, GA 70 s,
+  self-tuning 116 s.
+- NASA plan: restore GA from CSV, then score in several presses (optionally one or two cores per pass).
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

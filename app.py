@@ -7947,6 +7947,24 @@ def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
                  f"ga_pinn_evaluations__v{te.ENGINE_VERSION}.csv", "text/csv", key="ga_csv")
 
 
+def _score_cells(rule: str, core: str) -> List[str]:
+    """Batteries the scorecard streams for a core: Mission 3 groups, end of life reached in the record, a forecaster
+    available (same filters as m3_lives, without streaming)."""
+    out = []
+    for c in [c for g in M3_GROUPS for c in te.protocol_cells(CT_RAW, g)]:
+        eol_c = m3_soh_eol_for(c, rule)
+        meas = CT_RAW[(CT_RAW["Cell_ID"] == c) & ~CT_RAW["outlier"]][["n", "SOH"]].dropna().sort_values("n")
+        if not np.isfinite(eol_c) or len(meas) < 10:
+            continue
+        if te.eol_cycle_from_replay(meas.reset_index(drop=True), eol_c) is None:
+            continue
+        grp_c, fz, train_c = frozen_context(c, core)
+        if frozen_unavailable_reason(c, grp_c, fz, train_c):
+            continue
+        out.append(c)
+    return out
+
+
 def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
     """Which forecaster makes the better digital twin? Seven criteria agreed before running (STATUS 5bq), computed
     for every twin core on every battery that reached end of life (leave-one-out choices); 4b = band coverage after
@@ -7969,50 +7987,77 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
                           if r.get("done")))
     skey = (DATA_KEY, rule, float(eol_ah), core_refit(TWIN_CORES[1]), ga_sig)
     saved = st.session_state.get("twin_scorecard")
+    cores_sel = st.multiselect("Cores to score", list(TWIN_CORES), default=list(TWIN_CORES), key="score_cores",
+                               help="Score fewer cores per press to split the work (e.g. frozen + PINN first).")
+    budget = st.number_input("Time budget per press (minutes)", 2, 60, 15, key="score_mins")
+    skey = skey + (tuple(cores_sel),)
+    prog = st.session_state.setdefault("score_progress", {})       # (data, rule, refit, core, battery) -> seconds
+    pkey = (DATA_KEY, rule, float(eol_ah), core_refit(TWIN_CORES[1]))
+    todo = [(core, c) for core in cores_sel for c in _score_cells(rule, core)]
     if st.button("Score the twin cores", key="score_go", icon=":material/scoreboard:", type="primary",
-                 help="Streams every battery that reached end of life through every core (PINN cores train once per "
-                      "battery, or at each retraining: minutes on NASA the first time, then saved)."):
-        res, scales = {}, {}
-        for core in TWIN_CORES:
-            lives, notes = m3_lives(fleet, rule, core)
-            rows, kept = [], []
-            for c, (tl, grp, e) in lives.items():
-                grp_c, fz, train_c = frozen_context(c, core)
-                ns, nm = te.frozen_live_window(CT_RAW, c, train_c)
-                eol_c = float(m3_soh_eol_for(c, rule))
-                frames, _ = frozen_cached(CT_RAW, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1], eol_c,
-                                          core_refit(core), "capacity", float(eol_ah), ns, nm)
-                sc = _scorecard_battery(tl, e, frames)
-                if sc:
-                    rows.append({"core": core, "group": grp, "battery": c, "model key": fz[0], **sc})
-                    kept.append((c, grp, e, eol_c, frames))
-            for c, grp, e, eol_c, frames in kept:     # 4b: band scale learned on the OTHER batteries of the group
-                others = [x for x in kept if x[1] == grp and x[0] != c]
-                if others:
-                    covs = [np.nanmean([_band_coverage(o[4], o[2], o[3], s) for o in others]) for s in BAND_SCALES]
-                    s_c = float(BAND_SCALES[int(np.nanargmin(np.abs(np.array(covs) - 0.8)))])
-                else:
-                    s_c = 1.0
-                scales[(core, c)] = s_c
-                for r_ in rows:
-                    if r_["battery"] == c:
-                        r_["4b · band coverage, calibrated"] = _band_coverage(frames, e, eol_c, s_c)
-                        r_["band scale (calibrated)"] = s_c
-            per = te.m3_maintenance_study(lives, te.M3Economics())[0] if len(lives) >= 3 else pd.DataFrame()
-            first = next(iter(lives), None)
-            secs = np.nan
-            if first is not None:                     # criterion 7: one training at the live start, timed afresh
-                grp_c, fz, train_c = frozen_context(first, core)
-                ns, _ = te.frozen_live_window(CT_RAW, first, train_c)
-                t0 = time.time()
-                try:
-                    te._protocol_forecast(fz[0], None, CT_RAW, imp, first, int(ns), list(train_c), float(eol_ah))
-                    secs = time.time() - t0
-                except Exception:
-                    pass
-            res[core] = {"rows": pd.DataFrame(rows), "per": per, "secs": secs, "notes": notes}
-        saved = {"key": skey, "res": res, "scales": scales}
-        st.session_state["twin_scorecard"] = saved
+                 help="Streams every battery that reached end of life through the selected cores, one at a time, "
+                      "within the time budget; the table appears when all are streamed."):
+        deadline = time.time() + 60 * float(budget)
+        msg = st.empty()
+        for i, (core, c) in enumerate(todo):
+            k_ = pkey + (core, c)
+            if k_ in prog:
+                continue
+            if time.time() > deadline:
+                break
+            msg.caption(f"Streaming {c} through {core} ({i + 1} of {len(todo)})…")
+            grp_c, fz, train_c = frozen_context(c, core)
+            ns, nm = te.frozen_live_window(CT_RAW, c, train_c)
+            t0 = time.time()
+            try:
+                frozen_cached(CT_RAW, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1], float(m3_soh_eol_for(c, rule)),
+                              core_refit(core), "capacity", float(eol_ah), ns, nm)
+            except Exception as exc:
+                st.warning(f"{c} · {core}: forecast failed ({exc})")
+            prog[k_] = time.time() - t0
+        msg.empty()
+        n_done = sum((pkey + (core, c)) in prog for core, c in todo)
+        if n_done < len(todo):
+            st.info(f"{n_done} of {len(todo)} streamed before the time budget. Press again to continue: finished "
+                    "batteries are saved.")
+        else:
+            res, scales = {}, {}
+            for core in cores_sel:
+                lives, notes = m3_lives(fleet, rule, core)
+                rows, kept = [], []
+                for c, (tl, grp, e) in lives.items():
+                    grp_c, fz, train_c = frozen_context(c, core)
+                    ns, nm = te.frozen_live_window(CT_RAW, c, train_c)
+                    eol_c = float(m3_soh_eol_for(c, rule))
+                    frames, _ = frozen_cached(CT_RAW, imp, DATA_KEY, c, tuple(train_c), fz[0], fz[1], eol_c,
+                                              core_refit(core), "capacity", float(eol_ah), ns, nm)
+                    sc = _scorecard_battery(tl, e, frames)
+                    if sc:
+                        rows.append({"core": core, "group": grp, "battery": c, "model key": fz[0], **sc})
+                        kept.append((c, grp, e, eol_c, frames))
+                for c, grp, e, eol_c, frames in kept:     # 4b: band scale learned on the OTHER batteries of the group
+                    others = [x for x in kept if x[1] == grp and x[0] != c]
+                    if others:
+                        covs = [np.nanmean([_band_coverage(o[4], o[2], o[3], s) for o in others]) for s in BAND_SCALES]
+                        s_c = float(BAND_SCALES[int(np.nanargmin(np.abs(np.array(covs) - 0.8)))])
+                    else:
+                        s_c = 1.0
+                    scales[(core, c)] = s_c
+                    for r_ in rows:
+                        if r_["battery"] == c:
+                            r_["4b · band coverage, calibrated"] = _band_coverage(frames, e, eol_c, s_c)
+                            r_["band scale (calibrated)"] = s_c
+                per = te.m3_maintenance_study(lives, te.M3Economics())[0] if len(lives) >= 3 else pd.DataFrame()
+                tm = [v for (d_, r__, e__, f__, co, cc), v in prog.items()
+                      if (d_, r__, e__, f__) == pkey and co == core]
+                res[core] = {"rows": pd.DataFrame(rows), "per": per,
+                             "secs": float(np.median(tm)) if tm else np.nan, "notes": notes}
+            saved = {"key": skey, "res": res, "scales": scales}
+            st.session_state["twin_scorecard"] = saved
+    n_done = sum((pkey + (core, c)) in prog for core, c in todo)
+    if todo:
+        st.caption(f"Streamed: {n_done} of {len(todo)} battery × core pairs (each one saved; a press stops at the time "
+                   "budget and the next press continues).")
     if not saved or saved.get("key") != skey:
         placeholder("Press the button to score the cores (cores already streamed reuse their saved results).")
         return
@@ -8066,8 +8111,10 @@ def twin_scorecard_section(fleet: Optional[Dict[str, Any]]) -> None:
                 f"explanation and what-if come from the separate shared physics) · the PINN cores "
                 f"({', '.join(TWIN_CORES[1:])}): yes (mechanism states explain the fade, condition inputs give the "
                 f"what-if).  \n"
-                f"**7 · Speed:** every cycle is a re-anchoring for every core (instant); one training at the live "
-                f"start: " + " · ".join(f"{k}: {v:.0f} s" if np.isfinite(v) else f"{k}: —" for k, v in t7.items()))
+                f"**7 · Speed:** every cycle is a re-anchoring for every core (instant); time to stream one battery "
+                f"(trainings and retrainings included, median, measured when first computed): "
+                + " · ".join((f"{k}: {v:.0f} s" if v >= 1 else f"{k}: < 1 s") if np.isfinite(v) else f"{k}: —"
+                             for k, v in t7.items()))
     with st.expander("Per battery"):
         show_table(allrows.set_index(["core", "group", "battery"]).style.format(
             "{:.2f}", subset=[c for c in allrows.columns if allrows[c].dtype.kind == "f"]))
