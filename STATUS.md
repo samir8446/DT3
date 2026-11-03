@@ -1179,6 +1179,18 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - Demo AppTest: page, build, plot (frozen + GA fallback) without errors.
 - Note: run "Score the twin cores" (or restore + Mission 3 build) after an app restart; GA results need the restore.
 
+## 5cf. Mission 2 Level 4: first PINN + GA-PINN only (app-only)
+- User request. Models & forecasting, Level 4 section: model choices = "PINN" (v1, physics-informed) and "GA-PINN" (this
+  battery's GA winner, 3-seed ensemble); both default; plot and table show both forecasts side by side (+ the usual
+  level ensemble). GA-PINN is excluded from the hyperparameter editor, equation icons and automatic tuning (its
+  settings come from the GA); without a GA result for the battery a warning is shown.
+- Accuracy assessment, Level 4 options: "PINN (original inputs) + ablation" and new "GA-PINN (each battery's GA
+  winner)" (virtual key pinn:GA-PINN: each held-out battery runs its own GA winner, chosen without it; rows relabelled
+  as one model, family Physics-informed). The other PINN levels (all inputs, v2, v2 within group, twin core) are
+  removed from the choices; their engine kinds and results stay documented (5ap, 5bn, 5bp, 5bq).
+- Demo AppTests: Level 4 trains PINN + GA-PINN; assessment GA level runs on all batteries with the relabelled rows.
+- GA results must be loaded (run or restore) before using GA-PINN anywhere.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

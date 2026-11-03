@@ -2452,6 +2452,8 @@ def model_label(k: Optional[str]) -> str:
         return "—"
     if k in te.PROTOCOL_MODELS:
         return te.PROTOCOL_MODELS[k][1]
+    if k == "pinn:GA-PINN":
+        return "GA-PINN (each battery's GA winner)"
     if "PINN-self|" in k:
         return f"Self-tuning GA-PINN · {len(te.pinn_self_candidates(k))} candidates, chosen on its own last " \
                f"{te.SELF_TUNE_WINDOW} cycles at each retraining"
@@ -5522,6 +5524,22 @@ ASSESS_SECONDS = {"PINN": 8.0, "PINN-ablation": 4.0, "PINN-full": 9.0, "PINN-ful
                   "Physics v3 + ageing speed": 6.0, "Hybrid v3 + ageing speed": 15.0}
 
 
+GA_ASSESS_KEY = "pinn:GA-PINN"            # virtual key: the held-out battery's own GA winner (STATUS 5cf)
+
+
+def assess_ga_task(store: Any, ct_run: pd.DataFrame, dkey: str, cells_g: Tuple[str, ...], origin: float, c: str
+                   ) -> pd.DataFrame:
+    """GA-PINN in the assessment: run the held-out battery's own GA winner (chosen without it) and relabel the rows
+    so all batteries count as one model. Empty when the battery has no GA result."""
+    gk = ga_winner_key(c)
+    if not gk:
+        return pd.DataFrame()
+    r = assess_task_cached(store, ct_run, imp, dkey, cells_g, gk, float(origin), c, float(eol_ah)).copy()
+    if len(r):
+        r["key"], r["model"], r["family"] = GA_ASSESS_KEY, "GA-PINN (each battery's GA winner)", "Physics-informed (PINN)"
+    return r
+
+
 @st.cache_data(show_spinner=False, max_entries=20000)
 def assess_task_cached(_store: Any, _ct: pd.DataFrame, _imp: Optional[pd.DataFrame], key: str, cells: Tuple[str, ...],
                        mkey: str, origin: float, held: str, eol: float) -> pd.DataFrame:
@@ -5575,12 +5593,7 @@ def assessment_section() -> None:
                       "Level 3 · DL forecast": [f"dl:{k}" for k in te.DL_MODELS],
                       "Level 3 · DL measured": [f"dlm:{k}" for k in te.DL_MODELS],
                       "Level 4 · PINN (original inputs) + ablation": ["pinn:PINN", "pinn:PINN-ablation"],
-                      "Level 4 · PINN all inputs + ablation": ["pinn:PINN-full", "pinn:PINN-full-ablation"],
-                      "Level 4 · PINN v2 (pooled + cut-off + causal anchor) + ablation": ["pinn:PINN-v2",
-                                                                                           "pinn:PINN-v2-ablation"],
-                      "Level 4 · PINN v2 within group (cut-off + causal anchor) + ablation": [
-                          "pinn:PINN-v2-group", "pinn:PINN-v2-group-ablation"],
-                      "Level 4 · PINN twin core (cut-off, burn-in anchor, 3 seeds)": ["pinn:PINN-twin"]}
+                      "Level 4 · GA-PINN (each battery's GA winner)": [GA_ASSESS_KEY]}
         levels = st.multiselect("Levels (baselines are always included: the verdict needs them)", list(level_keys),
                                 default=list(level_keys), key="acc_levels")
         keys = ["persistence", "trend", "shape"] + [k for lv in levels for k in level_keys[lv]]
@@ -5612,7 +5625,14 @@ def assessment_section() -> None:
             prog.progress(i / max(len(tasks), 1),
                           text=f"{i}/{len(tasks)} · {model_label(k)} on {c} from {100 * o:.0f}% · "
                                f"{time.time() - t_start:.0f}s")
-            parts.append(assess_task_cached(store, ct_run, imp, dkey, cells_g, k, float(o), c, float(eol_ah)))
+            if k == GA_ASSESS_KEY:
+                r_ga = assess_ga_task(store, ct_run, dkey, cells_g, float(o), c)
+                if not len(r_ga):
+                    st.warning(f"GA-PINN on {c}: no GA result for this battery (run or restore the GA first).")
+                else:
+                    parts.append(r_ga)
+            else:
+                parts.append(assess_task_cached(store, ct_run, imp, dkey, cells_g, k, float(o), c, float(eol_ah)))
             if i % 3 == 2 or i == len(tasks) - 1:
                 part = pd.concat(parts, ignore_index=True)
                 sbp = te.protocol_scoreboard(view(part))
@@ -5957,7 +5977,8 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
     c1, c2 = st.columns([2, 1])
     mdls = c1.multiselect("Models", list(models), default=[m for m in default if m in models], key=f"{key}_models",
                           format_func=lambda m: models[m])
-    equation_icons(mdls, "_traj" if level in (2, 3) else None)
+    mdls_hp = [m for m in mdls if m != "GA-PINN"]          # GA-PINN: settings come from the GA, not the editor
+    equation_icons(mdls_hp, "_traj" if level in (2, 3) else None)
     mode = c2.radio("Mode to train", list(modes), key=f"{key}_mode", format_func=te.TRAJ_MODES.get,
                     help="Forecast: only what is known at the training | test line (a real forecast). Measured: each "
                          "test cycle's own measured parameters (estimation). Results of both modes are kept below.")
@@ -5979,7 +6000,7 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
     with st.expander("Model parameters (optimise each model by hand)", icon=":material/tune:"):
         st.caption("Each model's own settings. The values from an automatic selection appear here, and you can still "
                    "adjust them. 'Reset' restores the defaults.")
-        params = hyperparam_editor(mdls, hp_prefix) if mdls else {}
+        params = hyperparam_editor(mdls_hp, hp_prefix) if mdls_hp else {}
         if st.button("Reset to defaults", key=f"{key}_hp_reset", icon=":material/restart_alt:"):
             for k_ in [k_ for k_ in st.session_state if str(k_).startswith(hp_prefix + "_")]:
                 del st.session_state[k_]
@@ -5995,13 +6016,14 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
                           format_func={"random": "Random", "bayesian": "Bayesian optimisation"}.get)
         show_t0 = sc.get("show", sc["targets"][0])
         if st.button(f"Tune Level {level}: {len(mdls)} model(s) on {show_t0}, {mode} mode", key=f"{key}_tn_go",
-                     icon=":material/auto_fix_high:", disabled=not mdls):
+                     icon=":material/auto_fix_high:", disabled=not mdls_hp):
             prog = st.progress(0.0)
             best, rows = {}, []
-            for i, m in enumerate(mdls):
+            for i, m in enumerate(mdls_hp):
                 r = te.tune_level_model(ct, imp, show_t0, sc["n0"][show_t0], m, mode, train, float(eol_ah), n_iter=int(n_iter),
                                         method=method, progress=lambda f_, msg: prog.progress(
-                                            min((i + max(min(float(f_), 1.0), 0.0)) / len(mdls), 1.0), text=f"{m}: {msg}"))
+                                            min((i + max(min(float(f_), 1.0), 0.0)) / max(len(mdls_hp), 1), 1.0),
+                                            text=f"{m}: {msg}"))
                 best[m] = r.best_params
                 rows.append({"Model": m, "Default CV RMSE": r.default_score, "Tuned CV RMSE": r.best_score,
                              "Improvement (%)": r.improvement_pct, "Time (s)": r.seconds,
@@ -6046,11 +6068,19 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
                 k_ += 1
                 try:
                     prm = params.get(m)
-                    if self_opt:
+                    m_fit = m
+                    if level == 4 and m == "GA-PINN":       # this battery's own GA winner (STATUS 5cf)
+                        gk = ga_winner_key(t)
+                        if not gk:
+                            st.warning(f"GA-PINN on {t}: no GA result for this battery. Run the GA or restore it "
+                                       "(Integrated twin page, GA-PINN section).")
+                            continue
+                        m_fit, prm = gk.split(":", 1)[1], None
+                    if self_opt and m_fit == m:
                         so = self_tune_cached(ct, imp, DATA_KEY, t, sc["n0"][t], m, mode, tr_key, float(eol_ah), 8)
                         prm, tuned[m] = so["params"], so
                     used_prm[m] = prm
-                    f = level_fit_cached(ct, imp, DATA_KEY, level, t, sc["n0"][t], m, mode, tr_key,
+                    f = level_fit_cached(ct, imp, DATA_KEY, level, t, sc["n0"][t], m_fit, mode, tr_key,
                                          json.dumps(prm or {}, sort_keys=True, default=float), float(eol_ah), False)
                     out.setdefault(t, []).append(f)
                     ladder_add(f.model, level, sc["n0"][t], f.n_grid, f.soh, f.lo, f.hi, f.metrics, t)
@@ -6592,12 +6622,14 @@ def pinn_section() -> None:
         "thickens and speeds up with temperature (Arrhenius); plating that grows in the cold, at high current and as "
         "active material is lost (the cause of knees); loss of active material with cycling. The **same network "
         "without physics** is included as an ablation, so you can see what the physics itself contributes. Forecast "
-        "mode only: the PINN models how the battery evolves. **PINN · all inputs** uses the same equations but gives the "
-        "network everything measured about the battery at the forecast point, like the Level 2 and 3 models: SOH and "
-        "its trend, resistance and its trend, discharge, CC- and CV-charge times, mean voltage, energy efficiency, "
-        "temperature rise, cell temperature, C-rate, charge current, cut-off voltage, the ΔQ(V) voltage-curve feature "
-        "and EIS Re and Rct; its own ablation shows what the physics adds once the information is equal.",
-        te.PINN_MODELS, ("PINN-full", "PINN"),
+        "mode only: the PINN models how the battery evolves. **GA-PINN** is the same physics-informed network with the "
+        "settings a genetic algorithm chose for this battery: network size, learning rate, physics weight, the form "
+        "of the SEI law and an optional acceleration term, judged only on the other batteries (nested leave-one-out; "
+        "run or restore the GA on the Integrated twin page first). It is trained here from this battery's training | "
+        "test line, like the PINN, so both are compared on the same forecast.",
+        {"PINN": te.PINN_MODELS["PINN"],
+         "GA-PINN": "GA-PINN · this battery's genetic-algorithm winner (settings and physics form chosen by the GA)"},
+        ("PINN", "GA-PINN"),
         lambda t, n0, m, mode, train, model_params=None, **_: te.train_pinn_model(ct, imp, t, n0, m, mode, train,
                                                                                   float(eol_ah), model_params),
         "pinn", modes=("forecast",))
