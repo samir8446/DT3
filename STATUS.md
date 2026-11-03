@@ -1115,6 +1115,15 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - To run on NASA: sidebar retrain every 20 (default), then "Score the twin cores" (GA results reused; only the new core
   trains: 4 backtests + ensemble per retraining). Key question: B0005's EOL error (frozen 7.74, GA-PINN 23.91).
 
+## 5ca. Scorecard v5.42.0 ran WITHOUT GA results -> restore from CSV (app-only)
+- In the v5.42.0 scorecard every PINN core used pinn:PINN-twin (identical columns): GA results lived in the session
+  (lost at the app restart) and GA evaluations are disk-cached per engine version (5.41.0 entries not reused). That run
+  only reproduces 5bt (frozen 6.05 / PINN 6.46 mean; median 5.84 / 3.58; B0005 25.14).
+- Fix: GA-PINN section "Restore GA results from an evaluations CSV": rebuilds every battery's winner and ranked
+  candidates from ga_pinn_evaluations__*.csv (battery, genome, fitness); restored batteries are not rerun; table and
+  evaluation CSV use the restored values. Tested on the user's 131-evaluation CSV: all 8 winners match the GA table.
+- To do: restore from the latest evaluations CSV, then Score the twin cores (GA-PINN + self-tuning).
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

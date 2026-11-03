@@ -7803,6 +7803,24 @@ def _band_coverage(frames: Dict[int, Any], e: float, soh_eol: float, s: float = 
 BAND_SCALES = tuple(np.round(np.arange(0.1, 1.51, 0.05), 2))
 
 
+def ga_store_from_evaluations(E: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
+    """Rebuild finished GA-PINN searches from a downloaded evaluations CSV (battery, genome, fitness, ...): the winner and
+    the ranked candidates need nothing else. Used after an app restart or an engine release, so the GA need not rerun."""
+    names = list(te.GA_PINN_GENES)
+    out: Dict[str, Dict[str, Any]] = {}
+    for c, g in E.dropna(subset=["battery", "genome", "fitness"]).groupby("battery"):
+        fit, genomes, details = {}, {}, {}
+        for row in g.to_dict("records"):
+            gen = te.ga_pinn_genome("PINN-ga|" + str(row["genome"]))
+            gen["accel"] = int(gen["accel"])
+            k = tuple(gen[n] for n in names)
+            fit[k], genomes[k], details[k] = float(row["fitness"]), gen, row
+        best = min(fit, key=fit.get)
+        out[str(c)] = {"done": True, "generation": None, "history": [], "fitness": fit, "genomes": genomes,
+                       "restored": details, "best_key": te.ga_pinn_key(genomes[best]), "best_fitness": fit[best]}
+    return out
+
+
 def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
     """Professor's proposal (STATUS 5bu): a genetic algorithm searches the PINN configuration and the FORM of its
     physics for each battery, scored by nested leave-one-out on the training batteries only."""
@@ -7829,12 +7847,29 @@ def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
     mins = c3.number_input("Time budget per press (minutes)", 2, 60, 10, key="ga_mins")
     sel = st.multiselect("Batteries", cands, default=cands, key="ga_cells")
     store_ = st.session_state.setdefault("ga_pinn", {})
+    with st.expander("Restore GA results from an evaluations CSV (after an app restart or a new engine version)"):
+        up = st.file_uploader("ga_pinn_evaluations__*.csv", type="csv", key="ga_restore")
+        if up is not None and st.button("Restore", key="ga_restore_go", icon=":material/restore:"):
+            try:
+                E = pd.read_csv(up)
+                got = ga_store_from_evaluations(E)
+                for c, r in got.items():
+                    if c not in cands:
+                        continue
+                    grp_c, fz, train_c = frozen_context(c, TWIN_CORES[0])
+                    ns, _ = te.frozen_live_window(CT_RAW, c, train_c)
+                    r["train"], r["n0"] = tuple(train_c), int(ns)
+                    store_[c] = r
+                st.success(f"Restored {sum(c in cands for c in got)} batteries: their GA-PINN and self-tuning cores "
+                           "are available without rerunning the search.")
+            except Exception as exc:
+                report_error("Could not restore the GA results", exc, debug)
     if st.button("Run / continue GA-PINN", key="ga_go", icon=":material/genetics:", type="primary"):
         deadline = time.time() + 60 * float(mins)
         msg = st.empty()
         for c in sel:
             prev = store_.get(c) or {}
-            if prev.get("done") and prev.get("settings") == (int(pop), int(gens)):
+            if prev.get("done") and (prev.get("restored") or prev.get("settings") == (int(pop), int(gens))):
                 continue
             grp_c, fz, train_c = frozen_context(c, TWIN_CORES[0])
             ns, _ = te.frozen_live_window(CT_RAW, c, train_c)
@@ -7868,10 +7903,17 @@ def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
             rows.append({"battery": c, "status": "incomplete (press Run / continue)"})
             continue
         fit = r["fitness"]
-        start = ga_fitness_cached(CT_RAW, imp, DATA_KEY, c, r["train"], r["n0"], float(eol_ah), start_key)["fitness"]
+        restored = r.get("restored")
+        sk = tuple(te.GA_PINN_START[n] for n in te.GA_PINN_GENES)
+        if restored is not None:
+            start = float(fit.get(sk, np.nan))
+        else:
+            start = ga_fitness_cached(CT_RAW, imp, DATA_KEY, c, r["train"], r["n0"], float(eol_ah),
+                                      start_key)["fitness"]
         best_k = min(fit, key=fit.get) if fit else None
         bg = r["genomes"][best_k] if best_k else {}
-        rows.append({"battery": c, "status": "done" if r["done"] else f"generation {r['generation'] + 1}",
+        rows.append({"battery": c, "status": ("restored" if restored is not None else "done") if r["done"]
+                     else f"generation {r['generation'] + 1}",
                      "evaluations": len(fit), "fitness, current settings": start,
                      "fitness, best": fit[best_k] if best_k else np.nan,
                      "improvement (%)": 100 * (1 - fit[best_k] / start) if best_k and start > 0 else np.nan,
@@ -7882,7 +7924,11 @@ def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
         for h in r["history"]:
             hist.append({"battery": c, **h})
         for k_, g in r["genomes"].items():
-            d = ga_fitness_cached(CT_RAW, imp, DATA_KEY, c, r["train"], r["n0"], float(eol_ah), tuple(sorted(g.items())))
+            if restored is not None:
+                d = {kk: vv for kk, vv in restored[k_].items() if kk not in ("battery", "genome")}
+            else:
+                d = ga_fitness_cached(CT_RAW, imp, DATA_KEY, c, r["train"], r["n0"], float(eol_ah),
+                                      tuple(sorted(g.items())))
             evals.append({"battery": c, "genome": te.ga_pinn_key(g).split("|", 1)[1], **d})
     R = pd.DataFrame(rows).set_index("battery")
     show_table(R.style.format("{:.3g}", subset=[c for c in R.columns if R[c].dtype.kind == "f"], na_rep="—"),
