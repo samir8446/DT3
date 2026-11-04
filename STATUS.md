@@ -1237,6 +1237,27 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - Demo test without any saved GA: Level 4 searched (6 evaluations) and trained GA-PINN, re-run 1.9 s; assessment ran
   4 searches and scored GA-PINN on all 4 batteries. Cost on NASA: about 5-6 min per battery the first time.
 
+## 5cj. Where GA-PINN is used (recovery test) + app clean-up (app-only)
+- GA-PINN for the EXPLANATION? Mechanism-recovery test (simulated cohort with known splits, pinn_explain with GA genes,
+  2 seeds; H1 hot / R2 reference / C1 cold): mean share error PINN v1 32.7, GA-PINN Reference winner (h48 lr0.01
+  lambda 0.3 p0) 29.6, GA-PINN Cold winner (h16 lr0.002 lambda 0.3 p0 accel) 30.3 points (shared physics 1.1, 11/11).
+  H1 truth SEI/pl/LAM 89/6/6 -> GA-PINN 30/9/61 and 23/26/51. -> NOT adopted for explanation (per-battery codes let
+  each battery choose its split); explanation stays shared physics / hybrid.
+- GA-PINN used: twin forecast/status (default core), Mission 3 maintenance + lifecycle, Mission 2 Level 4 + assessment.
+  Not used: explanation (above); Mission 3 operation (condition effects need the shared physics; GA-PINN's within-group
+  condition effects unvalidated); anomaly detection (validated 11/11; a forecast-residual alarm would need the same
+  validation first).
+- Clean-up (user choice 1-3): removed the pre-Mission-2 optimiser (view_ops_legacy + orphaned integrated_section,
+  scenario_section, dp_section, run_policy, tune_rho_cached, fig_policy, fig_mismatch, fig_om_heatmap, fig_om_tradeoff,
+  fig_scenarios, fig_dp_policy, dp_cached, om_study_cached), the Diagnostics "operating conditions" regression
+  (condition_effects_section, both expanders, method-table mention), and the Integrated twin "Watch uses"
+  conservative option (Watch = median forecast; CSV "watch uses" = median forecast). About 370 lines. Engine unchanged.
+  Kept (user): Live twin estimators + ablation, update-frequency study. Hidden dead code left (not requested):
+  ml_section, cross_cell_section, early_life_section, ml_methods_panel, ladder_deep/hybrid/first_principles,
+  self_tuning_key.
+- Checks: pyflakes no undefined names (caught a leftover 'basis', fixed); all pages; every Diagnostics tab; Integrated
+  twin built; 36 tests.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

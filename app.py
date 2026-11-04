@@ -1320,59 +1320,8 @@ def fig_horizon(cov: pd.DataFrame, level: float, P: Palette) -> go.Figure:
 # =============================================================================
 # Figures: operations
 # =============================================================================
-def fig_policy(df: pd.DataFrame, policy: str, baselines: Dict[str, pd.DataFrame], soh_eol: float,
-               P: Palette) -> go.Figure:
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.08,
-                        row_heights=[0.28, 0.32, 0.40],
-                        specs=[[{"secondary_y": True}], [{}], [{}]],
-                        subplot_titles=("Selected current and ambient temperature",
-                                        "State of health", "Cumulative net profit"))
-    _style_subplot_titles(fig, P)
-    for amps in (1.0, 2.0, 4.0):
-        mm = df["I"] == amps
-        if mm.any():
-            fig.add_trace(go.Scatter(x=df.loc[mm, "cycle"], y=df.loc[mm, "I"], mode="markers",
-                                     name=f"{amps:g} A selected",
-                                     marker=dict(color=P.current_color(amps), size=7,
-                                                 symbol=CURRENT_SYMBOL.get(amps, "circle")),
-                                     hovertemplate="%{y:g} A<extra></extra>"),
-                          row=1, col=1, secondary_y=False)
-    fig.add_trace(go.Scatter(x=df["cycle"], y=df["T_amb"], mode="lines", name="Ambient temperature",
-                             line=dict(color=P.muted, width=1.5, dash="dot"),
-                             hovertemplate="%{y:.1f} °C<extra></extra>"), row=1, col=1, secondary_y=True)
-    for j, (name, d) in enumerate({policy: df, **baselines}.items()):
-        if name == policy:
-            style = dict(color=P.text, width=3)
-        else:
-            style = dict(color=P.current_color(float(name.split()[1])), width=1.8, dash=DASHES[1 + j % 4])
-        fig.add_trace(go.Scatter(x=d["cycle"], y=d["SOH"], mode="lines", name=name, line=style,
-                                 legendgroup=name, hovertemplate="%{y:.2%}<extra></extra>"), row=2, col=1)
-        fig.add_trace(go.Scatter(x=d["cycle"], y=d["cum_profit"], mode="lines", name=name, line=style,
-                                 legendgroup=name, showlegend=False,
-                                 hovertemplate="%{y:.1f}<extra></extra>"), row=3, col=1)
-    fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, line_width=1.5, row=2, col=1)
-    fig.update_xaxes(title_text="Operating cycle", row=3, col=1)
-    style_fig(fig, P, 820, f"Lifecycle simulation: {policy} policy")
-    fig.update_yaxes(title_text="Current (A)", tickvals=[1, 2, 4], row=1, col=1, secondary_y=False)
-    fig.update_yaxes(title_text="Ambient (°C)", row=1, col=1, secondary_y=True, showgrid=False, mirror=False)
-    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%", row=2, col=1)
-    fig.update_yaxes(title_text="Profit (CU)", row=3, col=1)
-    return fig
 
 
-def fig_mismatch(ms: pd.DataFrame, P: Palette) -> go.Figure:
-    tw = ms[ms["policy"] == "Twin-Aware"]
-    fig = go.Figure()
-    fig.add_hline(y=0, line_color=P.muted, line_dash="dash", line_width=1)
-    for key, name, col, sym in (("advantage_pct", "vs best compliant fixed policy", P.ekf, "circle"),
-                                ("advantage_vs_any_pct", "vs best fixed policy incl. violators", P.eis, "square")):
-        fig.add_trace(go.Box(x=tw["level"], y=tw[key], name=name, marker=dict(color=col, symbol=sym, size=8),
-                             line=dict(color=col), boxpoints="all", jitter=0.3, pointpos=0,
-                             hovertemplate="%{y:+.1f}%<extra></extra>"))
-    fig.update_layout(boxmode="group")
-    fig.update_xaxes(title_text="Plant / model mismatch level (relative std of perturbed physics)")
-    fig.update_yaxes(title_text="Twin-aware profit-rate advantage (%)")
-    return style_fig(fig, P, 460, "Robustness of the twin-aware policy to model error", hovermode="closest")
 
 
 # =============================================================================
@@ -1534,52 +1483,8 @@ def fig_update_freq(tab: pd.DataFrame, results: Dict[int, te.EKFResult], ct_cell
     return style_fig(fig, P, 840, "How often should the twin update?")
 
 
-def fig_om_heatmap(study: pd.DataFrame, opt: Dict[str, Any], P: Palette) -> go.Figure:
-    piv = study.pivot(index="policy", columns="threshold", values="rate")
-    viol = study.pivot(index="policy", columns="threshold", values="violations")
-    pf = study.pivot(index="policy", columns="threshold", values="p_failure")
-    order = sorted(piv.index, key=lambda s: (s.startswith("Fixed"), s))
-    piv, viol, pf = piv.loc[order], viol.loc[order], pf.loc[order]
-    txt = [[("✕ " if viol.loc[r, c] > 0 else "") + f"{piv.loc[r, c]:.3f}" for c in piv.columns] for r in piv.index]
-    custom = np.dstack([pf.to_numpy(), viol.to_numpy()])
-    fig = go.Figure(go.Heatmap(
-        z=piv.to_numpy(), x=[f"{c:.2f}" for c in piv.columns], y=piv.index, text=txt, texttemplate="%{text}",
-        textfont=dict(size=11), customdata=custom, colorscale="RdBu", zmid=0,
-        colorbar=dict(title=dict(text="CU/h", font=dict(color=P.text)), tickfont=dict(color=P.muted)),
-        hovertemplate="%{y} · replace at SOH %{x}<br>profit rate %{z:.4f} CU/h<br>"
-                      "P(sudden failure) %{customdata[0]:.2f} · violations %{customdata[1]}<extra></extra>"))
-    b = opt.get("best")
-    if b:
-        fig.add_trace(go.Scatter(x=[f"{b['threshold']:.2f}"], y=[b["policy"]], mode="markers", name="Integrated optimum",
-                                 marker=dict(symbol="star", size=22, color=P.pf if P.mode == "dark" else "#F0E442",
-                                             line=dict(color=P.text, width=1.5)),
-                                 hoverinfo="skip"))
-    fig.update_xaxes(title_text="Replacement threshold (SOH)", showspikes=False)
-    fig.update_yaxes(title_text=None, automargin=True, showspikes=False)
-    return style_fig(fig, P, 160 + 38 * len(order),
-                     "Integrated optimisation: long-run profit rate by operating policy × maintenance threshold",
-                     hovermode="closest")
 
 
-def fig_om_tradeoff(study: pd.DataFrame, P: Palette) -> go.Figure:
-    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.16,
-                        subplot_titles=("Profit rate versus replacement threshold", "Sudden-failure probability per life"))
-    _style_subplot_titles(fig, P)
-    for i, (pol, d) in enumerate(study.groupby("policy", sort=False)):
-        d = d.sort_values("threshold")
-        is_fixed = pol.startswith("Fixed")
-        col = P.current_color(float(pol.split()[1])) if is_fixed else P.series[i % len(P.series)]
-        style = dict(color=col, width=1.6 if is_fixed else 2.6, dash="dot" if is_fixed else DASHES[i % len(DASHES)])
-        fig.add_trace(go.Scatter(x=d["threshold"], y=d["rate"], mode="lines+markers", name=pol, legendgroup=pol,
-                                 line=style, marker=dict(symbol=SYMBOLS[i % len(SYMBOLS)], size=7),
-                                 hovertemplate="%{y:.2%} CU/h<extra>" + html.escape(pol) + "</extra>"), row=1, col=1)
-        fig.add_trace(go.Scatter(x=d["threshold"], y=d["p_failure"], mode="lines+markers", name=pol, legendgroup=pol,
-                                 showlegend=False, line=style, marker=dict(symbol=SYMBOLS[i % len(SYMBOLS)], size=7),
-                                 hovertemplate="%{y:.2f}<extra>" + html.escape(pol) + "</extra>"), row=2, col=1)
-    fig.update_xaxes(title_text="Replacement threshold (SOH)")
-    fig.update_yaxes(title_text="CU/h", row=1, col=1)
-    fig.update_yaxes(title_text="P(failure before replacement)", range=[0, 1.02], row=2, col=1)
-    return style_fig(fig, P, 822, "Maintenance trade-off: replace early (cost) or late (risk and performance loss)")
 
 
 # =============================================================================
@@ -1701,21 +1606,6 @@ def fig_risk_matrix(fs: pd.DataFrame, P: Palette, cell_id: str, highlight: Optio
                      hovermode="closest")
 
 
-def fig_scenarios(sp: pd.DataFrame, soh_eol: float, P: Palette) -> go.Figure:
-    fig = go.Figure()
-    for i, (name, d) in enumerate(sp.groupby("scenario", sort=False)):
-        col = CELL_COLORS[i % len(CELL_COLORS)]
-        add_band(fig, d["n"].to_numpy(), d["lo"].to_numpy(), d["hi"].to_numpy(), col, f"{name} band", group=name,
-                 alpha=0.13)
-        life = d["life_to_EOL"].iloc[0]
-        fig.add_trace(go.Scatter(x=d["n"], y=d["SOH"], mode="lines", name=f"{name} · EOL at {life if life else '>'} cycles",
-                                 legendgroup=name, line=dict(color=col, width=3, dash=DASHES[i % len(DASHES)]),
-                                 hovertemplate="%{y:.3f}<extra>" + html.escape(name) + "</extra>"))
-    fig.add_hline(y=soh_eol, line_dash="dash", line_color=P.eol, annotation_text="End of life",
-                  annotation_font=dict(color=P.eol))
-    fig.update_xaxes(title_text="Cycle n")
-    fig.update_yaxes(title_text="Projected SOH (%)", tickformat=".0%")
-    return style_fig(fig, P, 520, "What-if: projected fade for each operating scenario (cohort stress-factor law)")
 
 
 def build_report_html(title: str, sections: List[Tuple[str, Any]]) -> str:
@@ -1846,35 +1736,6 @@ def fig_live_track(track: pd.DataFrame, n: int, eol_true: Optional[int], P: Pale
     return style_fig(fig, P, 880 if has_mech else 680, None)
 
 
-def fig_dp_policy(dp: te.DPResult, P: Palette) -> go.Figure:
-    z = np.where(dp.action < 0, -1, np.array(dp.currents)[np.clip(dp.action, 0, None)])
-    labels = ["Replace"] + [f"{c:g} A" for c in dp.currents]
-    vals = [-1] + list(dp.currents)
-    palette = ["#D55E00", "#56B4E9", "#009E73", "#E69F00", "#CC79A7"][: len(vals)]
-    idx = np.vectorize(lambda v: vals.index(v))(z)
-    cs = []
-    for i, c in enumerate(palette):
-        cs += [[i / len(palette), c], [(i + 1) / len(palette), c]]
-    fig = make_subplots(rows=2, cols=1, vertical_spacing=0.14, row_heights=[0.72, 0.28],
-                        subplot_titles=("Optimal action by state of health and season", "Ambient temperature"))
-    _style_subplot_titles(fig, P)
-    fig.add_trace(go.Heatmap(x=dp.phases, y=dp.soh_grid, z=idx, colorscale=cs, zmin=-0.5, zmax=len(palette) - 0.5,
-                             colorbar=dict(tickvals=list(range(len(labels))), ticktext=labels, thickness=14, len=0.7,
-                                           y=0.64, tickfont=dict(color=P.text)),
-                             customdata=np.array(labels)[idx],
-                             hovertemplate="season cycle %{x:.0f} · SOH %{y:.1%}<br>%{customdata}<extra></extra>"),
-                  row=1, col=1)
-    fig.add_trace(go.Scatter(x=dp.phases, y=dp.replace_boundary, mode="lines+markers", name="Replacement boundary",
-                             line=dict(color=P.text, width=2.5, dash="dash"), marker=dict(size=6),
-                             hovertemplate="replace below SOH %{y:.1%}<extra></extra>"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=dp.phases, y=dp.T_amb, mode="lines+markers", name="Ambient", showlegend=False,
-                             line=dict(color=P.eis, width=2.5), hovertemplate="%{y:.1f} °C<extra></extra>"),
-                  row=2, col=1)
-    fig.update_yaxes(title_text="SOH (%)", tickformat=".0%", row=1, col=1)
-    fig.update_yaxes(title_text="°C", row=2, col=1)
-    fig.update_xaxes(title_text="Cycle within the seasonal period", row=2, col=1)
-    return style_fig(fig, P, 700, f"Dynamic-programming policy · optimal long-run profit rate ρ* = {dp.rho:.4f} CU/h",
-                     hovermode="closest")
 
 
 def fig_half_cell_fits(fits: List[te.HalfCellFit], P: Palette) -> go.Figure:
@@ -2535,11 +2396,6 @@ def frozen_unavailable_reason(c: str, grp_c: Optional[str], fz: Optional[Tuple[s
     return ""
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
-def dp_cached(econ: Dict[str, Any], phys: Dict[str, Any], maint: Dict[str, Any], amb_mean: float, amb_amp: float,
-              n_soh: int, n_phase: int) -> te.DPResult:
-    return te.solve_replacement_dp(te.Economics(**econ), te.CellPhysics(**phys), te.MaintenanceModel(**maint),
-                                   n_soh=n_soh, n_phase=n_phase, ambient_mean_C=amb_mean, ambient_amp_C=amb_amp)
 
 
 @st.cache_data(show_spinner=False, max_entries=16)
@@ -2626,29 +2482,10 @@ def modes_cached(_prep: pd.DataFrame, _ct_cell: pd.DataFrame, _eis: pd.DataFrame
     return dva, te.degradation_modes(ica, _ct_cell, _eis)
 
 
-@st.cache_data(show_spinner=False, max_entries=8)
-def om_study_cached(econ: Dict[str, Any], phys: Dict[str, Any], maint: Dict[str, Any], amb_mean: float,
-                    amb_amp: float, plant: Optional[Dict[str, Any]], weights: Tuple[float, ...],
-                    thresholds: Tuple[float, ...]) -> pd.DataFrame:
-    return te.integrated_om_study(te.Economics(**econ), te.CellPhysics(**phys), te.MaintenanceModel(**maint),
-                                  weights=weights, thresholds=thresholds, ambient_mean_C=amb_mean,
-                                  ambient_amp_C=amb_amp, plant=te.CellPhysics(**plant) if plant else None)
 
 
-@st.cache_data(show_spinner=False, max_entries=64)
-def run_policy(policy: str, econ: Dict[str, Any], phys: Dict[str, Any], amb_mean: float, amb_amp: float,
-               plant: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    return te.simulate_life(te.make_policy(policy), te.CellPhysics(**phys), te.Economics(**econ),
-                            ambient_mean_C=amb_mean, ambient_amp_C=amb_amp,
-                            plant=te.CellPhysics(**plant) if plant else None)
 
 
-@st.cache_data(show_spinner=False, max_entries=16)
-def tune_rho_cached(econ: Dict[str, Any], phys: Dict[str, Any], amb_mean: float, amb_amp: float
-                    ) -> Tuple[float, List[float]]:
-    e, path = te.tune_rate_reference(te.CellPhysics(**phys), te.Economics(**econ),
-                                     ambient_mean_C=amb_mean, ambient_amp_C=amb_amp)
-    return float(e.rate_ref or 0.0), path
 
 
 @st.cache_data(show_spinner=False)
@@ -3192,23 +3029,6 @@ def stress_section() -> None:
         st.markdown("**Stressor → degradation mechanism**")
         show_table(mech.set_index("Stressor"))
 
-
-def condition_effects_section() -> None:
-    st.warning("**Screening only, not used by the twin.** This pooled regression mixes every group (including Mixed "
-               "conditions and NASA-flagged batteries), rests on two batteries for the 24 °C current effect and gives "
-               "too-narrow intervals (batteries of one campaign are not independent). The identified condition effects "
-               "come from the shared physics: see the what-if on the Integrated twin and Mission 3 in Operations & "
-               "control (cut-off identified; discharge current not).", icon=":material/warning:")
-    sf = stress_factors_cached(ct, DATA_KEY)
-    if not sf.get("available"):
-        st.info("Operating-condition regression needs at least four cells with a measurable early fade rate.")
-        return
-    st.markdown(f"Cohort regression of the early fade rate per Ah on the NASA design factors "
-                f"({sf['n_cells']} cells, R² = {sf['r2']:.2f}). Factors without variation are dropped automatically.")
-    show_table(sf["coefficients"].style.format("{:.3g}"))
-    st.caption("Eₐ > 0: hotter cells fade faster per Ah (Arrhenius SEI growth). Current exponent > 0: rate-driven "
-               "damage. Cold regime (×) > 1: the 4 °C cells age faster than Arrhenius predicts (lithium plating). "
-               "Wide intervals mean the cohort cannot separate the factor from cell-to-cell variation.")
 
 
 def risk_banner(row: pd.Series, cell_id: str) -> None:
@@ -4194,8 +4014,6 @@ def view_data() -> None:
                 show(fig_cohort_group(ct, meta, members, grid_sel, P, f"Ambient {g:.0f} °C · {len(members)} cells",
                                       norm_x), key=f"cohort_{int(g)}",
                      data=ct.loc[~ct["outlier"] & ct["Cell_ID"].isin(members), ["Cell_ID", "n", "SOH"]])
-        with st.expander("Mission 1 · How do operating conditions influence degradation?", expanded=False):
-            condition_effects_section()
         section("Mission 1 · Which parameter best represents health?")
         health_indicator_section()
     elif tab == DIAG_TABS[2]:                                # ---------------- Electrochemistry
@@ -4208,8 +4026,6 @@ def view_data() -> None:
     else:                                                    # ---------------- Stress & safety
         section("Operating stress and safety exposure")
         stress_section()
-        with st.expander("Mission 1 · How do operating conditions influence degradation?", expanded=False):
-            condition_effects_section()
 
 
 # =============================================================================
@@ -4273,7 +4089,7 @@ def methods_panel() -> None:
         st.markdown(
             "| Model class (Rufino Júnior et al. 2024, Fig. 1) | Implemented as |\n|---|---|\n"
             "| Empirical | Direct ML regression SOH(n) (baseline) |\n"
-            "| Semi-empirical | Power law in Ah (Live twin); pooled condition regression (screening only) |\n"
+            "| Semi-empirical | Power law in Ah (Live twin) |\n"
             "| Equivalent-circuit | 1-RC ECM inside the dual EKF twin |\n"
             "| Electrochemical / physics-based | Butler–Volmer and SEI-type fade law in the hybrid PINN |\n"
             "| Data-driven | RF, GBR, GPR, SVR, MLP, Ridge fade-rate models with conformal bands |\n"
@@ -6962,193 +6778,11 @@ def anomaly_section() -> None:
              .to_csv(index=False).encode(), f"anomaly_scan_NASA__v{te.ENGINE_VERSION}.csv", "text/csv", key="an2_csv")
 
 
-def view_ops_legacy() -> None:   # pre-Mission-2 optimiser, set aside (STATUS 5aw); not shown
-    pass
 
 
-def dp_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional[te.CellPhysics], amb_mean: float,
-               amb_amp: float) -> None:
-    section("Optimal operation and replacement by dynamic programming")
-    st.markdown("The twin-aware policy above is one-step (greedy). Here the full sequential problem is solved as a "
-                "semi-Markov decision process. State: (SOH, season phase). Actions: discharge current or replace. "
-                "The objective is the true long-run profit rate, including the sudden-failure hazard, energy cost "
-                "and downtime. Dinkelbach's method finds the rate ρ* at which a new cell is exactly worth its "
-                "renewal. The DP policy is then run in closed loop, with observer noise and any plant mismatch set "
-                "above, and scored exactly like the grid study.")
-    with st.expander("Bellman equation", icon=":material/functions:"):
-        st.latex(r"W_\rho(s, j) = \max\Big\{-C_\mathrm{plan} - \rho\,t_\mathrm{plan},\;\max_I\big[r_I - \rho\,t_I "
-                 r"+ h(s)\,(-C_\mathrm{unpl} - \rho\,t_\mathrm{unpl}) + (1 - h(s))\,\mathbb{E}\,W_\rho(s - \Delta s_I, j')"
-                 r"\big]\Big\},\qquad \rho^*:\ W_{\rho^*}(1, j_0) = 0")
-    saved_om = st.session_state.get("om")
-    maint = saved_om["cfg"]["maint"] if saved_om else asdict(te.MaintenanceModel(replacement_cost=econ.replacement_cost))
-    c1, c2 = st.columns(2)
-    n_soh = c1.select_slider("SOH grid points", [50, 70, 90, 120], value=90, key="dp_ns")
-    n_ph = c2.select_slider("Season bins", [8, 12, 16, 24], value=16, key="dp_nph")
-    if st.button(f"Solve DP (≈ {4 + n_soh * n_ph // 150} s)", key="dp_go", icon=":material/account_tree:", type="primary"):
-        with st.spinner("Tabulating cycle outcomes and running value iteration…"):
-            try:
-                dp = dp_cached(asdict(econ), asdict(phys), maint, amb_mean, amb_amp, int(n_soh), int(n_ph))
-                ev, life = te.evaluate_dp_policy(dp, econ, phys, te.MaintenanceModel(**maint), plant=plant,
-                                                 ambient_mean_C=amb_mean, ambient_amp_C=amb_amp)
-                st.session_state["dp"] = {"dp": dp, "eval": ev, "life": life}
-            except Exception as exc:
-                report_error("Dynamic programming failed", exc, debug)
-    saved = st.session_state.get("dp")
-    if not saved:
-        return
-    dp, ev = saved["dp"], saved["eval"]
-    k = st.columns(5)
-    k[0].metric("Model-optimal rate ρ*", fmt(dp.rho, ".4f", "CU/h"), help="Upper bound under the DP's model.")
-    k[1].metric("Closed-loop rate", fmt(ev["rate"], ".4f", "CU/h"))
-    k[2].metric("Replaced at SOH", fmt(ev["threshold"], ".3f"))
-    k[3].metric("P(sudden failure)", fmt(100 * ev["p_failure"], ".1f", "%"))
-    k[4].metric("Violations", int(ev["violations"]))
-    show(fig_dp_policy(dp, P), key="dp_fig", data=pd.DataFrame(dp.action, index=dp.soh_grid, columns=dp.phases))
-    if saved_om:
-        opt = te.integrated_optimum(saved_om["study"])
-        b = opt.get("best")
-        if b:
-            gap = 100 * (ev["rate"] - b["rate"]) / abs(b["rate"])
-            card("DP versus the best grid policy", [
-                f"Grid optimum: {b['policy']}, replace at {b['threshold']:.2f} → {b['rate']:.4f} CU/h; "
-                f"DP closed loop {ev['rate']:.4f} CU/h ({gap:+.1f}%).",
-                f"The simple policy reaches {100 * b['rate'] / dp.rho:.0f}% of the model optimum ρ*. When the gap is "
-                "small, the one-step policy plus a replacement threshold is already near-optimal for this plant. "
-                "The DP adds a certificate of that, plus a season-dependent replacement boundary."])
-    else:
-        st.caption("Run the integrated optimisation above to compare the DP with the best grid policy.")
 
 
-def scenario_section() -> None:
-    section("What-if scenario planner")
-    sf = stress_factors_cached(ct, DATA_KEY)
-    if not sf.get("available"):
-        st.info("The planner needs the cohort stress-factor regression (at least four cells with measurable fade).")
-        return
-    st.markdown("Edit the table to compare operating scenarios. Projections use the stress-factor law fitted on this "
-                f"cohort ({sf['n_cells']} cells, R² = {sf['r2']:.2f}; factors: "
-                f"{', '.join(c for c in sf['columns'] if c != 'intercept')}), with a bootstrap band. Factors that do "
-                "not vary in the data are held at their reference value.")
-    default = pd.DataFrame([{"Scenario": "Reference (24 °C, 2 A)", "Ambient (°C)": 24.0, "Discharge current (A)": 2.0,
-                             "Cut-off (V)": 2.7},
-                            {"Scenario": "Hot site (43 °C)", "Ambient (°C)": 43.0, "Discharge current (A)": 2.0,
-                             "Cut-off (V)": 2.7},
-                            {"Scenario": "Hot + high load", "Ambient (°C)": 43.0, "Discharge current (A)": 4.0,
-                             "Cut-off (V)": 2.7},
-                            {"Scenario": "Cold site (4 °C)", "Ambient (°C)": 4.0, "Discharge current (A)": 2.0,
-                             "Cut-off (V)": 2.7}])
-    try:
-        ed = st.data_editor(default, num_rows="dynamic", hide_index=True, use_container_width=True, key="scen_tbl",
-                            column_config={"Ambient (°C)": st.column_config.NumberColumn(min_value=-20.0, max_value=60.0),
-                                           "Discharge current (A)": st.column_config.NumberColumn(min_value=0.1,
-                                                                                                  max_value=10.0),
-                                           "Cut-off (V)": st.column_config.NumberColumn(min_value=2.0, max_value=3.2)})
-    except Exception:
-        ed = default
-    if not isinstance(ed, pd.DataFrame) or ed.empty:
-        ed = default
-    horizon = st.slider("Projection horizon (cycles)", 100, 1500, 500, 50, key="scen_h")
-    scen = [{"name": str(r["Scenario"]), "T_C": float(r["Ambient (°C)"]), "I_A": float(r["Discharge current (A)"]),
-             "V_cut": float(r["Cut-off (V)"])} for _, r in ed.dropna().iterrows()][:8]
-    try:
-        sp = te.scenario_projection(sf, scen, horizon, c_bol=float(meta["C_bol_Ah"].median()),
-                                    soh_eol=float(soh_eol))
-    except Exception as exc:
-        report_error("Scenario projection failed", exc, debug)
-        return
-    show(fig_scenarios(sp, soh_eol, P), key="scen_fig", data=sp)
-    life = sp.groupby("scenario", sort=False).agg(life=("life_to_EOL", "first"), rate=("rate_per_Ah", "first"))
-    ref = life["life"].iloc[0]
-    k = st.columns(min(len(life), 4))
-    for i, (name, r) in enumerate(life.head(4).iterrows()):
-        delta = (f"{100 * (r['life'] - ref) / ref:+.0f}% vs first" if (ref and r["life"] and i) else None)
-        k[i].metric(name, f"{int(r['life'])} cycles" if r["life"] else f"> {horizon} cycles", delta=delta)
 
-
-def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional[te.CellPhysics],
-                       amb_mean: float, amb_amp: float, ops_cfg: Dict[str, Any]) -> None:
-    section("Mission 3 · Integrated operation and maintenance optimisation")
-    st.markdown("Operation and maintenance are optimised **jointly** with the same twin model. The operating knob is "
-                "the policy's shadow price of SOH, *w* (0 = run for immediate margin, large = protect the cell); the "
-                "maintenance knob is the replacement threshold. Each combination is scored by the long-run profit "
-                "rate of the renewal cycle (install → replace), with **Profit = Revenue − EnergyCost − "
-                "MaintenanceCost**, planned downtime, and a sudden-failure hazard after the knee (unplanned "
-                "replacement is more expensive and takes longer).")
-    with st.expander("Maintenance and risk model", expanded=False):
-        m1, m2, m3, m4 = st.columns(4)
-        maint = dict(
-            replacement_cost=float(econ.replacement_cost),
-            planned_downtime_h=float(m1.number_input("Planned downtime (h)", 0.0, 500.0, 24.0, 4.0)),
-            unplanned_factor=float(m2.number_input("Unplanned cost multiplier", 1.0, 10.0, 3.0, 0.5)),
-            unplanned_downtime_h=float(m3.number_input("Unplanned downtime (h)", 0.0, 1000.0, 120.0, 10.0)),
-            hazard_soh=float(m4.slider("Sudden-death onset SOH", 0.55, 0.85, 0.68, 0.01,
-                                       help="Hazard midpoint; set from the knee statistics of the cohort.")),
-            h_max=float(st.select_slider("Peak failure hazard per cycle", [0.005, 0.01, 0.02, 0.03, 0.05, 0.1],
-                                         value=0.03)))
-        c1, c2 = st.columns(2)
-        weights = tuple(c1.multiselect("Operating aggressiveness w (twin-aware)", [0.0, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0],
-                                       default=[0.0, 0.5, 1.0, 2.0, 4.0]))
-        thresholds = tuple(sorted(c2.multiselect("Replacement thresholds (SOH)",
-                                                 [0.60, 0.62, 0.64, 0.66, 0.68, 0.70, 0.72, 0.74, 0.76, 0.78, 0.80,
-                                                  0.82, 0.84, 0.86],
-                                                 default=[0.60, 0.64, 0.68, 0.70, 0.72, 0.74, 0.76, 0.80, 0.84])))
-    cfg = dict(ops_cfg, maint=maint, weights=list(weights), thresholds=list(thresholds))
-    n_runs = len(weights) + 3
-    if st.button(f"Run integrated optimisation (≈ {1.0 * n_runs:.0f} s)", key="om_go",
-                 disabled=not (weights and thresholds)):
-        with st.spinner("Simulating lives and evaluating replacement thresholds…"):
-            try:
-                study = om_study_cached(asdict(econ), asdict(phys), maint, amb_mean, amb_amp,
-                                        asdict(plant) if plant else None, weights, thresholds)
-                st.session_state["om"] = {"cfg": cfg, "study": study}
-            except Exception as exc:
-                report_error("Integrated optimisation failed", exc, debug)
-    saved = st.session_state.get("om")
-    if not saved:
-        return
-    if saved["cfg"] != cfg:
-        st.warning("Settings changed since the last run; the results below use the previous settings.")
-    study = saved["study"]
-    opt = te.integrated_optimum(study)
-    show(fig_om_heatmap(study, opt, P), key="om_heat", data=study)
-    st.caption("✕ marks combinations that breach the thermal or cold-derating limits; they are excluded from the "
-               "optimum. Hover for the sudden-failure probability.")
-    show(fig_om_tradeoff(study, P), key="om_trade", export=False)
-    if opt:
-        b = opt["best"]
-        k = st.columns(5)
-        k[0].metric("Optimal policy", b["policy"])
-        k[1].metric("Optimal replacement SOH", f"{b['threshold']:.2f}")
-        k[2].metric("Long-run profit rate", fmt(b["rate"], ".4f", "CU/h"))
-        k[3].metric("P(sudden failure) per life", fmt(100 * b["p_failure"], ".1f", "%"))
-        k[4].metric("Availability", fmt(100 * b["availability"], ".1f", "%"))
-        lines = []
-        bf = opt.get("best_fixed")
-        if bf and bf["rate"]:
-            lines.append(f"Versus the best compliant fixed-current policy ({bf['policy']}, replace at "
-                         f"{bf['threshold']:.2f}): {100 * (b['rate'] - bf['rate']) / abs(bf['rate']):+.1f}% profit rate")
-        same = study[(study["policy"] == b["policy"])].set_index("threshold")
-        lo_th, hi_th = same.index.min(), same.index.max()
-        lines.append(f"Same policy, replacing at {lo_th:.2f} (run towards failure): rate {same.loc[lo_th, 'rate']:.4f}, "
-                     f"P(failure) {same.loc[lo_th, 'p_failure']:.0%}; replacing at {hi_th:.2f} (early): rate "
-                     f"{same.loc[hi_th, 'rate']:.4f}")
-        lines.append(f"J_op {b['J_op']:.1f} CU and J_maint {b['J_maint']:.1f} CU per renewal "
-                     f"(maintenance {b['maintenance_cost']:.1f} + performance loss {b['performance_loss']:.1f})")
-        card("Mission 3 answer", lines)
-    tbl = study[["policy", "threshold", "cycles", "J_op", "J_maint", "profit", "rate", "p_failure", "availability",
-                 "violations"]].rename(columns={"policy": "Policy", "threshold": "Replace at SOH",
-                                                "cycles": "Expected cycles", "profit": "Profit per renewal",
-                                                "rate": "Profit rate (CU/h)", "p_failure": "P(failure)",
-                                                "availability": "Availability", "violations": "Violations"})
-    with st.expander("All combinations"):
-        show_table(tbl.style.format({"Replace at SOH": "{:.2f}", "Expected cycles": "{:.0f}", "J_op": "{:.1f}",
-                                     "J_maint": "{:.1f}", "Profit per renewal": "{:.1f}",
-                                     "Profit rate (CU/h)": "{:.4f}", "P(failure)": "{:.1%}",
-                                     "Availability": "{:.1%}"}, na_rep="—"))
-    st.caption("Simulation evidence on the synthetic plant family (CellPhysics); the hazard model is an assumption "
-               "calibrated to the knee literature, so treat the optimum's location, not its absolute value, as the "
-               "result. With plant/model mismatch set above, the policy plans with the nominal model.")
-    manifest_button(cfg, "integrated_om", DATA_KEY)
 
 
 # =============================================================================
@@ -7156,9 +6790,8 @@ def integrated_section(econ: te.Economics, phys: te.CellPhysics, plant: Optional
 # =============================================================================
 TWIN_STATUS_COLORS = {"Normal": "#009E73", "Watch": "#E69F00", "Alarm": "#CC0000", "End of life reached": "#6B1E1E"}
 TWIN_HYB = dict(restarts=30, fit_with="Re", lam=0.3)        # the Models view's defaults: both views share one result
-TWIN_WATCH_BASIS = {"Median forecast": None, "Conservative 50 % (experimental)": 0.5,
-                    "Conservative 75 % (experimental)": 0.75, "Conservative 90 % (experimental)": 0.9}
-# experimental: on NASA the conservative estimate over-corrected in Reference (bias -6..-12 cycles); not adopted (5au)
+# The conservative end-of-life option (twin's own track record) was tested and not adopted (STATUS 5au): removed from
+# the page (STATUS 5cj); Watch always uses the median forecast. The engine keeps the computation.
 TWIN_PARTS = {"main": "Explanation (physics version 2)", "check": "Explanation check (physics version 3)",
               "scan": "Anomaly detection", "fleet": "Fleet-wide parts"}
 
@@ -7503,7 +7136,7 @@ def view_twin() -> None:
                   + tuple(fr[4:]) for k_, fr in frames.items()}
 
     ns = meas["n"].astype(int).tolist()
-    c1, c2, c3, c4 = st.columns([3.0, 1.1, 1.1, 1.5], vertical_alignment="bottom")
+    c1, c2, c3 = st.columns([3.0, 1.1, 1.1], vertical_alignment="bottom")
     n = int(c1.select_slider("Today (discharge cycle)", options=ns, value=ns[-1], key=f"itw_n_{cell}",
                              help="Everything up to this cycle is known to the twin; the forecast starts here."))
     reveal = c2.toggle("Show later measurements", value=False, key="itw_reveal",
@@ -7511,12 +7144,7 @@ def view_twin() -> None:
     watch = int(c3.select_slider("Watch window (cycles)", [10, 20, 30, 50], value=20, key="itw_watch",
                                  help="Status 'Watch' when the early edge of the forecast band reaches end of life "
                                       "within this many cycles."))
-    basis = c4.selectbox("Watch uses", list(TWIN_WATCH_BASIS), index=0, key="itw_basis",
-                         help="Median: today's forecast as it is. Conservative: today's forecast made to fade faster "
-                              "by how much the twin's own forecasts of this battery were too optimistic over the last "
-                              "40 cycles (50, 75 or 90 % quantile of that past error). Needs at least 10 past "
-                              "comparisons; before that the median is used. Changes Watch only, not the forecast.")
-    watch_q = TWIN_WATCH_BASIS[basis]
+    watch_q = None                                         # Watch uses the median forecast (5cj)
     snap = te.integrated_snapshot(n, soh_eol_c, meas, frames, an, common, t_main, t_check, watch, watch_q)
 
     k = st.columns(5)
@@ -7624,7 +7252,7 @@ def view_twin() -> None:
              tl.assign(battery=cell, group=grp_c, **{"app version": te.ENGINE_VERSION, "twin core": twin_core(),
                                                     "core retrain every": core_refit(),
                                                     "end of life": _twin_eol_label(),
-                                                    "watch uses": basis}).to_csv(index=False).encode(),
+                                                    "watch uses": "median forecast"}).to_csv(index=False).encode(),
              f"integrated_twin_{cell}__v{te.ENGINE_VERSION}.csv", "text/csv", key="itw_csv")
     twin_whatif(fleet, cell, soh_eol_c)
     ga_pinn_section(fleet)
