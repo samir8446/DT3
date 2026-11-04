@@ -26,6 +26,7 @@ import html
 import itertools
 import json
 import math
+import io
 import time
 import os
 import re
@@ -2732,9 +2733,6 @@ with st.sidebar:
              help="Used by the Live twin, the Integrated twin and Mission 3. The PINN core is trained once at the live "
                   "start and re-anchored every cycle, like the frozen model; compare both with the twin scorecard "
                   "(Integrated twin page). The Model updating page always uses the frozen model (Mission 2).")
-    if twin_core() == TWIN_CORES[2] and not ga_loaded():
-        st.caption(":orange[GA-PINN results not loaded: restore them on the Integrated twin page (GA-PINN section). "
-                   "Until then every battery uses the PINN twin core.]")
     st.selectbox("PINN core: retrain every N cycles", [0, 10, 20, 30], key="pinn_refit", index=2,
                  format_func=lambda v: "never (trained once at the live start)" if v == 0 else f"every {v} cycles",
                  help="Only for the PINN cores (default every 20 cycles: STATUS 5bt, B0005 45 -> 25 cycles). Retraining lets "
@@ -5066,7 +5064,6 @@ LEVEL_INFO = {
     2: ("Machine learning", "SOH of every cycle learned from all training batteries: conditions and health parameters."),
     3: ("Deep learning", "MLP on the Level-2 inputs, GRU and Transformer over the last cycles: same question, neural networks."),
     4: ("Physics-informed", "Neural network constrained by the electrochemistry and degradation-mechanism equations."),
-    4: ("Deep learning", "GRU recurrent network and Transformer: learn from sequences of past SOH."),
     5: ("Hybrid & physics-informed", "Mechanistic PINN and hierarchical Bayes: equations plus learning."),
     6: ("First principles", "Single-particle electrochemical model with SEI growth: physics only, calibrated."),
 }
@@ -5593,6 +5590,7 @@ def assessment_section() -> None:
                       "Level 3 · DL forecast": [f"dl:{k}" for k in te.DL_MODELS],
                       "Level 3 · DL measured": [f"dlm:{k}" for k in te.DL_MODELS],
                       "Level 4 · PINN (original inputs) + ablation": ["pinn:PINN", "pinn:PINN-ablation"],
+                      "Level 4 · PINN twin core (best PINN before the GA)": ["pinn:PINN-twin"],
                       "Level 4 · GA-PINN (each battery's GA winner)": [GA_ASSESS_KEY]}
         levels = st.multiselect("Levels (baselines are always included: the verdict needs them)", list(level_keys),
                                 default=list(level_keys), key="acc_levels")
@@ -6536,7 +6534,7 @@ def physics_gap_section() -> None:
 
 
 def hybrid_section() -> None:
-    section("Level 4 · Hybrid · Shared physics (the explanation) + a small neural network (what the physics misses)")
+    section("Explanation · Hybrid: shared physics + a small neural network (what the physics misses)")
     st.markdown(
         "The **shared physics** (section above) computes SEI growth, lithium plating and loss of active material and is "
         "**frozen**; a **small neural network** then learns only what the physics leaves unexplained (measurement minus "
@@ -6622,14 +6620,17 @@ def pinn_section() -> None:
         "thickens and speeds up with temperature (Arrhenius); plating that grows in the cold, at high current and as "
         "active material is lost (the cause of knees); loss of active material with cycling. The **same network "
         "without physics** is included as an ablation, so you can see what the physics itself contributes. Forecast "
-        "mode only: the PINN models how the battery evolves. **GA-PINN** is the same physics-informed network with the "
+        "mode only: the PINN models how the battery evolves. **PINN twin core** is the best PINN before the GA: the "
+        "cut-off voltage as an input with a depth term, a start that ignores NASA's low first cycle, and 3 averaged "
+        "trainings. **GA-PINN** is the same physics-informed network with the "
         "settings a genetic algorithm chose for this battery: network size, learning rate, physics weight, the form "
         "of the SEI law and an optional acceleration term, judged only on the other batteries (nested leave-one-out; "
         "run or restore the GA on the Integrated twin page first). It is trained here from this battery's training | "
         "test line, like the PINN, so both are compared on the same forecast.",
         {"PINN": te.PINN_MODELS["PINN"],
+         "PINN-twin": "PINN twin core · best PINN before the GA (cut-off input, burn-in start, 3 seeds)",
          "GA-PINN": "GA-PINN · this battery's genetic-algorithm winner (settings and physics form chosen by the GA)"},
-        ("PINN", "GA-PINN"),
+        ("PINN", "PINN-twin", "GA-PINN"),
         lambda t, n0, m, mode, train, model_params=None, **_: te.train_pinn_model(ct, imp, t, n0, m, mode, train,
                                                                                   float(eol_ah), model_params),
         "pinn", modes=("forecast",))
@@ -6650,20 +6651,21 @@ def pinn_section() -> None:
 
 def view_models() -> None:
     recommendations("models")
-    section("Forecasting models: baselines and machine learning (levels 1–3)")
+    section("Forecasting models: from baselines to physics-informed networks (levels 1–4)")
     sc = scheme_controls()
     if not sc["targets"]:
         return
     ladder_intro()
-    ladder_baselines()
-    trajectory_section()
-    deep_section()
-    pinn_section()
-    nasa_physics_section()
-    hybrid_section()
-    physics_gap_section()
-    ladder_leaderboard()
-    assessment_section()
+    ladder_baselines()          # Level 1 · baselines
+    trajectory_section()        # Level 2 · machine learning
+    deep_section()              # Level 3 · deep learning
+    pinn_section()              # Level 4 · PINN and GA-PINN
+    ladder_leaderboard()        # every level on this battery's test cycles
+    assessment_section()        # every battery of the group (the evidence)
+    hybrid_section()            # explanation: which mechanisms caused the loss (not a forecaster)
+    # removed from the page at the user's request (2026-11-04): nasa_physics_section (shared physics alone; the twin
+    # and Mission 3 still use it through the fleet parts) and physics_gap_section (resistance diagnostic, ruled out:
+    # STATUS 5bl); both functions are kept
 
 
 # =============================================================================
@@ -7842,6 +7844,195 @@ def _band_coverage(frames: Dict[int, Any], e: float, soh_eol: float, s: float = 
 BAND_SCALES = tuple(np.round(np.arange(0.1, 1.51, 0.05), 2))
 
 
+GA_FILE = RESULTS_DIR / "ga_pinn_evaluations.csv"      # commit it to the repository to keep GA-PINN across restarts
+# The GA-PINN search on NASA (8 batteries, 131 evaluations, STATUS 5bx), embedded so GA-PINN works with app.py alone;
+# results/ga_pinn_evaluations.csv (a newer run or a restore) takes precedence when present.
+GA_EMBEDDED_CSV = """battery,genome,fitness,RMSE_val (pts),late bias (pts),physics residual,seconds
+B0005,h32|lr0.005|w1|p1|a0|it900,11.722848040552424,7.577409861442018,-8.211577693299308,0.3324082016542556,16.708733797073364
+B0005,h48|lr0.005|w1|p1|a0|it600,10.597745605113333,8.268974998788647,-4.524485950853683,0.3804650545074836,29.763180017471313
+B0005,h16|lr0.002|w0.3|p0|a1|it900,5.614709074621517,5.023449639428055,-1.1079086811300025,0.5748368317754599,13.72165822982788
+B0005,h32|lr0.005|w3|p0|a1|it900,12.087473882801614,9.709958606903575,-4.682345318802924,0.12108927151882887,16.93030333518982
+B0005,h32|lr0.01|w0.3|p0|a1|it600,4.933240328505106,4.443227521214045,0.9202890263832232,0.41572280740882156,11.159691333770752
+B0005,h32|lr0.01|w1|p1|a1|it900,8.947586151517765,7.919844182056426,-1.9693671160219566,0.26141831859848663,19.00772738456726
+B0005,h32|lr0.01|w0.3|p0|a1|it900,5.341997083661199,4.823580220097389,0.9478805962283966,0.44031126001067916,18.27687382698059
+B0005,h48|lr0.01|w0.3|p0|a1|it600,5.5974809095582465,4.622221805719025,1.8116073615137032,0.4766045631893168,30.496106386184692
+B0005,h32|lr0.01|w1|p0|a1|it600,4.978379739270875,4.826699701849384,0.2509665713144346,0.23145306877149488,10.837929248809814
+B0005,h48|lr0.01|w0.3|p0|a1|it900,5.542596359747946,4.683241761322194,1.5124169093708764,0.46595281458177823,47.420072078704834
+B0005,h16|lr0.01|w0.3|p0|a1|it900,6.246752650519332,5.589979879950106,-1.2366650720354457,0.4093543876764687,15.494611978530884
+B0005,h32|lr0.002|w0.3|p0|a1|it600,6.19284395064283,5.224104987621368,1.8677854493785537,0.7385017679455782,11.41874074935913
+B0005,h16|lr0.01|w0.3|p0.5|a1|it900,6.498227327113293,5.710829733220061,-1.5002133960449031,0.4163792648329166,14.86595892906189
+B0005,h32|lr0.01|w3|p0|a1|it900,9.596949405328841,8.101222642021893,-2.9107486354864225,0.1041645248926456,19.100378036499023
+B0005,h48|lr0.01|w0.3|p0|a0|it900,4.690730659254041,4.3602210007822615,0.4422139168821011,0.47523280443800936,50.479835987091064
+B0006,h32|lr0.005|w1|p1|a0|it900,8.940190312140617,7.596096654135465,-2.6023534254337743,0.3623989515523213,18.100865125656128
+B0006,h48|lr0.005|w1|p1|a0|it600,6.785017262103386,6.372489083611803,-0.6839704951157914,0.45525048488044956,31.19802165031433
+B0006,h16|lr0.002|w0.3|p0|a1|it900,9.151616575176009,8.024700837364982,-2.1720986277900756,0.5878895829338715,15.412704467773438
+B0006,h32|lr0.005|w3|p0|a1|it900,11.108927729394726,8.421467670532397,5.295579694551196,0.12087668163891976,18.59615993499756
+B0006,h32|lr0.01|w0.3|p0|a1|it600,8.070816442517883,7.341194225495923,1.3929218723934462,0.537845048413513,11.907825946807861
+B0006,h32|lr0.01|w1|p1|a1|it900,8.275296788144193,7.354526668942264,1.7569647585249555,0.36988276285498156,17.7267849445343
+B0006,h32|lr0.01|w0.3|p0|a1|it900,9.106644942267593,7.590852551383426,2.9412123656769826,0.518002688787891,18.061290502548218
+B0006,h48|lr0.01|w0.3|p0|a1|it600,7.086880120026765,6.959065678704588,-0.10737638000773554,0.6220171396719437,31.811739683151245
+B0006,h32|lr0.01|w1|p0|a1|it600,10.040399661964665,7.496213490341784,5.0281542061926645,0.32134875156186427,12.02909779548645
+B0006,h48|lr0.005|w1|p0|a0|it600,9.041896990523368,7.79740750747789,-2.350466743098054,0.3197329980650726,31.615903854370117
+B0006,h48|lr0.005|w0.3|p1|a0|it900,9.782752057494958,7.414275388449097,-4.521165583905052,0.7783848521215053,47.6962947845459
+B0006,h16|lr0.005|w0.3|p1|a1|it900,8.307863982363456,7.472827614552169,-1.5885635578129338,0.6536139237297967,14.916441440582275
+B0006,h32|lr0.002|w1|p1|a0|it900,11.654504906474838,7.60347808224828,-8.018104423200736,0.3834301596037499,17.463375329971313
+B0006,h48|lr0.005|w0.3|p0|a0|it900,8.042266609573987,7.379324632898832,-1.108347758692773,0.6912398475976111,48.6789186000824
+B0006,h16|lr0.01|w0.3|p0.5|a1|it600,7.9092132050029065,7.759126967867615,-0.24203089571104547,0.4912542738779201,10.19660210609436
+B0006,h48|lr0.005|w3|p1|a1|it600,8.328659721787577,7.37857401972973,-1.7573211543010268,0.18383754146058096,33.88025975227356
+B0018,h32|lr0.005|w1|p1|a0|it900,10.177350257656661,7.310596790568365,-5.645217729703973,0.4016772798325043,18.406100273132324
+B0018,h48|lr0.005|w1|p1|a0|it600,11.820561842697607,8.213652682555168,-7.021844515314098,0.5412931605608067,43.29631996154785
+B0018,h16|lr0.002|w0.3|p0|a1|it900,8.766803643647508,5.244761317179779,-6.9259227942578505,0.6221279842569647,24.288336753845215
+B0018,h32|lr0.005|w3|p0|a1|it900,11.090754741795335,8.742660579595888,-4.593575069660886,0.16180884848672378,24.024946689605713
+B0018,h32|lr0.01|w0.3|p0|a1|it600,5.040295006275901,3.5446455265781016,-2.9143328911430304,0.556174334546624,14.44006085395813
+B0018,h32|lr0.01|w1|p1|a1|it900,9.65943654406851,7.401463412563258,-4.423792704411091,0.3695149600523117,19.62422013282776
+B0018,h32|lr0.01|w0.3|p0|a1|it900,4.989663606017818,3.868488546406413,-2.1467256345230368,0.519721435366708,19.362021446228027
+B0018,h48|lr0.01|w0.3|p0|a1|it600,7.138339810129553,4.640606822200474,-4.834302223682143,0.5124074035168823,35.79921817779541
+B0018,h32|lr0.01|w1|p0|a1|it600,5.2215246062492255,4.205915356545754,-1.9634324436843695,0.32310591748867235,13.906648635864258
+B0018,h48|lr0.01|w0.3|p0|a1|it900,8.61251896777081,5.562564127467083,-5.86793420621889,0.5159913600026645,53.47645044326782
+B0018,h16|lr0.01|w0.3|p0|a1|it900,5.391825180073119,4.294299377778291,-2.109943982435544,0.5240318440710615,16.702054500579834
+B0018,h32|lr0.002|w0.3|p0|a1|it600,8.123383716699399,5.076749829533207,-6.002688791449174,0.9540027666291333,15.37161636352539
+B0018,h48|lr0.01|w0.3|p0.5|a1|it600,8.21388768596344,5.232851113642026,-5.797510219476692,0.6085890237828774,35.97960376739502
+B0018,h48|lr0.01|w3|p0|a1|it900,12.05305510685577,9.561799822657784,-4.759947603463322,0.131350365261534,54.3008131980896
+B0018,h48|lr0.01|w0.3|p0|a0|it900,8.107407114922495,6.189116877946385,-3.601983594812853,0.5903302273937368,53.61203694343567
+B0041,h32|lr0.005|w1|p1|a0|it900,10.668472204066495,6.383914943202658,-8.455569091768423,1.8965052542846428,16.839499473571777
+B0041,h48|lr0.005|w1|p1|a0|it600,11.172811038698997,6.665035031763472,-8.845574654648209,1.9655993544829817,30.691527843475342
+B0041,h16|lr0.002|w0.3|p0|a1|it900,10.664847821622587,6.393743504147113,-8.384202204470565,8.440205318742345,15.127071619033813
+B0041,h32|lr0.005|w3|p0|a1|it900,12.573047385421058,7.478295970690891,-10.100865514730256,0.6166834826873193,16.943703651428223
+B0041,h32|lr0.01|w0.3|p0|a1|it600,10.691627341055131,6.404525799673428,-8.44439487875136,5.978458219177174,11.35806393623352
+B0041,h32|lr0.01|w1|p1|a1|it900,10.92834835824091,6.524880874100412,-8.694644262069632,1.7247873147180623,17.189361333847046
+B0041,h32|lr0.01|w0.3|p0|a1|it900,10.83685610354671,6.489888138801724,-8.54054211960418,5.5185735586773506,17.994638204574585
+B0041,h48|lr0.01|w0.3|p0|a1|it600,11.345930610209932,6.761638179843016,-8.957588598335366,5.7109481661540515,32.07946848869324
+B0041,h32|lr0.005|w1|p1|a1|it900,11.265767778951206,6.743906865984608,-8.9287374193797,1.8913788785045027,17.21847653388977
+B0041,h16|lr0.002|w0.3|p1|a1|it900,11.719648255025811,7.008275161516302,-9.265589960260147,8.0483603385954,15.374809503555298
+B0041,h48|lr0.002|w1|p0|a1|it900,14.50901105535659,8.54907581429861,-11.671923970297412,3.051176752176439,46.79709815979004
+B0041,h32|lr0.002|w0.3|p0|a1|it900,12.98109801170617,7.668436709963252,-10.455279668454342,8.911640696439047,17.60709500312805
+B0041,h16|lr0.01|w0.3|p0|a1|it900,10.231097585039386,6.119457775553565,-8.071653234761202,5.735248426393524,17.197755575180054
+B0041,h32|lr0.01|w0.3|p0.5|a1|it900,10.187973017519205,6.115689937643987,-8.010707013149725,3.9363009302472416,16.129745960235596
+B0041,h16|lr0.002|w3|p0|a1|it900,14.034636856794059,8.314603378782023,-11.358814246439264,0.6666477364325936,14.76708197593689
+B0041,h48|lr0.01|w0.3|p0|a0|it900,10.577196477613345,6.302045903194465,-8.293775208831722,6.264684300523455,42.60106635093689
+B0041,h16|lr0.005|w3|p0|a1|it900,11.657939702958284,6.968981617727159,-9.302688611701166,0.5096918415297365,14.334681987762451
+B0045,h32|lr0.005|w1|p1|a0|it900,10.972820720307483,6.544218215574333,-8.75096598114255,1.479657848347326,16.699963092803955
+B0045,h48|lr0.005|w1|p1|a0|it600,12.022811463447114,6.94457801384004,-10.022341812345118,1.4557998432460806,23.776447534561157
+B0045,h16|lr0.002|w0.3|p0|a1|it900,5.4008274426006535,4.249409973083624,-2.1553576764182276,6.36973835458765,15.183013916015625
+B0045,h32|lr0.005|w3|p0|a1|it900,20.68884616436893,12.25500720731673,-16.78048448213161,0.6091901015989302,16.633174180984497
+B0045,h32|lr0.01|w0.3|p0|a1|it600,11.657174628344148,7.083602637890496,-9.031591202124915,4.043029325921636,11.320907354354858
+B0045,h32|lr0.01|w1|p1|a1|it900,11.711958077401093,6.803905736500783,-9.712829223474724,1.2765755944802444,16.886812686920166
+B0045,h32|lr0.01|w0.3|p0|a1|it900,11.640587934970718,6.9732936958409795,-9.198275125573584,3.7429729186510095,17.177072048187256
+B0045,h48|lr0.01|w0.3|p0|a1|it600,8.955864308178421,5.2839446151399345,-7.169862526137064,4.1547357924814285,25.68905472755432
+B0045,h32|lr0.005|w1|p1|a1|it900,13.333593533186406,7.742244069347088,-11.071838551251924,1.7271490610456226,16.82237219810486
+B0045,h16|lr0.002|w0.3|p1|a1|it900,8.53295549509085,5.138795253757518,-6.65174580882314,5.340847862023248,14.089985132217407
+B0045,h48|lr0.002|w1|p0|a1|it900,24.323013368875184,14.440773932568824,-19.558309078771686,2.6592031716488913,37.4577853679657
+B0045,h32|lr0.002|w0.3|p0|a1|it900,15.200529788269048,9.686401034093713,-10.875504446074585,5.765180059332021,17.431281566619873
+B0045,h16|lr0.01|w0.3|p0|a1|it900,6.863554911903861,4.382343432265354,-4.8389428918721205,3.813454137466307,13.808595895767212
+B0045,h32|lr0.01|w0.3|p0.5|a1|it900,9.41786179959121,6.170521963682999,-6.365055469116627,3.211775532451045,16.79442024230957
+B0045,h16|lr0.002|w3|p0|a1|it900,17.26848459142444,9.741254126362291,-14.972822745816961,0.7881617262008289,14.099376201629639
+B0045,h48|lr0.01|w0.3|p0|a0|it900,11.525538477368613,6.860166409375931,-9.117231816139116,4.163115125563769,35.55528473854065
+B0045,h16|lr0.005|w3|p0|a1|it900,13.100128332706815,7.526047647879039,-11.071488000075776,0.5367078248455245,14.503559827804565
+B0046,h32|lr0.005|w1|p1|a0|it900,18.36906314070887,10.6209358604872,-15.386106190249746,1.7900846170039637,16.396658182144165
+B0046,h48|lr0.005|w1|p1|a0|it600,20.34418421679417,11.66429848375449,-17.218628783829296,1.9143399942875774,23.672165155410767
+B0046,h16|lr0.002|w0.3|p0|a1|it900,14.05106062173835,8.213626929201515,-11.523466726074204,7.509900130609453,14.602053165435791
+B0046,h32|lr0.005|w3|p0|a1|it900,31.54800445333817,18.18608798381518,-26.63696619504623,0.555659920713133,16.918819427490234
+B0046,h32|lr0.01|w0.3|p0|a1|it600,21.251913195650307,12.882130762913022,-16.60395463110071,6.271502952375349,12.361953973770142
+B0046,h32|lr0.01|w1|p1|a1|it900,23.233958935401123,13.580930646253153,-19.19226213274966,1.8646051423160748,17.021992206573486
+B0046,h32|lr0.01|w0.3|p0|a1|it900,20.590727591280775,12.181274512611289,-16.670987822656137,5.841239871213685,16.101213216781616
+B0046,h48|lr0.01|w0.3|p0|a1|it600,20.599991691934413,12.51549222610745,-15.9805105882577,5.87751395175576,26.186298847198486
+B0046,h32|lr0.005|w1|p1|a1|it900,28.846618381500157,16.76082515446582,-24.055467305508706,1.996998190399729,17.112625122070312
+B0046,h16|lr0.002|w0.3|p1|a1|it600,8.667554641795396,5.36356904486061,-6.465198301591779,9.665425690209869,9.993768215179443
+B0046,h48|lr0.002|w1|p0|a1|it900,30.559024995516324,17.32899180097416,-26.24631185994585,3.3957646375461374,37.36277151107788
+B0046,h16|lr0.002|w0.3|p0|a1|it600,6.908145045391021,4.609592197409119,-4.454438200937052,9.263952713904201,10.384007692337036
+B0046,h16|lr0.01|w0.3|p0|a1|it900,17.492083230193938,10.374092041446017,-14.09632216431226,5.255044983178562,15.009292364120483
+B0046,h32|lr0.01|w1|p0.5|a1|it600,21.528496677835665,12.88155425980769,-17.205126937959417,1.6981206193211307,11.412940502166748
+B0046,h48|lr0.002|w3|p0|a1|it900,24.209205405517935,14.277116759779652,-19.683275862036385,0.7602746612013279,39.08584642410278
+B0046,h48|lr0.002|w0.3|p0|a0|it600,15.9409855588984,10.080690272065917,-11.521740835686728,7.886230488265299,25.994495153427124
+B0046,h16|lr0.005|w3|p1|a1|it600,20.006910007115916,11.96294153163599,-16.02908529082588,0.5144265223188841,10.206709861755371
+B0047,h32|lr0.005|w1|p1|a0|it900,15.735692456352249,9.687090971490004,-11.996206047793914,1.3301002947636946,16.064865112304688
+B0047,h48|lr0.005|w1|p1|a0|it600,17.62897465423313,10.664984351543051,-13.784783021838829,1.5618680672296912,25.585476875305176
+B0047,h16|lr0.002|w0.3|p0|a1|it900,12.635671030793599,7.465756255310345,-10.193833542660052,6.573570202497173,14.516485691070557
+B0047,h32|lr0.005|w3|p0|a1|it900,26.52007587309857,15.750138261488095,-21.45126946243603,0.5037387991376678,17.722130060195923
+B0047,h32|lr0.01|w0.3|p0|a1|it600,19.148813097122066,11.801084685487842,-14.563402625842967,6.135208509347032,11.678382635116577
+B0047,h32|lr0.01|w1|p1|a1|it900,22.12401926838951,13.691138828980435,-16.75564603011965,1.3657644230375745,18.17942476272583
+B0047,h32|lr0.01|w0.3|p0|a1|it900,19.379361096096474,11.953219906240442,-14.687372853996076,5.1569453618493455,21.49324893951416
+B0047,h48|lr0.01|w0.3|p0|a1|it600,21.06413585035393,12.833640000431181,-16.267444398295794,4.749943342371098,29.395236253738403
+B0047,h32|lr0.005|w1|p1|a1|it900,25.940937974659754,15.709346802143177,-20.346758894722573,1.5511660561348877,18.937394380569458
+B0047,h16|lr0.002|w0.3|p1|a1|it600,7.375637183063007,5.2400656219980295,-4.132061195751582,8.674792326552577,10.129440307617188
+B0047,h48|lr0.002|w1|p0|a1|it900,28.509427054033853,16.309809503171284,-24.171368447534437,2.3443185666929676,43.85897254943848
+B0047,h16|lr0.002|w0.3|p0|a1|it600,7.086069819723654,5.080909005239467,-3.8643128851918553,9.545731062868375,10.925268650054932
+B0047,h16|lr0.01|w0.3|p0|a1|it900,17.243167965947233,10.54902322663561,-13.238919593008838,4.72049018108322,18.40664029121399
+B0047,h32|lr0.01|w1|p0.5|a1|it600,20.461885675828178,12.668850854713574,-15.49869374996896,1.4519381020413253,12.10623550415039
+B0047,h48|lr0.002|w3|p0|a1|it900,29.07733274241017,16.374251873594357,-25.220812089492213,0.6095733190212037,41.16964292526245
+B0047,h48|lr0.002|w0.3|p0|a0|it600,18.26662679887854,10.873304148821939,-14.60308413901952,5.904603088283837,24.91182231903076
+B0047,h16|lr0.005|w3|p1|a1|it600,22.606536371900198,13.255762073795688,-18.642392937288673,0.44213558121384844,10.813762426376343
+B0048,h32|lr0.005|w1|p1|a0|it900,18.316615259181916,11.150627430716547,-14.22241265999928,1.7322463967528314,16.477752685546875
+B0048,h48|lr0.005|w1|p1|a0|it600,20.03862330627407,11.980632746639548,-15.966477841197479,1.7017048375979982,26.584872007369995
+B0048,h16|lr0.002|w0.3|p0|a1|it900,13.783179810085919,8.407682359744694,-10.598898582065123,7.4735818697312695,14.822403907775879
+B0048,h32|lr0.005|w3|p0|a1|it900,29.74808944006127,17.7157351743333,-23.967008283892387,0.7268348804986621,18.493791580200195
+B0048,h32|lr0.01|w0.3|p0|a1|it600,19.42848413257525,11.628763710689057,-15.466382528012826,5.842616066748874,12.384024620056152
+B0048,h32|lr0.01|w1|p1|a1|it900,24.311331778297692,14.87226593679173,-18.766443492101377,1.7932380838676238,16.769348859786987
+B0048,h32|lr0.01|w0.3|p0|a1|it900,22.140618134407106,13.336726896043032,-17.45759365207993,5.044376243309193,18.013418912887573
+B0048,h48|lr0.01|w0.3|p0|a1|it600,23.26584034083255,13.676944035331035,-18.987222968486165,5.124182915410489,27.966206789016724
+B0048,h32|lr0.005|w1|p1|a1|it900,26.720175777041447,16.33060516445517,-20.661103000098304,1.8629259231443644,18.089303493499756
+B0048,h16|lr0.002|w0.3|p1|a1|it600,7.442790194026774,5.572819253777117,-3.593860585709116,9.901472135573384,10.583194971084595
+B0048,h48|lr0.002|w1|p0|a1|it900,32.07236116293556,18.431897368252482,-27.05600526700087,2.9302418019426075,41.37009882926941
+B0048,h16|lr0.002|w0.3|p0|a1|it600,7.348702526947225,5.345876990020527,-3.857301257220971,11.088460872270339,10.028178930282593
+B0048,h16|lr0.01|w0.3|p0|a1|it900,19.31446068492612,11.796248207844402,-14.891865788738171,5.259979331295063,16.22546887397766
+B0048,h32|lr0.01|w1|p0.5|a1|it600,21.218190270379,13.213568676370949,-15.922120767995315,1.4581423544306513,12.015429258346558
+B0048,h48|lr0.002|w3|p0|a1|it900,31.766592547346463,18.23416636855194,-26.87495258460518,0.8186002525019395,40.98151206970215
+B0048,h48|lr0.002|w0.3|p0|a0|it600,20.528920873953812,12.426820891090019,-16.012107158774803,6.603478911087416,25.99789309501648
+B0048,h16|lr0.005|w3|p1|a1|it600,26.584335579144447,15.82662130968448,-21.453331779377503,0.6036144523154364,10.396690845489502"""
+
+
+def ga_evaluations_table() -> pd.DataFrame:
+    """All GA-PINN evaluations held in the session, in the format of the downloadable CSV (and of GA_FILE)."""
+    rows = []
+    for c, r in (st.session_state.get("ga_pinn") or {}).items():
+        restored = r.get("restored")
+        for k_, g in (r.get("genomes") or {}).items():
+            d = (dict(restored[k_]) if restored is not None and k_ in restored
+                 else {"fitness": float(r["fitness"][k_])})
+            d.pop("battery", None)
+            d.pop("genome", None)
+            rows.append({"battery": c, "genome": te.ga_pinn_key(g).split("|", 1)[1], **d})
+    return pd.DataFrame(rows)
+
+
+def ga_save() -> None:
+    """Write the GA-PINN evaluations next to the app (results/), so they load automatically after a restart."""
+    try:
+        E = ga_evaluations_table()
+        if len(E):
+            RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+            if GA_FILE.exists():                      # keep batteries of the file that are not in this session
+                old = pd.read_csv(GA_FILE)
+                old = old[~old["battery"].isin(E["battery"])]
+                E = pd.concat([old, E], ignore_index=True)
+            E.to_csv(GA_FILE, index=False)
+    except Exception:
+        pass                                          # read-only storage: the download / restore route still works
+
+
+def ga_autoload() -> None:
+    """Load the GA-PINN results from GA_FILE when the session has none (app start, restart, new version)."""
+    if ga_loaded() or st.session_state.get("_ga_autoload_tried") == DATA_KEY:
+        return
+    st.session_state["_ga_autoload_tried"] = DATA_KEY
+    try:
+        src = GA_FILE if GA_FILE.exists() else io.StringIO(GA_EMBEDDED_CSV)
+        got = ga_store_from_evaluations(pd.read_csv(src))
+        cells = set(CT_RAW["Cell_ID"])
+        store_ = st.session_state.setdefault("ga_pinn", {})
+        for c, r in got.items():
+            if c not in cells:
+                continue
+            grp_c, fz, train_c = frozen_context(c, TWIN_CORES[0])
+            if not fz:
+                continue
+            ns, _ = te.frozen_live_window(CT_RAW, c, train_c)
+            r["train"], r["n0"], r["autoloaded"] = tuple(train_c), int(ns), True
+            store_[c] = r
+    except Exception:
+        pass
+
+
 def ga_store_from_evaluations(E: pd.DataFrame) -> Dict[str, Dict[str, Any]]:
     """Rebuild finished GA-PINN searches from a downloaded evaluations CSV (battery, genome, fitness, ...): the winner and
     the ranked candidates need nothing else. Used after an app restart or an engine release, so the GA need not rerun."""
@@ -7886,7 +8077,10 @@ def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
     mins = c3.number_input("Time budget per press (minutes)", 2, 60, 10, key="ga_mins")
     sel = st.multiselect("Batteries", cands, default=cands, key="ga_cells")
     store_ = st.session_state.setdefault("ga_pinn", {})
-    with st.expander("Restore GA results from an evaluations CSV (after an app restart or a new engine version)"):
+    st.caption(("GA-PINN results load automatically from `results/" + GA_FILE.name + "`" if GA_FILE.exists() else
+                "GA-PINN results load automatically from the copy embedded in the app (NASA search, 131 evaluations)")
+               + f" · {sum(1 for r in store_.values() if r.get('done'))} batteries loaded.")
+    with st.expander("Restore GA results from an evaluations CSV (if the automatic loading has no file)"):
         up = st.file_uploader("ga_pinn_evaluations__*.csv", type="csv", key="ga_restore")
         if up is not None and st.button("Restore", key="ga_restore_go", icon=":material/restore:"):
             try:
@@ -7899,8 +8093,9 @@ def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
                     ns, _ = te.frozen_live_window(CT_RAW, c, train_c)
                     r["train"], r["n0"] = tuple(train_c), int(ns)
                     store_[c] = r
-                st.success(f"Restored {sum(c in cands for c in got)} batteries: their GA-PINN and self-tuning cores "
-                           "are available without rerunning the search.")
+                ga_save()
+                st.success(f"Restored {sum(c in cands for c in got)} batteries: GA-PINN is available without rerunning "
+                           "the search, and from now on it loads automatically.")
             except Exception as exc:
                 report_error("Could not restore the GA results", exc, debug)
     if st.button("Run / continue GA-PINN", key="ga_go", icon=":material/genetics:", type="primary"):
@@ -7931,6 +8126,7 @@ def ga_pinn_section(fleet: Optional[Dict[str, Any]]) -> None:
                         "Press again to continue: finished evaluations are reused.")
                 break
         msg.empty()
+        ga_save()
     rows, hist, evals = [], [], []
     start_key = tuple(sorted(te.GA_PINN_START.items()))
     for c in sel:
@@ -8538,6 +8734,14 @@ sidebar_guide()
 _VIEW_FN: Dict[str, Callable[[], None]] = {V_HOME: view_home, V_DATA: view_data, V_MODELS: view_models,
                                            V_UPDATE: view_update, V_LIVE: view_replay, V_TWIN: view_twin, V_OPS: view_ops,
                                            V_STUDY: view_study}
+try:
+    ga_autoload()
+    if twin_core() == TWIN_CORES[2] and not ga_loaded():
+        with st.sidebar:
+            st.caption(":orange[No GA-PINN results found (results/ga_pinn_evaluations.csv): run the GA or restore it on "
+                       "the Integrated twin page. Until then every battery uses the PINN twin core.]")
+except Exception:
+    pass
 try:
     _VIEW_FN.get(view, view_data)()
 except Exception as exc:

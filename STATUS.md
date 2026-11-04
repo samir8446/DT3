@@ -1191,6 +1191,23 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - Demo AppTests: Level 4 trains PINN + GA-PINN; assessment GA level runs on all batteries with the relabelled rows.
 - GA results must be loaded (run or restore) before using GA-PINN anywhere.
 
+## 5cg. GA-PINN loads automatically; Models page reorganised; best PINN before the GA added (app-only)
+- GA results file results/ga_pinn_evaluations.csv (the user's 131-evaluation CSV, 8 NASA batteries) ships with the app:
+  ga_autoload() loads it at startup when the session has no GA results (any page), so GA-PINN works without running or
+  restoring the GA. A GA run or a restore also writes the file (ga_save; until the next restart unless committed).
+  Sidebar caption only when no results are found.
+- Models & forecasting order: Level 1 baselines -> Level 2 machine learning -> Level 3 deep learning -> Level 4
+  physics-informed (first PINN, PINN twin core = best PINN before the GA, GA-PINN) -> leaderboard -> accuracy
+  assessment -> "Explanation · Hybrid" (the twin's explanation model, not a forecaster). Removed from the page:
+  shared-physics-only section and the resistance diagnostic (functions kept; the twin builds the shared physics itself;
+  diagnostic result in 5bl). Header "levels 1-4". Fixed a duplicate key in LEVEL_INFO that labelled Level 4
+  "Deep learning" in the level stepper.
+- Assessment Level 4 options: PINN (original inputs) + ablation; PINN twin core (best before the GA); GA-PINN.
+- Demo test: GA file under demo names auto-loaded in a fresh session; Level 4 trained all three (S001 got B0005's
+  winner h48 | lambda 0.3 | p 0 | accel off).
+- GA results now EMBEDDED in app.py (GA_EMBEDDED_CSV, 131 evaluations, 16 KB): app.py alone is enough; a
+  results/ga_pinn_evaluations.csv (newer run / restore) takes precedence. Embedded copy parses to the 8 winners of 5bx.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).
