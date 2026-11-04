@@ -1208,6 +1208,35 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - GA results now EMBEDDED in app.py (GA_EMBEDDED_CSV, 131 evaluations, 16 KB): app.py alone is enough; a
   results/ga_pinn_evaluations.csv (newer run / restore) takes precedence. Embedded copy parses to the 8 winners of 5bx.
 
+## 5ch. Colab notebook for an extended GA-PINN study (user request; runs the same engine)
+- GA_PINN_extended_search.ipynb (21 cells) + twin_engine.py 5.42.0; inputs battery_master_data.parquet (+ optional
+  impedance_ground_truth.parquet) in a Drive folder; every evaluation appended to evaluations_raw.csv (resumable).
+- Addresses the five limits: (1) larger GA (12 x 8) + optional full grid of 324; (2) re-ranking under 36 weightings,
+  winner stability; (3) 3 seeds per configuration, paired gain / SE vs the default; (4) balanced random design of 36
+  configurations + OLS of within-battery rank on genes with bootstrap CI; (5) B0005 oracle check (test-future error,
+  diagnosis only) + causal self-tuning backtest every 20 cycles.
+- Output ga_pinn_evaluations_colab_<BATTERY>.csv in the platform format (+ fitness_sd, n_seeds): restore or embed.
+- Parallel use (user: one notebook per battery): MODE = "run" + BATTERY per notebook, own file
+  evaluations_raw_<BATTERY>.csv (no concurrent writes); MODE = "merge" combines all files -> ..._ALL.csv and the
+  cross-battery analyses; the B0005 self-tuning table is saved by B0005's notebook (selftuning_B0005.csv).
+  Bug found by the merge test and fixed: reloaded evaluations lost column names (itertuples renames "late bias (pts)"),
+  which also broke resuming; now to_dict("records"). Demo: 2 parallel runs + merge + resume (5 s, nothing recomputed).
+- Smoke-tested end to end on the synthetic demo (DEMO = True). NASA cost: about 22 s per evaluation -> roughly 1.5-2 h
+  per battery with 3 seeds (about 15 h for 8 batteries; budget 11 h per session, re-run to resume); full grid about
+  6 h per battery.
+
+## 5ci. GA-PINN searched on demand in Mission 2 (Level 4 and assessment), like the other models (app-only)
+- User: restored results were not used on the Models page; GA-PINN should train for any battery like other models.
+  Cause: saved GA winners are per battery at the TWIN's live start with the group's training batteries; Level 4 and
+  the assessment use other forecast starts / training sets (and other batteries), so no winner matched.
+- ga_search_key(ct, data_key, battery, n0, train): reuses a saved search only when battery, start and training set are
+  identical; otherwise runs the GA now (population / generations of the GA-PINN section, default 6 x 4), nested
+  fitness on the given training batteries, every evaluation disk-backed (re-run instant). Level 4: search at the
+  scheme's start and training set. Assessment: search per held-out battery at its origin (safe_origin of
+  origin x recorded life) with the group's other batteries. The twin keeps its own saved / embedded winners.
+- Demo test without any saved GA: Level 4 searched (6 evaluations) and trained GA-PINN, re-run 1.9 s; assessment ran
+  4 searches and scored GA-PINN on all 4 batteries. Cost on NASA: about 5-6 min per battery the first time.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

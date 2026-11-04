@@ -5524,11 +5524,45 @@ ASSESS_SECONDS = {"PINN": 8.0, "PINN-ablation": 4.0, "PINN-full": 9.0, "PINN-ful
 GA_ASSESS_KEY = "pinn:GA-PINN"            # virtual key: the held-out battery's own GA winner (STATUS 5cf)
 
 
+def ga_search_key(ct_: pd.DataFrame, data_key: str, c: str, n0: int, train: Sequence[str],
+                  note: Optional[Any] = None) -> Optional[str]:
+    """GA-PINN for ANY battery, forecast start and training batteries (STATUS 5ci): reuse a saved search when it is
+    the same situation, otherwise run the search now (population and generations of the GA-PINN section, default
+    6 x 4; every evaluation saved on disk, so a re-run is instant). Nested fitness: only the training batteries'
+    futures are scored. Returns the winner's key."""
+    train_t = tuple(sorted(x for x in train if x != c))
+    saved = (st.session_state.get("ga_pinn") or {}).get(c) or {}
+    if saved.get("done") and saved.get("n0") == int(n0) and tuple(sorted(saved.get("train") or ())) == train_t:
+        return saved.get("best_key")
+    runs = st.session_state.setdefault("ga_runs", {})
+    rk = (data_key, c, int(n0), train_t)
+    if rk in runs and runs[rk].get("done"):
+        return runs[rk]["best_key"]
+    pop = int(st.session_state.get("ga_pop", 6))
+    gens = int(st.session_state.get("ga_gens", 4))
+    count = {"n": 0}
+
+    def evaluate(g: Dict[str, Any]) -> float:
+        count["n"] += 1
+        if note is not None:
+            note.caption(f"GA-PINN search for {c} (forecast start {int(n0)}): evaluation {count['n']} "
+                         f"(about {pop + 2 * (gens - 1) + 3} in total; saved, so a re-run is instant)")
+        return ga_fitness_cached(ct_, imp, data_key, c, train_t, int(n0), float(eol_ah),
+                                 tuple(sorted(g.items())))["fitness"]
+    run = te.ga_pinn_run(evaluate, pop, gens, seed=0)
+    runs[rk] = run
+    if note is not None:
+        note.empty()
+    return run.get("best_key") if run.get("done") else None
+
+
 def assess_ga_task(store: Any, ct_run: pd.DataFrame, dkey: str, cells_g: Tuple[str, ...], origin: float, c: str
                    ) -> pd.DataFrame:
     """GA-PINN in the assessment: run the held-out battery's own GA winner (chosen without it) and relabel the rows
     so all batteries count as one model. Empty when the battery has no GA result."""
-    gk = ga_winner_key(c)
+    good = ct_run[(ct_run["Cell_ID"] == c) & ~ct_run["outlier"]].sort_values("n")
+    n0, _ = te.safe_origin(ct_run, c, int(max(10, round(float(origin) * int(good["n"].max())))))
+    gk = ga_search_key(ct_run, dkey, c, int(n0), [x for x in cells_g if x != c], st.empty())
     if not gk:
         return pd.DataFrame()
     r = assess_task_cached(store, ct_run, imp, dkey, cells_g, gk, float(origin), c, float(eol_ah)).copy()
@@ -5626,7 +5660,7 @@ def assessment_section() -> None:
             if k == GA_ASSESS_KEY:
                 r_ga = assess_ga_task(store, ct_run, dkey, cells_g, float(o), c)
                 if not len(r_ga):
-                    st.warning(f"GA-PINN on {c}: no GA result for this battery (run or restore the GA first).")
+                    st.warning(f"GA-PINN on {c}: the search did not finish.")
                 else:
                     parts.append(r_ga)
             else:
@@ -6067,11 +6101,11 @@ def model_level_section(level: int, title: str, intro: str, models: Dict[str, st
                 try:
                     prm = params.get(m)
                     m_fit = m
-                    if level == 4 and m == "GA-PINN":       # this battery's own GA winner (STATUS 5cf)
-                        gk = ga_winner_key(t)
+                    if level == 4 and m == "GA-PINN":       # GA search for this battery, start and training set
+                        tr_ga = list(tr_key) if tr_key else [x for x in te.v2_training_pool(ct, t) if x != t]
+                        gk = ga_search_key(ct, DATA_KEY, t, int(sc["n0"][t]), tr_ga, st.empty())
                         if not gk:
-                            st.warning(f"GA-PINN on {t}: no GA result for this battery. Run the GA or restore it "
-                                       "(Integrated twin page, GA-PINN section).")
+                            st.warning(f"GA-PINN on {t}: the search did not finish.")
                             continue
                         m_fit, prm = gk.split(":", 1)[1], None
                     if self_opt and m_fit == m:
@@ -6624,9 +6658,9 @@ def pinn_section() -> None:
         "cut-off voltage as an input with a depth term, a start that ignores NASA's low first cycle, and 3 averaged "
         "trainings. **GA-PINN** is the same physics-informed network with the "
         "settings a genetic algorithm chose for this battery: network size, learning rate, physics weight, the form "
-        "of the SEI law and an optional acceleration term, judged only on the other batteries (nested leave-one-out; "
-        "run or restore the GA on the Integrated twin page first). It is trained here from this battery's training | "
-        "test line, like the PINN, so both are compared on the same forecast.",
+        "of the SEI law and an optional acceleration term, judged only on the other batteries (nested leave-one-out). "
+        "The search runs here for the selected battery, forecast start and training batteries, like any other model "
+        "(a few minutes per battery the first time on NASA; every evaluation is saved, so a re-run is instant).",
         {"PINN": te.PINN_MODELS["PINN"],
          "PINN-twin": "PINN twin core · best PINN before the GA (cut-off input, burn-in start, 3 seeds)",
          "GA-PINN": "GA-PINN · this battery's genetic-algorithm winner (settings and physics form chosen by the GA)"},
