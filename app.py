@@ -6519,11 +6519,44 @@ def est_ga_cached(_ct: pd.DataFrame, key: str, train: Tuple[str, ...], pop: int,
     return backed("soh_est_ga", lambda: te.ga_estimation(_ct, list(train), pop, gens), key, train, pop, gens)
 
 
-def run_estimator(cell: str, train: Sequence[str], choice: str) -> Dict[str, Any]:
-    """One estimator for one battery; the battery's capacity / SOH is never used (engine test)."""
+def ga_est_resumable(train_t: Tuple[str, ...], deadline: Optional[float], note: Optional[Any] = None) -> Dict[str, Any]:
+    """GA for the estimation PINN, resumable: every PINN training (one held-out training battery, one setting) is saved
+    the moment it finishes, so a press stopped at the time budget continues on the next press. Fitness = leave each
+    TRAINING battery out: RMSE + 0.5 |late bias| (the battery being estimated is not among them)."""
+    count = {"n": 0}
+    total = 16 * len(train_t)
+
+    def evaluate(g: Dict[str, Any]) -> float:
+        gj = json.dumps({k: (int(v) if k == "accel" else v) for k, v in g.items()}, sort_keys=True, default=float)
+        err, late = [], []
+        for v in train_t:
+            if deadline is not None and time.time() > deadline:
+                raise TimeoutError
+            r = est_cached(CT_RAW, DATA_KEY, v, tuple(sorted(x for x in train_t if x != v)), "PINN-est", gj)
+            count["n"] += 1
+            if note is not None:
+                note.caption(f"GA training {count['n']} of about {total} (each saved; a stopped press continues)")
+            e = r["pred"] - r["soh"]; err.append(e); late.append(float(np.mean(e[-max(1, len(e) // 3):])))
+        rmse, lb = 100 * float(np.sqrt(np.mean(np.concatenate(err) ** 2))), 100 * float(np.mean(late))
+        return rmse + 0.5 * abs(lb)
+    try:
+        run = te.ga_pinn_run(evaluate, 6, 4, seed=0)
+    except TimeoutError:
+        return {"done": False}
+    best = te.ga_pinn_genome(run["best_key"]) if run.get("best_key") else dict(te.GA_PINN_START)
+    best["accel"] = int(bool(best.get("accel", 0)))
+    return {"done": True, "best": best}
+
+
+def run_estimator(cell: str, train: Sequence[str], choice: str, deadline: Optional[float] = None,
+                  note: Optional[Any] = None) -> Optional[Dict[str, Any]]:
+    """One estimator for one battery; the battery's capacity / SOH is never used (engine test). Returns None when
+    the GA-PINN search stopped at the time budget (press again to continue)."""
     train_t = tuple(sorted(train))
     if choice == "GA-PINN-est":
-        ga = est_ga_cached(CT_RAW, DATA_KEY, train_t, 6, 4)
+        ga = ga_est_resumable(train_t, deadline, note)
+        if not ga["done"]:
+            return None
         g = ga["best"]
         r = dict(est_cached(CT_RAW, DATA_KEY, cell, train_t, "PINN-est", json.dumps(g, sort_keys=True, default=float)))
         r["label"] = "Estimation GA-PINN · " + te.ga_pinn_key(g).split("|", 1)[1]
@@ -6557,15 +6590,26 @@ def soh_estimation_section() -> None:
                             help="The GA-PINN option runs a GA on the training batteries first (several minutes the "
                                  "first time; saved afterwards).")
     train = [x for x in cells if x != cell]
+    budget = 15
+    if "GA-PINN-est" in models:
+        budget = st.number_input("Time budget per press for the GA-PINN search (minutes)", 2, 60, 15, key="est_budget",
+                                 help="The GA trains about 16 settings x each training battery; every training is "
+                                      "saved, so a press that reaches the budget continues on the next press.")
     b1, b2 = st.columns(2)
     if b1.button("Estimate this battery", key="est_go", type="primary", icon=":material/monitor_heart:"):
-        res = {}
+        res, note, deadline = {}, st.empty(), time.time() + 60 * float(budget)
         for m in models:
             with st.spinner(f"{EST_CHOICES[m]}…"):
                 try:
-                    res[m] = run_estimator(cell, train, m)
+                    r = run_estimator(cell, train, m, deadline, note)
+                    if r is None:
+                        st.info("The GA-PINN search reached the time budget: press **Estimate this battery** again "
+                                "to continue (finished trainings are saved).")
+                    else:
+                        res[m] = r
                 except Exception as exc:
                     report_error(f"{m} on {cell}", exc, False)
+        note.empty()
         st.session_state["est_one"] = {"key": (DATA_KEY, grp, cell, tuple(models)), "res": res}
     if b2.button("Every battery of the group (each held out)", key="est_all", icon=":material/groups:"):
         rows, bar = [], st.progress(0.0)
@@ -6573,7 +6617,10 @@ def soh_estimation_section() -> None:
             for m in models:
                 bar.progress((i + 1) / len(cells), text=f"{c} · {EST_CHOICES[m]}")
                 try:
-                    r = run_estimator(c, [x for x in cells if x != c], m)
+                    r = run_estimator(c, [x for x in cells if x != c], m, time.time() + 60 * float(budget))
+                    if r is None:
+                        st.info(f"{c}: the GA-PINN search reached the time budget; press again to continue.")
+                        continue
                     rows.append({"battery": c, "estimator": EST_CHOICES[m], "RMSE (SOH pts)": r["rmse"], "R²": r["r2"]})
                 except Exception as exc:
                     report_error(f"{m} on {c}", exc, False)

@@ -1486,6 +1486,10 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - App: Models & forecasting, first section "Mission 2 · SOH estimation": group, battery, estimators (GPR, estimation
   PINN default, estimation GA-PINN with GA on the training batteries), one battery (plot + band + table) or every
   battery of the group (LOBO table, CSV); "estimator for the twin's field mode" selector kept for the next release.
+- App-only follow-up: the estimation GA-PINN search is resumable (every PINN training saved as it finishes through
+  est_cached; time budget per press, default 15 min; progress line); NASA cost ~16 settings x 4 training batteries =
+  ~64 trainings (30-60 min on Streamlit Cloud). Demo: 2-min budget, press 1 stopped, press 2 finished in 16 s with the
+  same winner as an uninterrupted run.
 - 42 tests pass; all pages; md_check 0. Next: field-mode anchor with the chosen estimator + update study; estimate-vs-
   forecast fault indicator (validate on simulated faults); platform restructure.
 
