@@ -53,7 +53,8 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.42.0"
+ENGINE_VERSION = "5.43.0"
+CACHE_VERSION = "5.42.0"      # bump only when an EXISTING computation changes (5.43.0 only adds SOH estimation)
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
 DEFAULT_EOL_AH = 1.4
@@ -11799,3 +11800,208 @@ def m3_lifecycle_study(h: Dict[str, Any], ct: pd.DataFrame, lives: Dict[str, Tup
     parts = [_summ(g).assign(group=gname) for gname, g in per.groupby("group")] + [_summ(per).assign(group="all")]
     summ = pd.concat(parts).rename_axis("strategy").reset_index().set_index(["group", "strategy"])
     return per, summ
+
+
+
+# =====================================================================================================================
+# 59. SOH estimation: today's SOH from today's measurements (v5.43.0, STATUS 5da)
+#     Honest indicators (no capacity, no discharge time): charge between 3.8 and 3.5 V on discharge (qv grid), CC and
+#     CV charge times; cleaned, smoothed, relative to each battery's first 5 cycles. Two estimators, switchable by name:
+#     "GPR" (Gaussian process, Matern 1.5, one length scale per input) and "PINN-est" (estimation-mode PINN: the same
+#     rate laws, shared by all batteries, enforced on every measured cycle; inputs include the cycle's indicators; no
+#     battery code). The test battery's capacity / SOH is never used (tests/test_estimation.py checks it).
+# =====================================================================================================================
+ESTIMATION_FEATURES: Tuple[str, ...] = ("dQ_3.8_3.5V", "t_cc_s", "t_cv_s")
+ESTIMATION_MODELS: Dict[str, str] = {
+    "GPR": "GPR · Gaussian process on honest indicators (Matern 1.5, one length scale per input)",
+    "PINN-est": "Estimation PINN · physics-informed, inputs = clock + conditions + the cycle's indicators"}
+EST_C_NOM = 2.0                                          # ageing clock uses the nominal capacity, never the measured one
+
+
+def _est_hampel(s: pd.Series, window: int = 9, k: float = 4.0, min_abs: float = 0.0,
+                min_rel: float = 0.0) -> Tuple[pd.Series, pd.Series]:
+    med = s.rolling(window, center=True, min_periods=3).median()
+    mad = (s - med).abs().rolling(window, center=True, min_periods=3).median() * 1.4826
+    lim = np.maximum(np.maximum(k * mad, min_abs), min_rel * med.abs())
+    return ((s - med).abs() > lim).fillna(False), med
+
+
+def _est_conditions(g: pd.DataFrame) -> np.ndarray:
+    T = float(g["T_mean_C"].median()) + 273.15
+    I = float(g["I_dis_A"].median()) if g["I_dis_A"].notna().any() else 2.0
+    V = float(g["V_min_V"].median())
+    return np.array([1000 * (1 / 298.15 - 1 / T), max(0.0, 15 - (T - 273.15)) / 10, math.log(max(I, 0.1) / 2.0),
+                     max(0.0, 2.7 - V) / 0.7])
+
+
+def estimation_table(ct: pd.DataFrame, cells: Sequence[str], blind: Sequence[str] = ()) -> pd.DataFrame:
+    """One row per discharge cycle: SOH, the relative indicators, the cycle clock and the operating conditions.
+    Training batteries (not in `blind`): invalid first cycles (capacity < 93 % of the stable level of cycles 6-25),
+    capacity outliers and far random SOH points (Hampel, >= 3 points) are dropped. Blind batteries (the ones being
+    estimated): NOTHING is selected from their capacity / SOH -- all their cycles are kept, their indicators and
+    baseline come from their measurements only, and the SOH-based checks only set the column `score_ok` (scoring).
+    Far indicator values are replaced by the local median (>= 5 %) for every battery."""
+    i38 = int(np.argmin(np.abs(QV_GRID - 3.8))); i35 = int(np.argmin(np.abs(QV_GRID - 3.5)))
+    out = []
+    for c in cells:
+        is_blind = c in blind
+        g = ct[ct["Cell_ID"] == c].sort_values("n").copy()
+        if not is_blind:
+            g = g[~g["outlier"]]
+        if len(g) < 15:
+            continue
+        g["dQ_3.8_3.5V"] = g[f"qv_{i35:02d}"] - g[f"qv_{i38:02d}"]
+        soh_ok = g["SOH"].notna() & ~g["outlier"]
+        stable = float(g.loc[soh_ok, "SOH"].iloc[5:25].median()) if soh_ok.sum() > 25 else float(g.loc[soh_ok, "SOH"].median())
+        first = 0
+        sv = g["SOH"].to_numpy(float)
+        while first < min(15, len(g) - 10) and (not np.isfinite(sv[first]) or sv[first] < 0.93 * stable):
+            first += 1
+        f_soh, _ = _est_hampel(g["SOH"], min_abs=0.03)
+        score_ok = soh_ok.to_numpy() & ~f_soh.to_numpy() & (np.arange(len(g)) >= first)
+        if is_blind:
+            g["score_ok"] = score_ok
+        else:
+            g = g[score_ok].copy(); g["score_ok"] = True
+        for col in ESTIMATION_FEATURES:
+            s = g[col].astype(float)
+            f, med = _est_hampel(s, min_rel=0.05)
+            s[f.to_numpy()] = med[f].to_numpy()
+            g[col] = s
+        F = g[list(ESTIMATION_FEATURES)].astype(float).interpolate(limit_direction="both")
+        F = F.rolling(5, center=True, min_periods=1).median()
+        base = F.head(5).median().replace(0, np.nan)
+        F = F / base
+        x = _est_conditions(g)                         # operating conditions (temperature, current, cut-off voltage)
+        res = pd.DataFrame({"Cell_ID": c, "n": g["n"].to_numpy(), "SOH": g["SOH"].to_numpy(float),
+                            "score_ok": g["score_ok"].to_numpy(bool)})
+        for col in ESTIMATION_FEATURES:
+            res[col + "_rel"] = F[col].to_numpy(float)
+        res["cycle_rel"] = np.arange(1, len(g) + 1) / 100.0
+        res["a"] = res["cycle_rel"] * 100 * EST_C_NOM / 300
+        for j, name in enumerate(("xT", "xC", "xI", "xV")):
+            res[name] = x[j]
+        out.append(res.dropna(subset=[f + "_rel" for f in ESTIMATION_FEATURES]))
+    return pd.concat(out, ignore_index=True) if out else pd.DataFrame()
+
+
+def _est_gpr(Xtr: np.ndarray, ytr: np.ndarray, Xte: np.ndarray, restarts: int = 3, seed: int = 0):
+    from sklearn.gaussian_process import GaussianProcessRegressor
+    from sklearn.gaussian_process.kernels import ConstantKernel, Matern, WhiteKernel
+    mu, sd = Xtr.mean(0), Xtr.std(0) + 1e-9
+    k = ConstantKernel(1.0, (1e-3, 1e3)) * Matern(np.ones(Xtr.shape[1]), (1e-2, 1e3), nu=1.5) + WhiteKernel(1e-4, (1e-8, 1e-1))
+    gp = GaussianProcessRegressor(k, normalize_y=True, n_restarts_optimizer=restarts, random_state=seed)
+    gp.fit((Xtr - mu) / sd, ytr)
+    m, s = gp.predict((Xte - mu) / sd, return_std=True)
+    return np.asarray(m, float), np.asarray(s, float)
+
+
+def _est_pinn(Xtr: np.ndarray, ytr: np.ndarray, Xall: np.ndarray, Xte: np.ndarray, p: Dict[str, Any],
+              seed: int = 0) -> np.ndarray:
+    """Estimation-mode PINN. Columns of X: [a, xT, xC, xI, xV, indicators...]. SOH misfit on the training rows; rate
+    laws (shared, no per-battery multipliers) enforced on all measured rows (target rows: measurements only)."""
+    rng = np.random.default_rng(seed)
+    mu, sd = Xall.mean(0), Xall.std(0) + 1e-9
+    H = int(p["hidden"])
+    g_ = lambda *s_: Tensor(rng.normal(0, 1 / math.sqrt(s_[0]), size=s_))
+    W1, b1 = g_(Xall.shape[1], H), Tensor(np.zeros((1, H)))
+    W2, b2 = g_(H, H), Tensor(np.zeros((1, H)))
+    W3, b3 = Tensor(rng.normal(0, 0.01, size=(H, 3))), Tensor(np.full((1, 3), -2.0))
+    phys = {"k_sei": Tensor([[math.log(0.004)]]), "k_pl": Tensor([[math.log(0.01)]]), "k_lam": Tensor([[math.log(0.05)]]),
+            "b_T": Tensor([[3.6]]), "b_C": Tensor([[1.0]]), "a_I": Tensor([[0.5]]), "a_L": Tensor([[0.3]]),
+            "a_V": Tensor([[0.5]]), "c": Tensor([[math.log(2.0)]])}
+    sei_p = float(p.get("sei_p", 1.0)); accel = bool(p.get("accel", False))
+    if accel:
+        phys["k_acc"] = Tensor([[math.log(5.0)]])
+    params = [W1, b1, W2, b2, W3, b3] + list(phys.values())
+    sel = [Tensor(np.eye(3)[:, [j]]) for j in range(3)]
+
+    def states(X):
+        h = (Tensor((X - mu) / sd) @ W1 + b1).tanh()
+        h = (h @ W2 + b2).tanh()
+        st_ = (h @ W3 + b3).softplus() * 0.25 * Tensor(X[:, [0]])
+        return [st_ @ sel[j] for j in range(3)]
+
+    def soh(S):
+        return (1.0 - S[0] - S[1]) * (1.0 - S[2])
+
+    hstep = 0.01
+    X2 = Xall.copy(); X2[:, 0] += hstep
+    xT, xC, xI, xV = (Tensor(Xall[:, [k]]) for k in (1, 2, 3, 4))
+    opt = Adam(params, lr=float(p["learning_rate"]))
+    lam_w = float(p["physics_weight"])
+    Y = Tensor(ytr[:, None])
+    for _ in range(int(p["iterations"])):
+        loss = (soh(states(Xtr)) - Y).square().mean() * (1 / 0.01 ** 2)
+        if lam_w > 0:
+            S1, S2 = states(Xall), states(X2)
+            d = [(S2[j] - S1[j]) * (1 / hstep) for j in range(3)]
+            f_sei = (phys["k_sei"] + phys["b_T"] * xT).exp() / ((S1[0] + 0.005).log() * sei_p).exp()
+            f_pl = (phys["k_pl"] + phys["b_C"] * xC + phys["a_I"] * xI).exp() * (1.0 + phys["c"].exp() * S1[2] * 20.0)
+            f_lam = (phys["k_lam"] + phys["a_L"] * xI + phys["a_V"] * xV).exp()
+            if accel:
+                f_lam = f_lam * (phys["k_acc"].exp() * (S1[0] + S1[1] + S1[2])).exp()
+            res = ((d[0] - f_sei).square() + (d[1] - f_pl).square() + (d[2] - f_lam).square()).mean()
+            loss = loss + res * (lam_w / 0.05 ** 2)
+        for q in params:
+            q.grad = np.zeros_like(q.data)
+        loss.backward()
+        opt.step()
+    return np.asarray(soh(states(Xte)).data, float).ravel()
+
+
+def _est_matrix(tab: pd.DataFrame, kind: str) -> np.ndarray:
+    feats = [f + "_rel" for f in ESTIMATION_FEATURES]
+    cols = feats + ["cycle_rel"] if kind == "GPR" else ["a", "xT", "xC", "xI", "xV"] + feats
+    return tab[cols].to_numpy(float)
+
+
+def estimate_soh(ct: pd.DataFrame, test_cell: str, train_cells: Sequence[str], kind: str = "GPR",
+                 params: Optional[Dict[str, Any]] = None, seed: int = 0) -> Dict[str, Any]:
+    """Estimate the SOH of test_cell at every kept cycle from its measured indicators, with a model trained on
+    train_cells only. The test battery's SOH is used only for scoring, never for training."""
+    tab = estimation_table(ct, list(train_cells) + [test_cell], blind=[test_cell])
+    tr, te_ = tab[tab["Cell_ID"].isin(train_cells)], tab[tab["Cell_ID"] == test_cell]
+    if tr.empty or te_.empty:
+        raise ValueError(f"no usable cycles for {test_cell} or its training batteries")
+    std = None
+    if kind == "GPR":
+        pred, std = _est_gpr(_est_matrix(tr, kind), tr["SOH"].to_numpy(float), _est_matrix(te_, kind), seed=seed)
+    elif kind == "PINN-est":
+        g = dict(GA_PINN_START); g.update(params or {})
+        pred = _est_pinn(_est_matrix(tr, kind), tr["SOH"].to_numpy(float), _est_matrix(tab, kind),
+                         _est_matrix(te_, kind), g, seed=seed)
+    else:
+        raise ValueError(f"unknown estimation model {kind!r}")
+    ok = te_["score_ok"].to_numpy(bool)                  # scoring only: never used by the model
+    y_all = te_["SOH"].to_numpy(float)
+    y, pr = y_all[ok], pred[ok]
+    ss = float(np.sum((y - y.mean()) ** 2))
+    return {"cell": test_cell, "kind": kind, "params": params, "n": te_["n"].to_numpy(int)[ok], "soh": y, "pred": pr,
+            "std": None if std is None else std[ok], "n_all": te_["n"].to_numpy(int), "pred_all": pred,
+            "rmse": 100 * float(np.sqrt(np.mean((pr - y) ** 2))),
+            "r2": 1 - float(np.sum((y - pr) ** 2)) / ss if ss > 0 else float("nan"), "train": list(train_cells)}
+
+
+def ga_estimation(ct: pd.DataFrame, train_cells: Sequence[str], pop: int = 6, gens: int = 4, seed: int = 0,
+                  deadline: Optional[float] = None) -> Dict[str, Any]:
+    """GA over GA_PINN_GENES for the estimation PINN; fitness = leave each TRAINING battery out: RMSE + 0.5 |late
+    bias| (SOH points). The battery to be estimated is not among train_cells."""
+    cache: Dict[Tuple, Dict[str, float]] = {}
+    names = list(GA_PINN_GENES)
+
+    def evaluate(g: Dict[str, Any]) -> float:
+        k = tuple(g[n] for n in names)
+        if k not in cache:
+            err, late = [], []
+            for v in train_cells:
+                r = estimate_soh(ct, v, [x for x in train_cells if x != v], "PINN-est", g)
+                e = r["pred"] - r["soh"]; err.append(e); late.append(float(np.mean(e[-max(1, len(e) // 3):])))
+            rmse, lb = 100 * float(np.sqrt(np.mean(np.concatenate(err) ** 2))), 100 * float(np.mean(late))
+            cache[k] = {"fitness": rmse + 0.5 * abs(lb), "RMSE": rmse, "late bias": lb}
+        return cache[k]["fitness"]
+    run = ga_pinn_run(evaluate, pop, gens, seed=seed, deadline=deadline)
+    best = ga_pinn_genome(run["best_key"]) if run.get("best_key") else dict(GA_PINN_START)
+    best["accel"] = int(bool(best.get("accel", 0)))
+    table = pd.DataFrame([{"settings": ga_pinn_key(dict(zip(names, k))).split("|", 1)[1], **v} for k, v in cache.items()])
+    return {"best": best, "table": table.sort_values("fitness").reset_index(drop=True), "done": bool(run.get("done"))}

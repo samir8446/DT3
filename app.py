@@ -49,7 +49,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.42.0"
+REQUIRED_ENGINE = "5.43.0"
 if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
@@ -2206,10 +2206,11 @@ def backed(name: str, compute: Callable[[], Any], *parts: Any) -> Any:
     import hashlib
     import pickle
     h = hashlib.sha1()
-    h.update(f"{name}|{te.ENGINE_VERSION}".encode())
+    cv = getattr(te, "CACHE_VERSION", te.ENGINE_VERSION)   # results stay valid across releases that add features
+    h.update(f"{name}|{cv}".encode())
     for p_ in parts:
         _fingerprint(h, p_)
-    path = CACHE_DIR / f"{name}__{te.ENGINE_VERSION}__{h.hexdigest()[:20]}.pkl"
+    path = CACHE_DIR / f"{name}__{cv}__{h.hexdigest()[:20]}.pkl"
     if path.exists():
         try:
             with open(path, "rb") as f_:
@@ -2229,7 +2230,7 @@ def backed(name: str, compute: Callable[[], Any], *parts: Any) -> Any:
 
 
 def cache_backup_panel() -> None:
-    files = sorted(CACHE_DIR.glob(f"*__{te.ENGINE_VERSION}__*.pkl")) if CACHE_DIR.exists() else []
+    files = sorted(CACHE_DIR.glob(f"*__{getattr(te, 'CACHE_VERSION', te.ENGINE_VERSION)}__*.pkl")) if CACHE_DIR.exists() else []
     with st.expander(f"Result backup · {len(files)} saved result(s)", icon=":material/backup:"):
         st.caption("Heavy results (live replays, frozen models, anomaly scan, shared physics, hybrid) are saved here and "
                    "reload instantly. To keep them after the app restarts, download the zip and upload its files to "
@@ -2724,7 +2725,7 @@ if store is None or ct is None:
 
 meta = te.cell_meta(ct)
 cells = list(meta.index)
-DATA_KEY = f"{store.key}|engine-{te.ENGINE_VERSION}"   # engine upgrades invalidate every cached result
+DATA_KEY = f"{store.key}|engine-{getattr(te, 'CACHE_VERSION', te.ENGINE_VERSION)}"   # changes only when an existing computation changes
 
 
 def _cell_label(cid: str) -> str:
@@ -6499,8 +6500,124 @@ def pinn_section() -> None:
                         "at their starting values.")
 
 
+# ------------------------------------------------------------------------------------------------------- SOH estimation
+EST_GROUPS = ("Reference", "Hot", "Cold", "Pulsed load", "High current")
+EST_CHOICES = {"GPR": "GPR · Gaussian process on honest indicators",
+               "PINN-est": "Estimation PINN · physics-informed, default settings",
+               "GA-PINN-est": "Estimation GA-PINN · settings chosen by the GA on the training batteries"}
+
+
+@st.cache_data(show_spinner=False, max_entries=600)
+def est_cached(_ct: pd.DataFrame, key: str, cell: str, train: Tuple[str, ...], kind: str, params_json: str) -> Dict[str, Any]:
+    params = json.loads(params_json)
+    return backed("soh_est", lambda: te.estimate_soh(_ct, cell, list(train), kind, params or None),
+                  key, cell, train, kind, params_json)
+
+
+@st.cache_data(show_spinner=False, max_entries=100)
+def est_ga_cached(_ct: pd.DataFrame, key: str, train: Tuple[str, ...], pop: int, gens: int) -> Dict[str, Any]:
+    return backed("soh_est_ga", lambda: te.ga_estimation(_ct, list(train), pop, gens), key, train, pop, gens)
+
+
+def run_estimator(cell: str, train: Sequence[str], choice: str) -> Dict[str, Any]:
+    """One estimator for one battery; the battery's capacity / SOH is never used (engine test)."""
+    train_t = tuple(sorted(train))
+    if choice == "GA-PINN-est":
+        ga = est_ga_cached(CT_RAW, DATA_KEY, train_t, 6, 4)
+        g = ga["best"]
+        r = dict(est_cached(CT_RAW, DATA_KEY, cell, train_t, "PINN-est", json.dumps(g, sort_keys=True, default=float)))
+        r["label"] = "Estimation GA-PINN · " + te.ga_pinn_key(g).split("|", 1)[1]
+    else:
+        r = dict(est_cached(CT_RAW, DATA_KEY, cell, train_t, choice, "null"))
+        r["label"] = EST_CHOICES[choice]
+    return r
+
+
+def soh_estimation_section() -> None:
+    """Mission 2 · estimation: what is the SOH now, from this cycle's measurements, without a capacity test."""
+    section("Mission 2 · SOH estimation · today's SOH from today's measurements")
+    st.markdown(
+        "Each cycle's **measured indicators** (charge between 3.8 and 3.5 V on discharge, CC and CV charge times; "
+        "cleaned, smoothed, relative to the battery's own first cycles) give its SOH **now**, without a capacity "
+        "test. Models are trained on the **other batteries of the group**; the battery being estimated never "
+        "contributes its capacity (an engine test changes it and checks that the estimate is identical). "
+        "Discharge time and energy are not used: at constant current they are the capacity itself. "
+        "Forecasting the future is the next section; this estimate is what the twin can use in field mode and for "
+        "fault detection.")
+    avail = [g for g in EST_GROUPS if len(te.protocol_cells(CT_RAW, g)) >= 3]
+    if not avail:
+        placeholder("No condition group has three or more batteries.")
+        return
+    c1, c2, c3 = st.columns([1, 1, 2.2])
+    grp = c1.selectbox("Group", avail, key="est_group")
+    cells = te.protocol_cells(CT_RAW, grp)
+    cell = c2.selectbox("Battery to estimate", cells, key="est_cell")
+    models = c3.multiselect("Estimators", list(EST_CHOICES), default=["GPR", "PINN-est"], format_func=EST_CHOICES.get,
+                            key="est_models",
+                            help="The GA-PINN option runs a GA on the training batteries first (several minutes the "
+                                 "first time; saved afterwards).")
+    train = [x for x in cells if x != cell]
+    b1, b2 = st.columns(2)
+    if b1.button("Estimate this battery", key="est_go", type="primary", icon=":material/monitor_heart:"):
+        res = {}
+        for m in models:
+            with st.spinner(f"{EST_CHOICES[m]}…"):
+                try:
+                    res[m] = run_estimator(cell, train, m)
+                except Exception as exc:
+                    report_error(f"{m} on {cell}", exc, False)
+        st.session_state["est_one"] = {"key": (DATA_KEY, grp, cell, tuple(models)), "res": res}
+    if b2.button("Every battery of the group (each held out)", key="est_all", icon=":material/groups:"):
+        rows, bar = [], st.progress(0.0)
+        for i, c in enumerate(cells):
+            for m in models:
+                bar.progress((i + 1) / len(cells), text=f"{c} · {EST_CHOICES[m]}")
+                try:
+                    r = run_estimator(c, [x for x in cells if x != c], m)
+                    rows.append({"battery": c, "estimator": EST_CHOICES[m], "RMSE (SOH pts)": r["rmse"], "R²": r["r2"]})
+                except Exception as exc:
+                    report_error(f"{m} on {c}", exc, False)
+        bar.empty()
+        st.session_state["est_all_res"] = {"key": (DATA_KEY, grp, tuple(models)), "rows": rows}
+    one = st.session_state.get("est_one")
+    if one and one["key"] == (DATA_KEY, grp, cell, tuple(models)) and one["res"]:
+        fig = go.Figure()
+        first = next(iter(one["res"].values()))
+        fig.add_trace(go.Scatter(x=first["n"], y=100 * first["soh"], mode="markers", name=f"measured SOH · {cell}",
+                                 marker=dict(size=5, color="#9AA3AD")))
+        colors = {"GPR": "#CC79A7", "PINN-est": "#56B4E9", "GA-PINN-est": "#009E73"}
+        rows = []
+        for m, r in one["res"].items():
+            col = colors.get(m, "#E69F00")
+            if r.get("std") is not None:
+                fig.add_trace(go.Scatter(x=np.r_[r["n"], r["n"][::-1]], y=100 * np.r_[r["pred"] + 1.96 * r["std"],
+                                         (r["pred"] - 1.96 * r["std"])[::-1]], fill="toself", opacity=0.15,
+                                         line=dict(width=0), fillcolor=col, name=f"{m} · 95 % band", hoverinfo="skip"))
+            fig.add_trace(go.Scatter(x=r["n"], y=100 * r["pred"], mode="lines", line=dict(color=col, width=2.6),
+                                     name=r["label"]))
+            rows.append({"estimator": r["label"], "R²": r["r2"], "RMSE (SOH pts)": r["rmse"],
+                         "training batteries": ", ".join(r["train"])})
+        fig.update_xaxes(title_text="Cycle"); fig.update_yaxes(title_text="SOH (%)")
+        show(style_fig(fig, P, 460, f"{cell}: SOH estimated from its measurements (none of its capacity used)"),
+             key="est_fig")
+        show_table(pd.DataFrame(rows).set_index("estimator").style.format({"R²": "{:.3f}", "RMSE (SOH pts)": "{:.2f}"}),
+                   note="Scored on the battery's valid cycles; RMSE is the better measure for batteries that barely fade.")
+    allr = st.session_state.get("est_all_res")
+    if allr and allr["key"] == (DATA_KEY, grp, tuple(models)) and allr["rows"]:
+        A = pd.DataFrame(allr["rows"])
+        piv = A.pivot_table(index="battery", columns="estimator", values="RMSE (SOH pts)")
+        piv.loc["MEAN"] = piv.mean()
+        show_table(piv.style.format("{:.2f}"), note=f"{grp}: RMSE (SOH points), each battery held out in turn.")
+        download("Download (CSV)", A.to_csv(index=False).encode(), f"soh_estimation_{grp}__v{te.ENGINE_VERSION}.csv",
+                 "text/csv", key="est_csv")
+    st.selectbox("Estimator the twin will use for its field mode and fault detection (next release)", list(EST_CHOICES),
+                 format_func=EST_CHOICES.get, key="twin_estimator",
+                 help="Kept for the next step: the twin re-anchored to this estimate when no capacity test exists.")
+
+
 def view_models() -> None:
     recommendations("models")
+    soh_estimation_section()            # Mission 2 · estimation (today's SOH from today's measurements)
     section("Forecasting models: from baselines to physics-informed networks (levels 1–4)")
     sc = scheme_controls()
     if not sc["targets"]:

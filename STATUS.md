@@ -1258,6 +1258,237 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - Checks: pyflakes no undefined names (caught a leftover 'basis', fixed); all pages; every Diagnostics tab; Integrated
   twin built; 36 tests.
 
+## 5ck. Colab extended GA study: B0005 results (3 seeds, 91 configurations)
+- Winner h32|lr0.01|w0.3|p1|a0|it600, mean fitness 4.80 (sd 0.26) vs default 7.23 (-34 %); default was 11.72 with one
+  seed on the platform -> single-seed fitness is noisy.
+- Limit 2 (weights): same winner under 64 % of 36 weightings, 2 distinct winners -> moderately robust.
+- Limit 3 (seeds): paired gain vs default 2.43, SE 2.07, gain/SE 1.2 (< 2-3) -> on B0005 the GA's improvement is NOT
+  established beyond training noise (default varies strongly across seeds).
+- Limit 4 (balanced design, OLS on within-battery rank, bootstrap 95 % CI): lambda 3 +0.38 (CI 0.12-0.61), SEI p 1
+  +0.30 (0.05-0.52), accel on +0.20 (0.02-0.36) all worse; lr 0.01 -0.23 (borderline better); hidden, iterations none.
+  -> lighter physics and steady SEI law better ON AVERAGE (the single winner uses p 1: interactions); acceleration term
+  not supported by B0005's training batteries.
+- Limit 5 (B0005): oracle-best configuration h16|lr0.002|w0.3|p0.5|a0|it600 error 8.45 SOH pts on B0005's future;
+  nested winner 9.76; default 10.57 -> even the best of 91 fails: model-form / information limit, not search.
+  Causal self-tuning backtest would pick the oracle-best at cycles 70 and 90 (90: 1.78 vs 2.38, 25 % better, above the
+  20 % margin) -> wider candidate set (e.g. top 10 of the balanced design) could help self-tuning after ~cycle 70.
+- Pending: other batteries (one per group) and the merge.
+
+## 5cl. Colab extended GA study: B0046 (Cold) + cross-group conclusions
+- B0046: 97 configurations x 3 seeds; winner h16|lr0.002|w0.3|p0|a1|it600 = the platform's B0046 winner (confirmed);
+  fitness 8.64 (sd 1.51) vs default 18.15 (-52 %); paired gain 9.51, SE 1.04, gain/SE 9.1 -> beyond noise; winner
+  under 50 % of 36 weightings (2 distinct winners); winner's oracle error on B0046 4.79 SOH pts.
+- Balanced design, Cold (B0046): lambda 1 +0.37 (CI 0.14-0.56), lambda 3 +0.45 (0.26-0.65) worse; hidden 32 +0.32,
+  48 +0.24 worse; accel on +0.21 (0.06-0.38) worse; SEI p 0.5 -0.21 (-0.38 to -0.01) better than p 0, p 1 n.s.
+- Cross-group: ROBUST = light physics weight (lambda 0.3) best in both groups; acceleration term not helpful on
+  average in both (winners using it = interaction). GROUP-DEPENDENT = SEI law (Reference: steady p 0 best, decelerating
+  p 1 worst; Cold: p 0.5 best, p 0 worst) -> CORRECTS 5bv/5bx "data rejects the decelerating SEI law" to Reference only.
+  Cold prefers small networks.
+- GA improvement beyond seed noise: yes for B0046 (9.1), not for B0005 (1.2).
+
+## 5cm. Colab raw-file analysis: GA fitness does NOT predict the test battery's forecast (B0005, B0046, B0029 partial)
+- evaluations_raw_B0046.csv also contained 78 evaluations of B0029 (Hot, 26 configurations x 3 seeds, unfinished):
+  analyse per battery. B0046 confirmed: winner h16|lr0.002|w0.3|p0|a1|it600 8.64 vs default 18.15.
+- Spearman (mean over seeds, configurations with 3 seeds) between GA fitness and the error on the battery's OWN future
+  (oracle): B0005 0.07, B0046 0.06, B0029 -0.09; components: validation RMSE 0.01 / 0.06 / -0.19, |late bias| 0.07 /
+  0.06 / 0.21, physics residual 0.03 / 0.16 / 0.21 -> none.
+- Real error best / GA winner / default: B0005 8.45 / 9.76 / 10.57 (config spread 0.57 = seed noise 0.54: no real
+  differences); B0046 4.02 / 4.79 / 4.08; B0029 1.33 / 2.29 / 2.27. Top-10 vs bottom-10 configurations: 9.83 vs 9.75,
+  4.57 vs 4.74, 2.23 vs 2.07.
+- Interpretation: with 3-4 training batteries cell-to-cell differences dominate; nested-validation selection does not
+  transfer to a new battery's single forecast. The GA reliably delivers group-level robust settings (lambda 0.3 in
+  both groups; small nets in Cold), training stability (B0005 top-10 seed sd ~0.4 vs default 3.7) and physical insight
+  (SEI law group-dependent), not per-battery gains. Twin: GA-PINN's advantage over frozen comes mainly from the PINN
+  twin core (cut-off input, burn-in, 3-seed ensemble, retraining); GA's own addition small (6.46 -> 6.25, bias 1.36 ->
+  0.99), consistent.
+- Recommendation: one robust configuration per group (lambda 0.3 family) or an average of the top configurations,
+  instead of per-battery winners. Pending: B0006, B0018 (and finishing B0029 if wanted).
+
+## 5cn. Colab: B0029 (Hot) complete (summary file; raw file pending for the oracle check)
+- 92 configurations x 3 seeds. Winner h48|lr0.005|w1|p0|a0|it900 fitness 0.82 (sd 0.02); default 1.28 (sd 0.16), rank
+  71/92; gain ~0.46, roughly 5x its uncertainty (unpaired estimate; paired test needs the raw file). Top-10 0.82-0.90.
+- Physics weight is GROUP-DEPENDENT: top-10 with lambda 0.3 = Reference 9/10, Cold 7/10, Hot 1/10 (Hot top configs use
+  lambda 1-3). Reading: strong physics helps where the equations fit the dominant mechanism (hot: SEI, Arrhenius),
+  light physics where they are misspecified (reference LAM, cold plating). Consistent with the early seed study
+  (physics helped only in Hot, 0.95 vs 1.43). CORRECTS 5cl "lambda 0.3 best in both groups" -> best in Reference and
+  Cold, not Hot. SEI p 0 in 7 of Hot's top 8.
+
+## 5co. Colab study, three groups complete (B0005 Reference, B0046 Cold, B0029 Hot; raw files; balanced design)
+- GA vs default beyond seed noise (paired gain/SE): B0029 4.6 yes, B0046 9.1 yes, B0005 1.2 no.
+- Fitness vs error on the battery's own future (Spearman): 0.07 / -0.27 / 0.06 (B0005 / B0029 / B0046); real error
+  GA winner vs default 9.76 vs 10.57, 2.29 vs 2.27, 4.79 vs 4.08 -> selection does not improve the held-out battery's
+  forecast in any group.
+- Balanced-design gene effects on within-battery rank (+ worse; * CI excludes 0), Reference / Hot / Cold: accel on
+  +0.20* / +0.23* / +0.21* (knee term not supported anywhere); SEI p 1 +0.30* / +0.25* / -0.13 (Cold: p 0.5 -0.21*);
+  lambda 3 +0.38* / +0.05 / +0.45*, lambda 1 +0.22 / -0.23 / +0.37*; hidden 32/48 Cold +0.31* / +0.24*.
+- Conclusions: GA value = group-level knowledge + training stability, not per-battery selection; physics weight
+  light where equations are misspecified (Reference, Cold), no penalty in Hot (SEI-dominated, equations fit).
+- Group configurations from these searches would be slightly leaky (a battery's search uses the other batteries'
+  futures); honest robust alternative = average of each battery's own top-k configurations (its nested search).
+- Pending: B0006, B0018 raw files.
+
+## 5cp. Colab: B0006 (Reference) -> B0005 is the exception; selection does not transfer (4 batteries)
+- B0006: 92 configs x 3 seeds; winner h48|lr0.002|w3|p0.5|a1|it600 6.66 (sd 0.53) vs default 8.85 (0.78), rank
+  32/92; gain/SE 4.7 (beyond noise). Fitness vs own-future error Spearman 0.02; real error best / winner / default
+  2.35 / 4.47 / 3.27 (winner worse than default); top-10 vs bottom-10 4.08 vs 4.40; top-10 with lambda 0.3: 3/10.
+  Balanced design: no significant gene effect (accel +0.10, p1 +0.19, lambda 3 +0.03).
+- Four batteries (B0005 / B0006 / B0029 / B0046): gain/SE 1.2 / 4.7 / 4.6 / 9.1; fitness-vs-real Spearman 0.07 /
+  0.02 / -0.27 / 0.06. Accel on worse in all four (3 significant) -> robust; SEI p 1 worse in 3 of 4 (2 significant),
+  not Cold; strong physics worse only in B0005 and B0046 -> lambda finding battery-dependent (corrects 5co wording
+  "light physics best in Reference").
+- B0005 = special case (oracle best 8.45 vs B0006 2.35). Limit is information (3-4 training batteries cannot select
+  settings for a new battery), not search (good configurations exist: B0006 best 2.35 vs default 3.27).
+- Pending: B0018.
+
+## 5cq. Colab GA study COMPLETE: five batteries, three groups (B0005, B0006, B0018 Reference; B0029 Hot; B0046 Cold)
+- B0018: 87 configs x 3 seeds; winner h16|lr0.01|w1|p0.5|a0|it600 5.42 (sd 0.66) vs default 11.10 (0.70), rank 78/87;
+  beyond noise (paired gain/SE very large); fitness vs own-future error Spearman 0.52; real error best / winner /
+  default 2.90 / 3.73 / 5.37; top-10 vs bottom-10 4.20 vs 5.52 -> the one battery where GA selection transfers.
+- Five batteries: GA beats default on its fitness beyond noise in 4/5 (not B0005); fitness predicts the real future in
+  1/5 (Spearman 0.07 / 0.02 / 0.52 / -0.27 / 0.06); real error GA winner vs default: better 2 (B0018 clear, B0005
+  within noise), equal 1 (B0029), worse 2 (B0006, B0046); mean 5.01 vs 5.11 -> equal on average.
+- Balanced-design gene effects (5 batteries): accel on worse in 5/5 (4 significant) = most robust; SEI p 1 worse in 4/5
+  (3 significant), Cold exception; lambda 3 worse in 3/5 (significant), never better -> light physics safe; lr 0.01
+  better in 2 Reference batteries; small nets better in B0018 and Cold.
+- Conclusions: GA value = stable settings + group-level physical evidence; per-battery selection transfers only when
+  the test battery resembles its training batteries; B0005 special case (no configuration forecasts it).
+- DECISION (proposed): GA-PINN stays the twin core with its current winners (scorecard 5by/5cc); Colab 3-seed winners not
+  swapped in (no average gain on the real future); the Colab study = robustness analysis + limitations in the thesis.
+
+## 5cr. Mission 2 accuracy assessment with GA-PINN (v5.42.0, origin 30 %, LOBO, on-demand GA per held-out battery)
+- Mean RMSE (SOH pts) GA-PINN / fleet shape / linear trend / persistence: Reference (5) 7.22 / 4.34 / 6.13 / 13.13;
+  Hot (4) 1.58 / 3.21 / 4.50 / 5.09; Cold (5) 6.58 / 3.20 / 11.67 / 10.70. Earlier same-protocol references (5h, 5bn):
+  frozen MLP 4.47, DT 0.95, GP 2.77; PINN v1 5.61 / 0.98 / 8.44.
+- Per battery GA-PINN: Reference B0005 10.16, B0006 3.39 (fleet 6.37), B0007 8.84, B0018 6.20, B0036 7.52; Hot 2.24 /
+  0.96 / 1.13 / 1.99; Cold B0041 3.39, B0045 14.57, B0046 4.79, B0047 5.76, B0048 4.41.
+- End-of-life error, Reference: GA-PINN 7.0 cycles vs fleet shape 32.0, linear trend 22.7 (better EOL placement).
+- VERDICT: as a stand-alone forecaster from 30 % (no re-anchoring / retraining) GA-PINN is NOT the best: frozen data
+  models remain the Mission 2 forecasters (and fleet shape is hard to beat in Reference / Cold). GA-PINN remains the best
+  twin core (5cc). Consistent with the Colab study (5cq): per-battery GA selection does not transfer to a single
+  long-horizon forecast. Optional: one combined assessment run (PINN v1, twin core, frozen winners + GA-PINN).
+
+## 5cs. More GA search does not help (winner's curse); physics + data ensemble test prepared
+- Simulation on the Colab raw files (2000 random subsets per size): as the search grows from 5 to 80 configurations the
+  chosen configuration's FITNESS improves strongly (B0046 15.0 -> 8.7) while its REAL error stays flat or worsens
+  (B0005 9.78 -> 9.89, B0006 3.73 -> 4.34, B0029 2.17 -> 2.27, B0046 4.52 -> 4.78; only B0018 4.08 -> 3.83); a random
+  configuration is as good or better in 4 of 5 (B0006 3.65); the oracle best in the set keeps improving (B0006 2.70 ->
+  2.36). -> Winner's curse with 3-4 validation batteries: more genes / larger search (incl. layers, lambda_bc of the
+  professor's plan) would improve the fitness, not the forecasts. Bottleneck = information for selection.
+- Next test (user agreed): physics + data ensemble, Mission2 walkthrough part 11: per held-out battery GA-PINN, PINN v1,
+  GP, MLP; te.ensemble_trajectories weights 1/CV^2 from training batteries only; compared with every single model.
+  Demo check OK (ensemble ties the best single, beats MLP / GP 4/4, GA-PINN / PINN v1 3/4).
+
+## 5ct. Colab GA notebook: POOL option (pooled training AND validation) + built-in forecast plot
+- POOL = True: training and GA cross-validation on every constant-condition battery except the test one (engine
+  "pooled": True -> NASA_PHYSICS_GROUPS protocol cells); forecast start kept = the per-group run's start (comparable);
+  files suffixed _pool (merge keeps pooled and per-group apart); self-tuning backtest skipped in POOL mode.
+- RUN_GA = False: only the default + 36 balanced configurations (enough to answer: does pooled validation make the
+  fitness predict the real error?). Suggested: B0006 and B0046, POOL = True, RUN_GA = False (~1.5-2 h each).
+- Part 10 (forecast plot with end-of-life markers) now built in; follows POOL. Demo: both modes + merge OK.
+- Prior evidence (5bp): pooled TRAINING gave no gain for PINN v2 (Reference 5.80 vs 5.83, Cold 7.38 vs 6.67).
+
+## 5cu. Pooled GA test, B0006 (balanced 36 + default, 3 seeds; twin start; ~18 pooled batteries)
+- Same 37 configurations, own group vs pooled: fitness-vs-real Spearman -0.19 vs -0.00; real error of best-fitness
+  configuration 4.47 vs 3.53, random configuration 3.65 vs 3.23 (chosen worse than random in both), top-10 vs bottom-10
+  3.90 vs 3.50 / 3.40 vs 3.38, oracle 2.35 vs 2.21; default 3.27 vs 3.78; ~29 s vs 12 s per evaluation.
+- -> Pooled VALIDATION does not fix the winner's curse (other groups age differently: more batteries help selection only
+  if they resemble the test battery). Pooled TRAINING: same configurations 3.65 -> 3.23 on average (pooled better on
+  22/37) but default worse (3.27 -> 3.78); contrasts with PINN v2 pooled (5bp, Reference 5.80 vs 5.83, Cold worse
+  6.67 -> 7.38). Pending: B0046 (Cold) to decide.
+
+## 5cv. Professor's idea: GA-PINN + GPR hybrid (walkthrough part 13)
+- Professor (meeting): GPR with an optimised loss, combined with GA-PINN, "fit" B0005 with 0.996 (likely R^2 of a fit
+  / interpolation; R^2 0.996 on B0005 ~ RMSE 0.55 SOH pts given SOH spread ~8-9 pts). Our B0005 numbers are forecasts
+  from 30 % of life (8-10 pts): different questions. Code not available -> built from the description.
+- Part 13: per held-out battery: GA-PINN (GA search 6x4 at the origin, or PINN twin core if USE_GA = False); GPR
+  trained on the PINN's errors on the OTHER batteries' futures (each forecast from the same life fraction, features
+  horizon, PINN prediction, SOH and slope at the origin); kernel Const*RBF(ARD)+White fitted by minimising the
+  negative log marginal likelihood, 5 restarts; hybrid = PINN + GPR correction, 80 % band from the GPR std. Scores:
+  RMSE, R^2 on the future, EOL error vs GA-PINN alone and GP alone. Second cell: GPR fit to one battery with 20 %
+  random cycles held out -> interpolation R^2 (explains 0.99-type numbers).
+- Demo check: hybrid 0.41 vs PINN 0.67 vs GP 1.32 (R^2 future 0.994); fit R^2 0.999. NASA pending.
+
+## 5cw. GPR / GA-PINN step-by-step study in Colab (B0005, none of its capacity used) + professor's 0.996 explained
+- Health indicators per discharge cycle (from the raw parquet): t(3.8->3.5 V), mean discharge V, temperature rise,
+  load-step R, CC / CV charge times; proxies = time to peak temperature and discharge time (= capacity at CC; t_peak_T
+  correlates ~1 with t_discharge).
+- GPR (Matern, ARD, ML-II with restarts), trained on B0006/B0007/B0018 (+B0036, the only 2.7 V cut-off like B0005):
+  absolute indicators 0.956; relative to own first 5 cycles + smoothed (chosen by LOBO CV on training batteries only)
+  0.957 -> with B0036 0.9636; backward feature selection by CV RMSE kept t(3.8-3.5 V), t_CC, t_CV -> 0.9630
+  (RMSE 1.97). Remaining error: late-life plateau (~75 % vs 70 %). Lessons: R^2 is a poor CV metric for B0036 (little
+  SOH variation) -> RMSE; B0005's 2.7 V cut-off outside the 2.2-2.5 V of its campaign.
+- Professor's 0.996 explained: with proxies, absolute 0.9816 (t_peak_T most important), relative + smoothed 0.9905
+  (RMSE 0.99) -> his result very likely used discharge-time-type features.
+- GA-PINN alone (JAX, cycle clock with nominal 2 Ah, conditions only, zero-shot): 0.7125 (default 0.7095), GA chose
+  p 1 -> steep early, too flat late. GPR + GA-PINN, residual correction (chosen by LOBO CV): R^2 0.9753, RMSE 1.61,
+  fixes the late-life plateau -> professor's combination validated honestly.
+- Improved PINN (measured resistance in the loss for all batteries incl. target, shared physics, LOBO GA): mechanism
+  recovery test (8 simulated batteries, known splits, 1500 iterations): all variants ~31 share pts, 5/8 dominant ->
+  the PINN collapses the loss into SEI (rates of other mechanisms can shrink to ~0 at no cost; resistance cannot pin
+  L_SEI because g is learned). Explanation stays with the shared physics (1.1 pts, exact solutions); PINN / GPR for SOH.
+
+## 5cx. Part C: physics-structured GA-PINN + GPR + combination for all 18 batteries (Reference, Hot, Cold, Pulsed)
+- Physics core: exact solutions, parameters shared by all batteries (fitted on all groups together so mechanisms are
+  separable): SEI dL/da = f/(L+delta)^p, f = k e^{b_T x_T} (closed form for any p); plating k_pl e^{a_pl x_I} x_C a
+  (cold only, by construction); LAM k_LAM e^{a_I x_I + a_V x_V} a; SOH = (1-s-pl)(1-m); R/R0 = 1 + g s; least squares
+  on SOH/0.01 and R/0.03, multi-start. Bounded neural correction (MLP, clip +-bound) on the total SOH.
+- GA genes: hidden, learning rate, bound, SEI law p, iterations; fitness = LOBO RMSE over all batteries + 0.5|late
+  bias| + time (one setting for all batteries: slight selection optimism, stated).
+- Recovery test (8 simulated batteries, same law forms): 0.10 share pts, all dominant correct (earlier PINN ~31) ->
+  identifiable when the laws are right (does not prove the laws).
+- GPR (relative + smoothed t(3.8-3.5 V), t_CC, t_CV + cycle, Matern 1.5) and GPR + physics residual correction, each
+  battery held out within its group; physics predictions of training batteries from LOBO fits. Mechanism shares from
+  the core fitted on all 18. Demo: all cells run; combination can be worse than GPR alone (group-dependent). NASA pending.
+
+## 5cy. Data cleaning (Colab cell 2b) and final Part C results (all groups, none of the target's capacity used)
+- Cleaning: aborted discharges (V_min > battery median + 0.15 V) dropped; invalid first cycles (capacity < 0.93 x
+  stable level of cycles 6-25) dropped; Hampel filter on capacity (9 neighbours, 4 robust std, >= 3 % of stable
+  level) drops far random points (regeneration kept); Hampel on indicators (>= 5 % from local median) replaces values
+  by the local median; start capacity = median of the first 10 kept cycles. Tested with planted bad points: exact.
+- B0005 after cleaning: GPR alone 0.985 (was 0.963); GPR + GA-PINN 0.977 (was 0.975); GA-PINN alone 0.695 (default
+  0.706). Combination no longer helps once the GPR's late-life gap is gone.
+- Part C after cleaning, GPR alone RMSE: Cold ~3.0 (B0046 1.62, B0047 1.84, B0048 2.29, B0045 6.35; was 10.3), Hot
+  ~1.2 (0.56-1.97), Pulsed ~0.6 (0.35-1.08; B0026 dropped < 25 cycles), Reference ~3.5 (B0005 1.43, B0007 1.97, B0018
+  1.86, B0006 4.92, B0036 7.28). Physics-structured GA-PINN 1.3-14 pts; combination better than GPR only for B0006.
+- Mechanism shares (SEI / plating / LAM) shift 20-30 pts after cleaning (Hot 75-86 -> 47-63 SEI; Reference 41-55 ->
+  18-26 SEI; Cold plating 60-77 -> 37-53, LAM 40-57). Robust qualitative ranking: SEI share rises with temperature;
+  plating only in the cold (by structure); LAM large at room temperature. Quantitative shares uncertain ~+-20 pts.
+  Physics fit: Cold now 0.7-0.9; Pulsed poor (-0.8 to -11: the pulsed load is not represented).
+- FINAL: SOH = honest GPR on cleaned indicators; mechanisms = shared physics (qualitative ranking, with fit R^2 as
+  confidence); professor's combination useful only when the data-driven model has a systematic gap.
+
+## 5cz. FINAL Mission 3 with the GA-PINN twin core (v5.42.0, maintenance + lifecycle CSVs)
+- Share of the ideal benefit (perfect knowledge vs run to EOL), group sums: Reference twin alone 0.947 (0 unplanned),
+  twin + age limit 0.895 (0), best fixed age 0.583 (1), run to EOL 0 (3); Cold twin alone 0.389 (3 unplanned),
+  twin + age limit 0.746 (1), best fixed age 0.706 (1), run to EOL 0 (5). Twin replacements: B0005 122 (EOL 126),
+  B0018 92 (98), B0006 94 (110). Recommended rule: twin + age limit (all groups).
+- Lifecycle profit per hour (group means), do nothing / usual / twin replacement / twin strategy / upper bound:
+  Reference -0.687 / 0.092 / 0.278 / 0.304 / 0.341; Cold -1.320 / -0.672 / -0.886 / -0.862 / -0.249 (Cold loses money
+  under these economics; twin does not help there). Chosen operation: 2.7 V cut-off for all.
+- vs frozen core (5be): Reference 96 / 93 % -> 95 / 90 %; Cold 34 / 62 % -> 39 / 75 % (but best fixed age also moved
+  54 -> 71 %, independent of the core -> other settings differed; compare within run). Decisions ~equal, consistent
+  with the scorecard.
+
+## 5da. v5.43.0: SOH ESTIMATION in the platform (engine section 59 + Models page section)
+- User request: estimation (today's SOH from today's measurements) next to forecasting, GA-PINN usable for both;
+  estimator switchable later as results improve.
+- Engine: estimation_table (honest indicators from the cycle table: charge between 3.8 and 3.5 V = qv_18 - qv_06,
+  t_cc_s, t_cv_s; Hampel replacement >= 5 %; rolling median 5; relative to own first 5 cycles; cycle clock with nominal
+  2 Ah; operating conditions); training batteries cleaned with their SOH (invalid first cycles < 93 % of stable level,
+  outliers, Hampel >= 3 pts); the battery being estimated is BLIND: nothing selected from its SOH, SOH checks only set
+  score_ok. estimate_soh(kind = "GPR" | "PINN-est"): GPR Matern 1.5 ARD + white, restarts 3; estimation PINN (engine
+  Tensor/Adam): inputs [a, xT, xC, xI, xV, 3 indicators], no battery code, shared rate laws enforced on all measured
+  rows (target: measurements only), genes as GA_PINN_GENES. ga_estimation: ga_pinn_run, fitness = LOBO over training
+  batteries RMSE + 0.5|late bias|. CACHE_VERSION = 5.42.0 (existing results stay valid; ENGINE_VERSION 5.43.0).
+- tests/test_estimation.py (6): relative indicators start at 1; finite estimates; TARGET BLIND (SOH scaled,
+  oscillated, far points, low first cycles, outlier flags changed -> estimates identical on every cycle) for GPR and
+  PINN-est; GA runs. A first version leaked (SOH-based row selection set the indicator baseline) -> fixed, test stricter.
+- App: Models & forecasting, first section "Mission 2 · SOH estimation": group, battery, estimators (GPR, estimation
+  PINN default, estimation GA-PINN with GA on the training batteries), one battery (plot + band + table) or every
+  battery of the group (LOBO table, CSV); "estimator for the twin's field mode" selector kept for the next release.
+- 42 tests pass; all pages; md_check 0. Next: field-mode anchor with the chosen estimator + update study; estimate-vs-
+  forecast fault indicator (validate on simulated faults); platform restructure.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).
