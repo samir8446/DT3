@@ -149,7 +149,7 @@ def test_hybrid_portable_pickles(demo):
 def test_app_requires_this_engine():
     app = (ROOT / "app.py").read_text(encoding="utf-8")
     req = re.search(r'REQUIRED_ENGINE = "([^"]+)"', app).group(1)
-    assert req == te.ENGINE_VERSION == "5.43.0"
+    assert req == te.ENGINE_VERSION == "5.43.1"
     assert te.CACHE_VERSION == "5.42.0"                  # 5.43.0 adds estimation only: earlier results stay valid
     for f in ("integrated_snapshot", "integrated_timeline", "whatif_projection", "whatif_identifiability",
               "hybrid_portable", "estimate_soh", "ga_estimation"):

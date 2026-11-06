@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.43.0"
+ENGINE_VERSION = "5.43.1"
 CACHE_VERSION = "5.42.0"      # bump only when an EXISTING computation changes (5.43.0 only adds SOH estimation)
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
@@ -11816,6 +11816,7 @@ ESTIMATION_MODELS: Dict[str, str] = {
     "GPR": "GPR · Gaussian process on honest indicators (Matern 1.5, one length scale per input)",
     "PINN-est": "Estimation PINN · physics-informed, inputs = clock + conditions + the cycle's indicators"}
 EST_C_NOM = 2.0                                          # ageing clock uses the nominal capacity, never the measured one
+ESTIMATION_VERSION = "2"     # 2: network inputs = clock + measured indicators only (conditions only in the rate laws)
 
 
 def _est_hampel(s: pd.Series, window: int = 9, k: float = 4.0, min_abs: float = 0.0,
@@ -11898,13 +11899,17 @@ def _est_gpr(Xtr: np.ndarray, ytr: np.ndarray, Xte: np.ndarray, restarts: int = 
 
 def _est_pinn(Xtr: np.ndarray, ytr: np.ndarray, Xall: np.ndarray, Xte: np.ndarray, p: Dict[str, Any],
               seed: int = 0) -> np.ndarray:
-    """Estimation-mode PINN. Columns of X: [a, xT, xC, xI, xV, indicators...]. SOH misfit on the training rows; rate
-    laws (shared, no per-battery multipliers) enforced on all measured rows (target rows: measurements only)."""
+    """Estimation-mode PINN. Columns of X: [a, xT, xC, xI, xV, indicators...]. The NETWORK sees only the clock and the
+    measured indicators: the operating conditions (constant per battery) enter only the rate laws, so the network
+    cannot use them to recognise a training battery and copy its curve (v2 fix: B0005 shares its 2.7 V cut-off with
+    B0036 only). SOH misfit on the training rows; rate laws (shared, no per-battery multipliers) enforced on all
+    measured rows (target rows: measurements only)."""
     rng = np.random.default_rng(seed)
-    mu, sd = Xall.mean(0), Xall.std(0) + 1e-9
+    net_cols = [0] + list(range(5, Xall.shape[1]))       # clock + indicators
+    mu, sd = Xall[:, net_cols].mean(0), Xall[:, net_cols].std(0) + 1e-9
     H = int(p["hidden"])
     g_ = lambda *s_: Tensor(rng.normal(0, 1 / math.sqrt(s_[0]), size=s_))
-    W1, b1 = g_(Xall.shape[1], H), Tensor(np.zeros((1, H)))
+    W1, b1 = g_(len(net_cols), H), Tensor(np.zeros((1, H)))
     W2, b2 = g_(H, H), Tensor(np.zeros((1, H)))
     W3, b3 = Tensor(rng.normal(0, 0.01, size=(H, 3))), Tensor(np.full((1, 3), -2.0))
     phys = {"k_sei": Tensor([[math.log(0.004)]]), "k_pl": Tensor([[math.log(0.01)]]), "k_lam": Tensor([[math.log(0.05)]]),
@@ -11917,7 +11922,7 @@ def _est_pinn(Xtr: np.ndarray, ytr: np.ndarray, Xall: np.ndarray, Xte: np.ndarra
     sel = [Tensor(np.eye(3)[:, [j]]) for j in range(3)]
 
     def states(X):
-        h = (Tensor((X - mu) / sd) @ W1 + b1).tanh()
+        h = (Tensor((X[:, net_cols] - mu) / sd) @ W1 + b1).tanh()
         h = (h @ W2 + b2).tanh()
         st_ = (h @ W3 + b3).softplus() * 0.25 * Tensor(X[:, [0]])
         return [st_ @ sel[j] for j in range(3)]

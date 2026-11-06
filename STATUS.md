@@ -1493,6 +1493,15 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
 - 42 tests pass; all pages; md_check 0. Next: field-mode anchor with the chosen estimator + update study; estimate-vs-
   forecast fault indicator (validate on simulated faults); platform restructure.
 
+## 5db. v5.43.1: estimation PINN fix (NASA B0005: GPR 0.978 / RMSE 1.52 vs estimation PINN default -0.041 / 10.49)
+- Diagnosis: the network received the per-battery operating conditions as inputs; in Reference only the cut-off
+  differs between batteries, and B0005 shares 2.7 V with B0036 alone (which barely fades: 87 %) -> the network could
+  recognise "the 2.7 V battery" and copy B0036's curve (~10 pts error). The GPR never sees the conditions.
+- Fix (ESTIMATION_VERSION 2): network inputs = clock + measured indicators only; conditions enter only the rate laws.
+  Demo: S001 0.829 -> 0.923, S008 0.814 -> 0.972 (GPR -1.463 / 0.930); shortcut test (S001 given S002's conditions,
+  S002 ages differently): 0.932. App: estimator cache keyed by ESTIMATION_VERSION (old PINN results never reused).
+- 42 tests, all pages, md_check 0. NASA rerun pending (B0005 and all groups).
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

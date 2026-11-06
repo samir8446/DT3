@@ -49,7 +49,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.43.0"
+REQUIRED_ENGINE = "5.43.1"
 if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
@@ -6510,7 +6510,8 @@ EST_CHOICES = {"GPR": "GPR · Gaussian process on honest indicators",
 @st.cache_data(show_spinner=False, max_entries=600)
 def est_cached(_ct: pd.DataFrame, key: str, cell: str, train: Tuple[str, ...], kind: str, params_json: str) -> Dict[str, Any]:
     params = json.loads(params_json)
-    return backed("soh_est", lambda: te.estimate_soh(_ct, cell, list(train), kind, params or None),
+    ver = getattr(te, "ESTIMATION_VERSION", "1")           # a new estimator version never reuses old saved results
+    return backed(f"soh_est_v{ver}", lambda: te.estimate_soh(_ct, cell, list(train), kind, params or None),
                   key, cell, train, kind, params_json)
 
 
