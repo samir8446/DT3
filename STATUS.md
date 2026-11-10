@@ -1502,6 +1502,127 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   S002 ages differently): 0.932. App: estimator cache keyed by ESTIMATION_VERSION (old PINN results never reused).
 - 42 tests, all pages, md_check 0. NASA rerun pending (B0005 and all groups).
 
+## 5dc. Part D results (NASA, cleaned, 16 batteries, none of each battery's capacity used)
+- RMSE (SOH pts) median / mean / worst; B0005: own group 1.73 / 2.27 / 7.28 (B0036), 1.43; all groups (+ conditions,
+  1000 pooled cycles) 1.53 / 2.03 / 3.92, 3.92; BOTH GPRs weighted by their own predictive std 1.61 / 1.84 / 4.25,
+  1.32; GPR (all groups) + physics core residual, uncertainty-weighted 1.09 / 1.90 / 4.23, 4.22.
+- Group means (own / all / both / +physics): Reference 3.49 / 1.95 / 2.12 / 2.28; Hot 1.20 / 1.14 / 1.14 / 0.93;
+  Cold 3.03 / 3.23 / 2.99 / 3.18; Pulsed 0.68 / 1.74 / 0.75 / 0.88 (pulsed load: other groups mislead).
+- All groups fixes out-of-range batteries (B0006 4.92 -> 2.45, B0036 7.28 -> 1.30, B0031, B0045); own group better on
+  typical ones (B0005, B0029, Cold B0046-48, Pulsed). Both-GPR weighting: lowest mean, best B0005, worst case 7.28 ->
+  4.25; partial switch only (own-group GPR overconfident when extrapolating: B0036 3.03 vs 1.30).
+- Recommended platform estimator: both GPRs, uncertainty-weighted (principled, nothing tuned on the target).
+
+## 5dd. GA-PINN for ESTIMATION reaches the professor's level (none of the target's capacity used, no proxies)
+- Platform (v5.43.1, fixed estimation PINN, GA on the training batteries): B0006 R^2 0.991, RMSE 1.16 (GPR own group
+  0.845 / 4.92: B0006 fades below its training range); GA winner h32 lr0.01 lambda 1 p1 accel 900.
+- Colab Part F (JAX; inputs = GPR inputs; conditions only in the physics; GA minimises LOBO validation RMSE on the
+  training batteries; final = 3-seed mean; combination weights 1/validation RMSE^2): B0005 GA-PINN 0.9887 / RMSE 1.10,
+  GPR 0.9810 / 1.43, GA-PINN + GPR 0.9873 / 1.16 (weights 0.66 / 0.34). GA winner h64 lr0.01 lambda 0 p1 it1000
+  (validation RMSE 1.76; GPR 2.43).
+- Reading: the physics-SHAPED network (states from 0, non-negative, multiplicative SOH) carries the gain and can
+  extrapolate below the training range; the best residual weight differs per battery (0 or 1).
+- Colab Part F, B0006: GA-PINN 0.9904 / RMSE 1.22, GPR 0.8452 / 4.92, combined 0.9850 / 1.53 (weights 0.82 / 0.18;
+  validation RMSE 1.94 vs 4.21). Independent implementations agree on B0006 (JAX 0.990, engine 0.991).
+  Batch notebook GA_PINN_vs_GPR_batch.ipynb (B0007, B0018, B0029, B0030, B0046, B0047, B0025, B0028; GA 4 x 3) running.
+- Platform, B0007: estimation GA-PINN R^2 0.995 / RMSE 0.62 (GPR own group 0.947 / 1.97); GA winner identical to
+  B0006 (h32 lr0.01 lambda 1 p1 accel 900), chosen independently -> stable setting for Reference.
+  Reference so far (GA-PINN vs GPR RMSE): B0005 1.10 vs 1.43, B0006 1.16-1.22 vs 4.92, B0007 0.62 vs 1.97. Professor's GA-PINN
+  0.96-0.97 exceeded honestly. Next: GA-PINN estimation on all batteries; make it the platform's default estimator.
+
+## 5de. v5.44.0: Mission 3 OPERATING WINDOW (engine section 60 + Operations page section 1b)
+- User goal: test a battery over a range of operating conditions and pick the candidates that last longest before
+  end of life, starting from today's state (measured or ESTIMATED by the estimation GA-PINN).
+- Engine m3_operating_window(h, cell, n_now, soh_now, soh_eol, T, I, V grids, depth, groups): shared-physics
+  mechanism laws (identifiable) for each candidate (_whatif_cd), scaled by m3_fade_scale; today's damage
+  (1 - soh_now)/k placed on each candidate's loss curve (same physics-equivalent damage), ageing continues from there
+  with throughput per cycle scaled by the measured Ah to the candidate cut-off; Wh per cycle from the depth table
+  (pooled median Wh / Ah to 2.7 V x own Ah to 2.7 V). Outputs remaining cycles, energy to EOL, vs own, flags
+  (combination not tested, value not tested, condition not identifiable / limited, no measured energy).
+  Assumption stated: equivalent-damage transfer between conditions; physics used for differences.
+- App (Operations & control, after stage 1): battery, today's cycle, today's state (measured / estimated from the
+  Models page estimation, best available GA-PINN > PINN > GPR), grids, criterion (most energy / longest life),
+  "rank only candidates supported by the data" (default on); metrics, top-8 table, trajectories of the top 3 vs own,
+  heat map current x cut-off at a temperature, CSV.
+- tests/test_window.py (2): table + flags; more damage today -> never more remaining life. 44 tests, all pages,
+  md_check 0.
+
+## 5df. Estimation batch: GA-PINN vs GPR vs combined on 10 batteries (Colab, JAX, GA 4 x 3 for the batch)
+- RMSE (SOH pts) GA-PINN / GPR / combined: B0005 1.10 / 1.43 / 1.16; B0006 1.22 / 4.92 / 1.53; B0007 1.34 / 1.97 /
+  1.49 (platform 6x4: 0.62); B0018 2.50 / 1.87 / 2.28; B0029 0.65 / 0.56 / 0.59; B0030 0.80 / 0.70 / 0.75; B0046 1.74
+  / 1.62 / 1.57; B0047 4.59 / 1.84 / 2.48; B0025 0.50 / 0.45 / 0.45; B0028 1.44 / 0.41 / 0.81. Batch-of-8 means
+  1.70 / 1.18 / 1.30.
+- GA-PINN better on 3/10 (B0005-07, Reference: long lives, 4 training batteries, B0006 below its training range);
+  GPR better on 7/10 (Hot, Cold, Pulsed: 2-4 training batteries, short lives -> the network overfits, the GPR's
+  smoothness prior copes). Failures: B0028 collapse in the last 2 cycles (clock beyond the training lives),
+  B0047 too high late (noisy Cold indicators).
+- B0018 with the full GA (6 x 4, Colab): GA-PINN 0.929 / 2.25 (batch 4x3: 2.50), GPR 0.951 / 1.86, combined 0.937 /
+  2.12 (weights 0.79 / 0.21 from training validation 2.16 vs 4.17: the GPR's LOBO failures on B0006 / B0036 drive
+  the weights). Both models overestimate cycles 35-105 the same way -> an input-information limit, not a model one.
+  Reference: GA-PINN better on 3 of 4 (B0005, B0006, B0007).
+- Platform (6 x 4 GA), B0005: estimation GA-PINN 0.990 / RMSE 1.01 (Colab 0.989 / 1.10), GA winner h16 lr0.01
+  lambda 3 p0.5 no accel 900 (Colab: lambda 0, p1) -> accuracy robust to the settings. Platform Reference so far:
+  B0005 1.01, B0006 1.16, B0007 0.62 (GPR 1.43 / 4.92 / 1.97).
+- Combination (weights = 1 / validation RMSE^2 on the training batteries) is the robust choice: worst 2.48 vs 4.59,
+  keeps the B0006 gain. Fixable: bound the clock input to its training range; larger GA (6 x 4).
+
+## 5dg. v5.44.1: operating-window fixes (NASA test on B0006 showed only 2.7 V and identical energy per current)
+- Bug: _window_depth_factors read the depth table's row number as the battery (column is 'battery') -> only 2.7 V
+  rows matched -> every other cut-off lost its measured energy and fell out of map and ranking (demo has 2.7 V only).
+- Energy per cycle now from the batteries run at the same discharge current (measured), pooled otherwise: higher
+  current -> less Wh per cycle. Ageing vs current is still flat where the physics' current sensitivity is limited
+  (flagged).
+- Colab notebook Operating_window_Colab.ipynb: START "new" (whole life from cycle 0) / "measured" / "estimated";
+  SCOPE "tested" (only combinations NASA ran: inside the training data) / "supported" / "all"; top N (5) by total
+  energy to end of life (default) or life. Reproduces the platform exactly (demo: 110 cycles 629.0 Wh / best 114
+  cycles 649.3 Wh in both).
+- Tests: depth factors with several cut-offs and currents (4 window tests); suite and pages pass.
+- NASA B0006, new battery (START new), SCOPE tested (5 of 60 candidates), most energy to EOL: #1 32 C · 2 A · 2.7 V
+  (~127 cycles, 751 Wh) > own 32 C · 2 A · 2.4 V (~119, 708 Wh) > 35 C · 4 A · 2.4 V (~116) > 54 C · 4 A · 2.4 V
+  (~102) > 9 C · 1 A · 2.7 V (~32: plating). Map at 32 C: energy rises with shallower cut-off in every current
+  column (2.0 V 644 -> 2.7 V 751 Wh at 2 A); +6 % energy, ~+7 % life vs own = same direction as Mission 3 stage 2.
+  Caveat: 1 A energy factors come from the cold batteries only (current confounded with temperature).
+- Notebook fix: the battery's own conditions are always added to the grid (own row was missing when the grid
+  lacked its 2.4 V cut-off).
+
+## 5dh. GENERAL operating window (Colab cells 9-11, engine 5.44.1): 504 scenarios x 20 batteries = 10,080 lives
+- Scenarios inside NASA's ranges: T 9-54 C (9 values), I 1-4 A (7), cut-off 2.0-2.7 V (8); every battery simulated
+  as new; energy relative to each battery's best, then averaged. 9 s.
+- Identifiability: cut-off identified; temperature limited; discharge current limited; charge current not identifiable.
+- Top: 20.2 C · 2 A · 2.7 V, mean relative energy 0.972, median 219.5 cycles (10-90 %: 137-534), 1,033 Wh; top 10 %
+  for 95 % of batteries (worst battery 0.44). Then 20 C · 2.6 V, 26 C · 2.7 V, 20 C · 1 A, 20 C · 1.5 A.
+- Robust: shallower cut-off better at every T and I (31.5 C: 2.0 V ~172 -> 2.7 V 206 cycles, +20 %). Temperature:
+  9 C 40-46 cycles (plating), optimum ~20-26 C (interpolated, sensitivity limited -> state "20-30 C"), 54 C 136-178
+  (-15-20 % vs 31.5 C). Current: no reliable conclusion (limited ageing effect; energy factors per current come from
+  different groups -> confounded with temperature). Large battery spread in absolute life: ranking general, life not.
+
+## 5di. Estimation: B0036, B0029 (platform) and the v2 batch (input clipping fix)
+- B0036 (Colab, full GA; a plot titled B0029 is the same B0036 run, TEST_F changed before replotting): GA-PINN 0.937,
+  GPR -3.549 (collapses to 83 %: other campaign), combined 0.423 (validation weights misled).
+- B0029 platform (Hot): GA-PINN 0.872 / RMSE 1.25 vs GPR own group 0.975 / 0.56.
+- v2 batch (inputs clipped to the training range; training-only standardisation), R^2 GA-PINN before -> after:
+  B0028 -0.284 -> 0.483, B0047 0.642 -> 0.721, B0018 0.912 -> 0.931, B0025 0.813 -> 0.778, B0007 0.975 -> 0.956, B0029
+  0.966 -> 0.963, B0030 0.948 -> 0.942, B0046 0.949 -> 0.929. Combined after: 0.955 0.943 0.971 0.952 0.948 0.921 0.880
+  0.860 (mean 0.929 vs GPR 0.935; worst 0.86 vs 0.60 before).
+- 14 batteries: GA-PINN wins Reference 4/5 (B0005, B0006, B0007, B0036 incl. the two the GPR fails), GPR wins Hot,
+  Cold, Pulsed (2-4 training batteries, short lives). Conclusion: physics helps most where data cannot cover the
+  battery (out of range, other campaign).
+
+## 5dj. v5.45.0: the Colab estimation improvements in the platform (ESTIMATION_VERSION 3)
+- Platform NASA results before this release (RMSE, GPR vs estimation GA-PINN / PINN): B0029 0.56 vs 1.25; B0030
+  1.45 vs 3.89 (GA-PINN flat after the cycle-17 bump: extrapolation); B0031 1.48 vs 0.92; B0032 1.43 vs 0.76; B0041
+  6.00 vs 11.93 (only cycles 46-67 valid; 4 A, unlike its group); B0045 2.15 vs 2.19; B0046 2.68 vs 3.46; B0047 3.11
+  vs 2.27; B0048 2.09 vs 1.87. Low R^2 in Hot = little SOH variation (100 -> 89 %); far points are mostly real
+  regeneration bumps.
+- Engine: ga_pinn_run(genes=, start=) (defaults unchanged: the twin core's GA is identical); EST_GENES (hidden 16-64,
+  lambda 0/0.1/0.3/1/3, p, accel, iterations 600/1000/1500), EST_START; _est_pinn: training-only scaling, inputs
+  clipped to the training range, cosine learning-rate decay; estimate_soh PINN-est params "seeds" (final estimate =
+  mean of seeds; GA candidates 1 seed); second score excluding far points (Hampel window 7, k 3, >= 1.5 pts; scoring
+  only): rmse_clean, r2_clean, n_far.
+- App: estimator "GA-PINN + GPR" weighted 1/validation RMSE^2 (GA winner's LOBO RMSE on the training batteries,
+  GPR's LOBO RMSE); final GA-PINN and default PINN average 3 seeds; table with far-point-excluded scores; window
+  start prefers GA-PINN + GPR. 46 tests, all pages, md_check 0.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

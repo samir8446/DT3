@@ -49,7 +49,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.43.1"
+REQUIRED_ENGINE = "5.45.0"
 if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
@@ -6504,7 +6504,9 @@ def pinn_section() -> None:
 EST_GROUPS = ("Reference", "Hot", "Cold", "Pulsed load", "High current")
 EST_CHOICES = {"GPR": "GPR · Gaussian process on honest indicators",
                "PINN-est": "Estimation PINN · physics-informed, default settings",
-               "GA-PINN-est": "Estimation GA-PINN · settings chosen by the GA on the training batteries"}
+               "GA-PINN-est": "Estimation GA-PINN · settings chosen by the GA on the training batteries",
+               "GA-PINN-GPR": "GA-PINN + GPR · weighted by their validation errors on the training batteries"}
+EST_FINAL_SEEDS = 3          # the final estimate averages 3 trainings (the GA uses 1 per candidate, as in Colab)
 
 
 @st.cache_data(show_spinner=False, max_entries=600)
@@ -6526,6 +6528,7 @@ def ga_est_resumable(train_t: Tuple[str, ...], deadline: Optional[float], note: 
     TRAINING battery out: RMSE + 0.5 |late bias| (the battery being estimated is not among them)."""
     count = {"n": 0}
     total = 16 * len(train_t)
+    rmse_of: Dict[str, float] = {}
 
     def evaluate(g: Dict[str, Any]) -> float:
         gj = json.dumps({k: (int(v) if k == "accel" else v) for k, v in g.items()}, sort_keys=True, default=float)
@@ -6539,14 +6542,25 @@ def ga_est_resumable(train_t: Tuple[str, ...], deadline: Optional[float], note: 
                 note.caption(f"GA training {count['n']} of about {total} (each saved; a stopped press continues)")
             e = r["pred"] - r["soh"]; err.append(e); late.append(float(np.mean(e[-max(1, len(e) // 3):])))
         rmse, lb = 100 * float(np.sqrt(np.mean(np.concatenate(err) ** 2))), 100 * float(np.mean(late))
+        rmse_of[gj] = rmse
         return rmse + 0.5 * abs(lb)
     try:
-        run = te.ga_pinn_run(evaluate, 6, 4, seed=0)
+        run = te.ga_pinn_run(evaluate, 6, 4, seed=0, genes=getattr(te, "EST_GENES", None), start=getattr(te, "EST_START", None))
     except TimeoutError:
         return {"done": False}
-    best = te.ga_pinn_genome(run["best_key"]) if run.get("best_key") else dict(te.GA_PINN_START)
+    best = te.ga_pinn_genome(run["best_key"]) if run.get("best_key") else dict(getattr(te, "EST_START", te.GA_PINN_START))
     best["accel"] = int(bool(best.get("accel", 0)))
-    return {"done": True, "best": best}
+    bj = json.dumps({k: (int(v) if k == "accel" else v) for k, v in best.items()}, sort_keys=True, default=float)
+    return {"done": True, "best": best, "val_rmse": rmse_of.get(bj, float("nan"))}
+
+
+def gpr_val_rmse(train_t: Tuple[str, ...]) -> float:
+    """The GPR's validation RMSE (SOH points) on the training batteries, each left out in turn."""
+    err = []
+    for v in train_t:
+        r = est_cached(CT_RAW, DATA_KEY, v, tuple(sorted(x for x in train_t if x != v)), "GPR", "null")
+        err.append(r["pred"] - r["soh"])
+    return 100 * float(np.sqrt(np.mean(np.concatenate(err) ** 2)))
 
 
 def run_estimator(cell: str, train: Sequence[str], choice: str, deadline: Optional[float] = None,
@@ -6554,15 +6568,32 @@ def run_estimator(cell: str, train: Sequence[str], choice: str, deadline: Option
     """One estimator for one battery; the battery's capacity / SOH is never used (engine test). Returns None when
     the GA-PINN search stopped at the time budget (press again to continue)."""
     train_t = tuple(sorted(train))
-    if choice == "GA-PINN-est":
+    if choice in ("GA-PINN-est", "GA-PINN-GPR"):
         ga = ga_est_resumable(train_t, deadline, note)
         if not ga["done"]:
             return None
         g = ga["best"]
-        r = dict(est_cached(CT_RAW, DATA_KEY, cell, train_t, "PINN-est", json.dumps(g, sort_keys=True, default=float)))
+        r = dict(est_cached(CT_RAW, DATA_KEY, cell, train_t, "PINN-est",
+                            json.dumps({**g, "seeds": EST_FINAL_SEEDS}, sort_keys=True, default=float)))
         r["label"] = "Estimation GA-PINN · " + te.ga_pinn_key(g).split("|", 1)[1]
+        if choice == "GA-PINN-GPR":
+            rg = est_cached(CT_RAW, DATA_KEY, cell, train_t, "GPR", "null")
+            rm_p, rm_g = ga["val_rmse"], gpr_val_rmse(train_t)
+            w = (1 / rm_p ** 2) / (1 / rm_p ** 2 + 1 / rm_g ** 2) if np.isfinite(rm_p) and np.isfinite(rm_g) else 0.5
+            pa = w * np.asarray(r["pred_all"]) + (1 - w) * np.asarray(rg["pred_all"])
+            ok = np.isin(r["n_all"], r["n"])
+            y = np.asarray(r["soh"]); pr = pa[ok]
+            far, _ = te._est_hampel(pd.Series(y), window=7, k=3.0, min_abs=0.015)
+            keep = ~far.to_numpy(bool)
+            ss, ssk = float(np.sum((y - y.mean()) ** 2)), float(np.sum((y[keep] - y[keep].mean()) ** 2))
+            r.update({"pred_all": pa, "pred": pr, "std": None, "rmse": 100 * float(np.sqrt(np.mean((pr - y) ** 2))),
+                      "r2": 1 - float(np.sum((y - pr) ** 2)) / ss if ss > 0 else float("nan"),
+                      "rmse_clean": 100 * float(np.sqrt(np.mean((pr[keep] - y[keep]) ** 2))),
+                      "r2_clean": 1 - float(np.sum((y[keep] - pr[keep]) ** 2)) / ssk if ssk > 0 else float("nan"),
+                      "label": f"GA-PINN + GPR · weights {w:.2f} / {1 - w:.2f} (validation {rm_p:.2f} / {rm_g:.2f})"})
     else:
-        r = dict(est_cached(CT_RAW, DATA_KEY, cell, train_t, choice, "null"))
+        params = json.dumps({"seeds": EST_FINAL_SEEDS}) if choice == "PINN-est" else "null"
+        r = dict(est_cached(CT_RAW, DATA_KEY, cell, train_t, choice, params))
         r["label"] = EST_CHOICES[choice]
     return r
 
@@ -6592,7 +6623,7 @@ def soh_estimation_section() -> None:
                                  "first time; saved afterwards).")
     train = [x for x in cells if x != cell]
     budget = 15
-    if "GA-PINN-est" in models:
+    if "GA-PINN-est" in models or "GA-PINN-GPR" in models:
         budget = st.number_input("Time budget per press for the GA-PINN search (minutes)", 2, 60, 15, key="est_budget",
                                  help="The GA trains about 16 settings x each training battery; every training is "
                                       "saved, so a press that reaches the budget continues on the next press.")
@@ -6622,7 +6653,8 @@ def soh_estimation_section() -> None:
                     if r is None:
                         st.info(f"{c}: the GA-PINN search reached the time budget; press again to continue.")
                         continue
-                    rows.append({"battery": c, "estimator": EST_CHOICES[m], "RMSE (SOH pts)": r["rmse"], "R²": r["r2"]})
+                    rows.append({"battery": c, "estimator": EST_CHOICES[m], "RMSE (SOH pts)": r["rmse"], "R²": r["r2"],
+                                 "RMSE (far points excluded)": r.get("rmse_clean", np.nan)})
                 except Exception as exc:
                     report_error(f"{m} on {c}", exc, False)
         bar.empty()
@@ -6644,12 +6676,19 @@ def soh_estimation_section() -> None:
             fig.add_trace(go.Scatter(x=r["n"], y=100 * r["pred"], mode="lines", line=dict(color=col, width=2.6),
                                      name=r["label"]))
             rows.append({"estimator": r["label"], "R²": r["r2"], "RMSE (SOH pts)": r["rmse"],
+                         "R² (far points excluded)": r.get("r2_clean", np.nan),
+                         "RMSE (far points excluded)": r.get("rmse_clean", np.nan),
                          "training batteries": ", ".join(r["train"])})
         fig.update_xaxes(title_text="Cycle"); fig.update_yaxes(title_text="SOH (%)")
         show(style_fig(fig, P, 460, f"{cell}: SOH estimated from its measurements (none of its capacity used)"),
              key="est_fig")
-        show_table(pd.DataFrame(rows).set_index("estimator").style.format({"R²": "{:.3f}", "RMSE (SOH pts)": "{:.2f}"}),
-                   note="Scored on the battery's valid cycles; RMSE is the better measure for batteries that barely fade.")
+        show_table(pd.DataFrame(rows).set_index("estimator").style.format(
+                       {"R²": "{:.3f}", "RMSE (SOH pts)": "{:.2f}", "R² (far points excluded)": "{:.3f}",
+                        "RMSE (far points excluded)": "{:.2f}"}),
+                   note="Scored on the battery's valid cycles. 'Far points excluded': cycles more than 3 robust std (and "
+                        "1.5 SOH points) from their neighbours are left out of the SCORE only (many are real regeneration "
+                        "bumps after a rest; the model never sees any capacity). RMSE is the better measure for batteries "
+                        "that barely fade.")
     allr = st.session_state.get("est_all_res")
     if allr and allr["key"] == (DATA_KEY, grp, tuple(models)) and allr["rows"]:
         A = pd.DataFrame(allr["rows"])
@@ -7574,6 +7613,135 @@ def m3_operation_section(fleet: Dict[str, Any], p: Dict[str, Any]) -> None:
         show_table(own_best.to_frame().style.format("{:.0%}"))
         download("Download the operation study (CSV)", res.drop(columns=[], errors="ignore").to_csv(index=False).encode(),
                  f"m3_operation_study__v{te.ENGINE_VERSION}.csv", "text/csv", key="m3_ops_csv")
+
+
+def window_start_estimate(c: str, n_now: float) -> Optional[Tuple[float, str]]:
+    """SOH at cycle n_now ESTIMATED from the battery's measurements, if the estimation was run for this battery on the
+    Models page (best available: estimation GA-PINN, then estimation PINN, then GPR)."""
+    one = st.session_state.get("est_one") or {}
+    res = one.get("res") or {}
+    if not res or one.get("key", (None, None, None))[2] != c:
+        return None
+    for m in ("GA-PINN-GPR", "GA-PINN-est", "PINN-est", "GPR"):
+        r = res.get(m)
+        if r is not None and len(r.get("n_all", [])):
+            return float(np.interp(n_now, r["n_all"], r["pred_all"])), r["label"]
+    return None
+
+
+def m3_window_section(fleet: Dict[str, Any]) -> None:
+    """Mission 3 · operating window: score a grid of temperature x current x cut-off for one battery from today."""
+    section("Mission 3 · 1b. Operating window: the best conditions for one battery, from today")
+    st.markdown(
+        "Choose a battery and **today's cycle**. Its state today is either the **measured SOH** or the SOH **estimated "
+        "from today's measurements** (run the estimation for this battery on the Models page first). Every candidate "
+        "condition of the grid is then projected to end of life: ageing from the **shared physics** (identifiable "
+        "mechanism laws), scaled to this battery's measured fade; charge and energy per cycle at each cut-off from the "
+        "**measured discharge traces**. Today's damage is placed on each candidate's ageing curve and ageing continues "
+        "from there. Candidates outside what NASA tested, or using a condition the data cannot identify, are flagged.")
+    h = fleet.get("main")
+    if h is None:
+        placeholder("The operating window needs the shared physics (fleet-wide parts).")
+        return
+    groups = te.condition_groups(CT_RAW)
+    tested = te.whatif_tested(h, groups)
+    cells = sorted(h["data"])
+    c1, c2, c3 = st.columns([1, 1.4, 1.6])
+    c = c1.selectbox("Battery", cells, key="win_cell")
+    d = CT_RAW[(CT_RAW["Cell_ID"] == c) & ~CT_RAW["outlier"]].sort_values("n")
+    n_max = int(d["n"].max()) if len(d) else 10
+    n_now = c2.slider("Today's cycle", 5, max(6, n_max), int(max(5, round(0.4 * n_max))), key="win_now")
+    src = c3.radio("Today's state", ["Measured SOH (laboratory)", "Estimated from today's measurements"], key="win_src",
+                   horizontal=True)
+    meas = float(np.interp(n_now, d["n"], d["SOH"])) if len(d) else float("nan")
+    soh_now, src_label = meas, "measured"
+    if src.startswith("Estimated"):
+        est = window_start_estimate(c, n_now)
+        if est is None:
+            st.info(f"No estimate for {c} yet: on the Models page, choose {c} in SOH estimation and press "
+                    "**Estimate this battery**. Using the measured SOH meanwhile.")
+        else:
+            soh_now, src_label = est[0], est[1]
+    st.caption(f"Today: cycle {n_now} · SOH {100 * soh_now:.1f} % ({src_label}); measured {100 * meas:.1f} %.")
+    v_opts = [float(v) for v in te.M3_DEPTH_GRID if 1.95 <= v <= 2.75]
+    g1, g2, g3 = st.columns(3)
+    Ts = g1.multiselect("Temperatures (°C)", tested["values"]["T_C"], default=tested["values"]["T_C"], key="win_T")
+    Is = g2.multiselect("Discharge currents (A)", tested["values"]["I_dis"], default=tested["values"]["I_dis"], key="win_I")
+    Vs = g3.multiselect("Cut-off voltages (V)", v_opts, default=sorted(set(v_opts) & set(tested["values"]["V_cut"])) or [2.7],
+                        key="win_V")
+    k1, k2 = st.columns([1.2, 1])
+    crit = k1.radio("Best means", ["Most energy delivered to end of life", "Longest life (cycles to end of life)"],
+                    key="win_crit", horizontal=True)
+    supported = k2.checkbox("Rank only candidates supported by the data", value=True, key="win_sup",
+                            help="Excludes candidates with an untested value or a condition the data cannot identify.")
+    if not (Ts and Is and Vs):
+        placeholder("Choose at least one value of each condition.")
+        return
+    if st.button("Explore the operating window", key="win_go", type="primary", icon=":material/tune:"):
+        try:
+            depth = m3_depth_cached(CT_RAW, DATA_KEY, tuple(cells)) if store is not None else None
+            W = te.m3_operating_window(h, c, n_now, soh_now, m3_soh_eol_for(c, "nasa"), Ts, Is, Vs, depth=depth,
+                                       groups=groups)
+            st.session_state["win_res"] = {"key": (DATA_KEY, c, n_now, round(soh_now, 5)), "W": W}
+        except Exception as exc:
+            report_error("operating window", exc, False)
+    R = st.session_state.get("win_res")
+    if not R or R["key"] != (DATA_KEY, c, n_now, round(soh_now, 5)):
+        return
+    W = R["W"]; T = W["table"].copy()
+    col = "energy to EOL (Wh)" if crit.startswith("Most energy") else "remaining cycles"
+    if col == "energy to EOL (Wh)" and T[col].isna().all():
+        st.info("No measured energy for these cut-offs: ranking by life instead.")
+        col = "remaining cycles"
+    rank = T[~T["flags"].str.contains("not identifiable|value not tested", regex=True)] if supported else T
+    rank = rank.sort_values(col, ascending=False)
+    if not len(rank):
+        placeholder("No candidate is supported by the data: untick the option above to see all candidates.")
+        return
+    best = rank.iloc[0]
+    own = T[T["own"]]
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Best candidate", f"{best['T_C']:g} °C · {best['I_dis']:g} A · {best['V_cut']:g} V")
+    if len(own):
+        o = own.iloc[0]
+        m2.metric("Remaining cycles", f"{int(best['remaining cycles'])}", f"{int(best['remaining cycles'] - o['remaining cycles']):+d} vs own")
+        if np.isfinite(best["energy to EOL (Wh)"]) and np.isfinite(o["energy to EOL (Wh)"]):
+            m3.metric("Energy to end of life", f"{best['energy to EOL (Wh)']:.0f} Wh",
+                      f"{100 * (best['energy to EOL (Wh)'] / o['energy to EOL (Wh)'] - 1):+.0f} % vs own")
+    top = rank.head(8)[["T_C", "I_dis", "V_cut", "own", "remaining cycles", "energy to EOL (Wh)", "Wh per cycle (new)", "flags"]]
+    show_table(top.rename(columns={"T_C": "T (°C)", "I_dis": "I (A)", "V_cut": "cut-off (V)"}).reset_index(drop=True)
+               .style.format({"energy to EOL (Wh)": "{:.0f}", "Wh per cycle (new)": "{:.2f}", "T (°C)": "{:g}",
+                              "I (A)": "{:g}", "cut-off (V)": "{:g}"}, na_rep="—"),
+               note=f"Ranked by {col}. Own operation = the battery's tested conditions. The physics is used for the "
+                    "difference between conditions; flags mark extrapolation.")
+    fig = go.Figure()
+    cols_ = [P.accent, "#E69F00", "#56B4E9"]
+    fig.add_trace(go.Scatter(x=d["n"], y=100 * d["SOH"], mode="markers", name=f"measured · {c}",
+                             marker=dict(size=4, color="#9AA3AD")))
+    shown = [tuple(r) for r in top[["T_C", "I_dis", "V_cut"]].head(3).to_numpy(float)]
+    if len(own):
+        shown = shown + [W["own"]] if W["own"] not in shown else shown
+    for i, combo in enumerate(shown):
+        n_, s_ = W["traj"][combo]
+        is_own = combo == W["own"]
+        fig.add_trace(go.Scatter(x=n_, y=100 * s_, mode="lines", name=("own: " if is_own else f"#{i + 1}: ") +
+                                 f"{combo[0]:g} °C · {combo[1]:g} A · {combo[2]:g} V",
+                                 line=dict(width=3 if i == 0 else 2, dash="dash" if is_own else "solid",
+                                           color="#9AA3AD" if is_own else cols_[i % 3])))
+    fig.add_hline(y=100 * m3_soh_eol_for(c, "nasa"), line_dash="dot", annotation_text="end of life")
+    fig.add_vline(x=n_now, line_dash="dot", annotation_text="today")
+    fig.update_xaxes(title_text="Cycle"); fig.update_yaxes(title_text="SOH (%)")
+    show(style_fig(fig, P, 460, f"{c}: best candidates from today vs its own operation"), key="win_fig")
+    piv_T = st.selectbox("Map at temperature (°C)", sorted(T["T_C"].unique()), key="win_mapT",
+                         index=sorted(T["T_C"].unique()).index(best["T_C"]))
+    M = T[np.isclose(T["T_C"], piv_T)].pivot_table(index="V_cut", columns="I_dis", values=col)
+    if M.size:
+        hm = go.Figure(go.Heatmap(z=M.to_numpy(), x=[f"{v:g} A" for v in M.columns], y=[f"{v:g} V" for v in M.index],
+                                  colorscale="Viridis", colorbar=dict(title="Wh" if col.startswith("energy") else "cycles"),
+                                  text=np.round(M.to_numpy(), 0), texttemplate="%{text}"))
+        show(style_fig(hm, P, 360, f"{col} at {piv_T:g} °C: discharge current × cut-off"), key="win_map")
+    download("Download all candidates (CSV)", T.to_csv(index=False).encode(),
+             f"operating_window_{c}_cycle{n_now}__v{te.ENGINE_VERSION}.csv", "text/csv", key="win_csv")
 
 
 def m3_lives(fleet: Dict[str, Any], rule: str, core: Optional[str] = None
@@ -8549,6 +8717,7 @@ def view_ops() -> None:
             placeholder("Mission 3 uses the twin's fleet-wide parts (shared physics, anomaly scan). Build them once.")
             return
     m3_operation_section(fleet, p)
+    m3_window_section(fleet)
     m3_forecast_section(fleet)
     m3_maintenance_section(fleet, p)
     m3_lifecycle_section(fleet, p)

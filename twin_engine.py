@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.43.1"
+ENGINE_VERSION = "5.45.0"
 CACHE_VERSION = "5.42.0"      # bump only when an EXISTING computation changes (5.43.0 only adds SOH estimation)
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
@@ -8663,14 +8663,18 @@ def ga_pinn_fitness(ct: pd.DataFrame, imp: Optional[pd.DataFrame], cell_id: str,
 
 
 def ga_pinn_run(evaluate: Callable[[Dict[str, Any]], float], pop_size: int = 6, generations: int = 4, seed: int = 0,
-                deadline: Optional[float] = None, elite: int = 2, p_mut: float = 0.25) -> Dict[str, Any]:
-    """Genetic algorithm over GA_PINN_GENES. Deterministic for a given seed and fitness values, so with cached
-    evaluations a stopped run resumes exactly (it replays the cached part). Stops at `deadline` (time.time())."""
+                deadline: Optional[float] = None, elite: int = 2, p_mut: float = 0.25,
+                genes: Optional[Dict[str, Tuple[Any, ...]]] = None, start: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Genetic algorithm over `genes` (default GA_PINN_GENES, the forecasting GA-PINN; estimation passes
+    EST_GENES). Deterministic for a given seed and fitness values, so with cached evaluations a stopped run resumes
+    exactly (it replays the cached part). Stops at `deadline` (time.time())."""
+    G = genes or GA_PINN_GENES
+    S = start or GA_PINN_START
     rng = np.random.default_rng(seed)
-    names = list(GA_PINN_GENES)
+    names = list(G)
     key = lambda g: tuple(g[k] for k in names)
-    rand = lambda: {k: GA_PINN_GENES[k][int(rng.integers(len(GA_PINN_GENES[k])))] for k in names}
-    pop, seen = [dict(GA_PINN_START)], {key(GA_PINN_START)}
+    rand = lambda: {k: G[k][int(rng.integers(len(G[k])))] for k in names}
+    pop, seen = [dict(S)], {key(S)}
     while len(pop) < pop_size:
         g = rand()
         if key(g) not in seen:
@@ -8698,7 +8702,7 @@ def ga_pinn_run(evaluate: Callable[[Dict[str, Any]], float], pop_size: int = 6, 
             child = {k: (a[k] if rng.random() < 0.5 else b[k]) for k in names}
             for k in names:
                 if rng.random() < p_mut:
-                    child[k] = GA_PINN_GENES[k][int(rng.integers(len(GA_PINN_GENES[k])))]
+                    child[k] = G[k][int(rng.integers(len(G[k])))]
             if key(child) not in {key(x) for x in new}:
                 new.append(child)
         pop = new
@@ -11816,7 +11820,13 @@ ESTIMATION_MODELS: Dict[str, str] = {
     "GPR": "GPR · Gaussian process on honest indicators (Matern 1.5, one length scale per input)",
     "PINN-est": "Estimation PINN · physics-informed, inputs = clock + conditions + the cycle's indicators"}
 EST_C_NOM = 2.0                                          # ageing clock uses the nominal capacity, never the measured one
-ESTIMATION_VERSION = "2"     # 2: network inputs = clock + measured indicators only (conditions only in the rate laws)
+ESTIMATION_VERSION = "3"     # 2: network inputs = clock + measured indicators only (conditions only in the rate laws)
+                             # 3: inputs clipped to the training range, training-only scaling, cosine learning rate,
+                             #    final estimate = mean of `seeds` trainings, wider genes (Colab study, STATUS 5dj)
+EST_GENES: Dict[str, Tuple[Any, ...]] = {
+    "hidden": (16, 32, 48, 64), "learning_rate": (0.002, 0.005, 0.01), "physics_weight": (0.0, 0.1, 0.3, 1.0, 3.0),
+    "sei_p": (1.0, 0.5, 0.0), "accel": (0, 1), "iterations": (600, 1000, 1500)}
+EST_START = {"hidden": 32, "learning_rate": 0.005, "physics_weight": 0.3, "sei_p": 0.5, "accel": 0, "iterations": 1000}
 
 
 def _est_hampel(s: pd.Series, window: int = 9, k: float = 4.0, min_abs: float = 0.0,
@@ -11906,7 +11916,8 @@ def _est_pinn(Xtr: np.ndarray, ytr: np.ndarray, Xall: np.ndarray, Xte: np.ndarra
     measured rows (target rows: measurements only)."""
     rng = np.random.default_rng(seed)
     net_cols = [0] + list(range(5, Xall.shape[1]))       # clock + indicators
-    mu, sd = Xall[:, net_cols].mean(0), Xall[:, net_cols].std(0) + 1e-9
+    mu, sd = Xtr[:, net_cols].mean(0), Xtr[:, net_cols].std(0) + 1e-9      # training batteries only (v3)
+    lo, hi = Xtr[:, net_cols].min(0), Xtr[:, net_cols].max(0)               # range seen in training (v3)
     H = int(p["hidden"])
     g_ = lambda *s_: Tensor(rng.normal(0, 1 / math.sqrt(s_[0]), size=s_))
     W1, b1 = g_(len(net_cols), H), Tensor(np.zeros((1, H)))
@@ -11922,7 +11933,8 @@ def _est_pinn(Xtr: np.ndarray, ytr: np.ndarray, Xall: np.ndarray, Xte: np.ndarra
     sel = [Tensor(np.eye(3)[:, [j]]) for j in range(3)]
 
     def states(X):
-        h = (Tensor((X[:, net_cols] - mu) / sd) @ W1 + b1).tanh()
+        # network inputs clipped to the training range (no wild extrapolation); ageing still grows with the full clock
+        h = (Tensor((np.clip(X[:, net_cols], lo, hi) - mu) / sd) @ W1 + b1).tanh()
         h = (h @ W2 + b2).tanh()
         st_ = (h @ W3 + b3).softplus() * 0.25 * Tensor(X[:, [0]])
         return [st_ @ sel[j] for j in range(3)]
@@ -11933,10 +11945,11 @@ def _est_pinn(Xtr: np.ndarray, ytr: np.ndarray, Xall: np.ndarray, Xte: np.ndarra
     hstep = 0.01
     X2 = Xall.copy(); X2[:, 0] += hstep
     xT, xC, xI, xV = (Tensor(Xall[:, [k]]) for k in (1, 2, 3, 4))
-    opt = Adam(params, lr=float(p["learning_rate"]))
+    lr0, n_it = float(p["learning_rate"]), int(p["iterations"])
+    opt = Adam(params, lr=lr0)
     lam_w = float(p["physics_weight"])
     Y = Tensor(ytr[:, None])
-    for _ in range(int(p["iterations"])):
+    for it in range(n_it):
         loss = (soh(states(Xtr)) - Y).square().mean() * (1 / 0.01 ** 2)
         if lam_w > 0:
             S1, S2 = states(Xall), states(X2)
@@ -11951,7 +11964,7 @@ def _est_pinn(Xtr: np.ndarray, ytr: np.ndarray, Xall: np.ndarray, Xte: np.ndarra
         for q in params:
             q.grad = np.zeros_like(q.data)
         loss.backward()
-        opt.step()
+        opt.step(lr=lr0 * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * it / max(1, n_it)))))   # cosine decay (v3)
     return np.asarray(soh(states(Xte)).data, float).ravel()
 
 
@@ -11973,19 +11986,27 @@ def estimate_soh(ct: pd.DataFrame, test_cell: str, train_cells: Sequence[str], k
     if kind == "GPR":
         pred, std = _est_gpr(_est_matrix(tr, kind), tr["SOH"].to_numpy(float), _est_matrix(te_, kind), seed=seed)
     elif kind == "PINN-est":
-        g = dict(GA_PINN_START); g.update(params or {})
-        pred = _est_pinn(_est_matrix(tr, kind), tr["SOH"].to_numpy(float), _est_matrix(tab, kind),
-                         _est_matrix(te_, kind), g, seed=seed)
+        g = dict(EST_START); g.update({k: v for k, v in (params or {}).items() if k != "seeds"})
+        n_seeds = int((params or {}).get("seeds", 1))
+        pred = np.mean([_est_pinn(_est_matrix(tr, kind), tr["SOH"].to_numpy(float), _est_matrix(tab, kind),
+                                  _est_matrix(te_, kind), g, seed=seed + s_) for s_ in range(n_seeds)], axis=0)
     else:
         raise ValueError(f"unknown estimation model {kind!r}")
     ok = te_["score_ok"].to_numpy(bool)                  # scoring only: never used by the model
     y_all = te_["SOH"].to_numpy(float)
     y, pr = y_all[ok], pred[ok]
     ss = float(np.sum((y - y.mean()) ** 2))
+    far, _ = _est_hampel(pd.Series(y), window=7, k=3.0, min_abs=0.015)          # stricter, SCORING ONLY
+    keep = ~far.to_numpy(bool)
+    yk, pk = y[keep], pr[keep]
+    ssk = float(np.sum((yk - yk.mean()) ** 2))
     return {"cell": test_cell, "kind": kind, "params": params, "n": te_["n"].to_numpy(int)[ok], "soh": y, "pred": pr,
             "std": None if std is None else std[ok], "n_all": te_["n"].to_numpy(int), "pred_all": pred,
             "rmse": 100 * float(np.sqrt(np.mean((pr - y) ** 2))),
-            "r2": 1 - float(np.sum((y - pr) ** 2)) / ss if ss > 0 else float("nan"), "train": list(train_cells)}
+            "r2": 1 - float(np.sum((y - pr) ** 2)) / ss if ss > 0 else float("nan"), "train": list(train_cells),
+            "rmse_clean": 100 * float(np.sqrt(np.mean((pk - yk) ** 2))),
+            "r2_clean": 1 - float(np.sum((yk - pk) ** 2)) / ssk if ssk > 0 else float("nan"),
+            "n_far": int(far.sum())}
 
 
 def ga_estimation(ct: pd.DataFrame, train_cells: Sequence[str], pop: int = 6, gens: int = 4, seed: int = 0,
@@ -11993,7 +12014,7 @@ def ga_estimation(ct: pd.DataFrame, train_cells: Sequence[str], pop: int = 6, ge
     """GA over GA_PINN_GENES for the estimation PINN; fitness = leave each TRAINING battery out: RMSE + 0.5 |late
     bias| (SOH points). The battery to be estimated is not among train_cells."""
     cache: Dict[Tuple, Dict[str, float]] = {}
-    names = list(GA_PINN_GENES)
+    names = list(EST_GENES)
 
     def evaluate(g: Dict[str, Any]) -> float:
         k = tuple(g[n] for n in names)
@@ -12005,8 +12026,134 @@ def ga_estimation(ct: pd.DataFrame, train_cells: Sequence[str], pop: int = 6, ge
             rmse, lb = 100 * float(np.sqrt(np.mean(np.concatenate(err) ** 2))), 100 * float(np.mean(late))
             cache[k] = {"fitness": rmse + 0.5 * abs(lb), "RMSE": rmse, "late bias": lb}
         return cache[k]["fitness"]
-    run = ga_pinn_run(evaluate, pop, gens, seed=seed, deadline=deadline)
-    best = ga_pinn_genome(run["best_key"]) if run.get("best_key") else dict(GA_PINN_START)
+    run = ga_pinn_run(evaluate, pop, gens, seed=seed, deadline=deadline, genes=EST_GENES, start=EST_START)
+    best = ga_pinn_genome(run["best_key"]) if run.get("best_key") else dict(EST_START)
     best["accel"] = int(bool(best.get("accel", 0)))
     table = pd.DataFrame([{"settings": ga_pinn_key(dict(zip(names, k))).split("|", 1)[1], **v} for k, v in cache.items()])
     return {"best": best, "table": table.sort_values("fitness").reset_index(drop=True), "done": bool(run.get("done"))}
+
+
+
+# =====================================================================================================================
+# 60. MISSION 3 · OPERATING WINDOW: the best conditions for one battery FROM TODAY (v5.44.0, STATUS 5de)
+#     A grid of temperature x discharge current x cut-off is scored from today's state (measured SOH, or the SOH
+#     ESTIMATED from today's measurements). Ageing under each candidate comes from the shared physics (identifiable
+#     mechanism laws), scaled to this battery's measured fade (m3_fade_scale); today's damage is placed on each
+#     candidate's ageing curve (same physics-equivalent damage) and ageing continues there. Charge and energy per cycle
+#     at each cut-off come from the measured discharge traces (m3_depth_table, pooled medians, relative to 2.7 V).
+#     Candidates outside the tested combinations, or using a condition the data cannot identify, are flagged.
+# =====================================================================================================================
+def _window_depth_factors(depth: Optional[pd.DataFrame], cell: str, currents: Optional[Dict[str, float]] = None
+                          ) -> Tuple[Optional[Dict[Tuple[float, Optional[float]], Tuple[float, float]]], float]:
+    """Per (cut-off voltage, discharge current): (Ah factor, Wh per Ah) relative to the 2.7 V depth, pooled medians
+    over the batteries run at that current (key current None: all batteries); and the battery's own Ah to 2.7 V.
+    v5.44.1: the battery column is 'battery' (or 'Cell_ID'); 5.44.0 read the row number and kept only 2.7 V."""
+    if depth is None or not len(depth):
+        return None, float("nan")
+    d = depth.reset_index(drop=("battery" in depth.columns or "Cell_ID" in depth.columns))
+    bcol = "battery" if "battery" in d.columns else ("Cell_ID" if "Cell_ID" in d.columns else None)
+    vcol = "V" if "V" in d.columns else None
+    if bcol is None or vcol is None:
+        raise ValueError(f"depth table needs a battery and a voltage column, got {list(d.columns)}")
+    d[vcol] = d[vcol].astype(float).round(2)
+    ref = d[np.isclose(d[vcol], M3_DEPTH_REF)].drop_duplicates(bcol).set_index(bcol)["Ah"].astype(float)
+    d = d[d[bcol].isin(ref.index)].copy()
+    d["ah_f"] = d["Ah"].astype(float).to_numpy() / ref.loc[d[bcol]].to_numpy()
+    d["wh_f"] = d["Wh"].astype(float).to_numpy() / ref.loc[d[bcol]].to_numpy()
+    d["I"] = d[bcol].map(currents).astype(float) if currents else np.nan
+    out: Dict[Tuple[float, Optional[float]], Tuple[float, float]] = {}
+    for v, g in d.groupby(vcol):
+        out[(float(v), None)] = (float(np.nanmedian(g["ah_f"])), float(np.nanmedian(g["wh_f"])))
+        if currents:
+            for i_, gi in g.dropna(subset=["I"]).groupby("I"):
+                out[(float(v), float(i_))] = (float(np.nanmedian(gi["ah_f"])), float(np.nanmedian(gi["wh_f"])))
+    own_ref = float(ref.loc[cell]) if cell in ref.index else float(np.nanmedian(ref.to_numpy(float)))
+    return out, own_ref
+
+
+def m3_operating_window(h: Dict[str, Any], cell: str, n_now: float, soh_now: float, soh_eol: float,
+                        T_values: Sequence[float], I_values: Sequence[float], V_values: Sequence[float],
+                        depth: Optional[pd.DataFrame] = None, groups: Optional[pd.DataFrame] = None,
+                        max_cycles: int = 4000) -> Dict[str, Any]:
+    """Score every (T, I, V_cut) candidate for `cell` from today (cycle n_now, SOH soh_now): remaining cycles to
+    soh_eol, energy delivered until then, flags. Returns {"table": DataFrame, "traj": {(T, I, V): (cycles, SOH)},
+    "own": (T, I, V)}."""
+    if cell not in h["data"]:
+        raise ValueError(f"{cell} is not among the batteries the shared physics was fitted to")
+    cd = h["data"][cell]
+    mech = _nasa_spec(h.get("version", 2))[3]
+    tested = whatif_tested(h, groups)
+    own = tested["by_battery"].loc[cell]
+    own_c = (float(own["T_C tested"]), float(own["I_dis tested"]), float(own["V_cut tested"]))
+    ident = whatif_identifiability(h, groups).set_index("key")
+    k = m3_fade_scale(h, cell)
+    n_rec, a_rec = np.asarray(cd["n"], float), np.asarray(cd["a"], float)
+    slope = float(np.polyfit(n_rec, a_rec, 1)[0]) if len(n_rec) >= 2 else float(a_rec[-1] / max(n_rec[-1], 1))
+    currents = {b: float(tested["by_battery"].loc[b, "I_dis tested"]) for b in tested["by_battery"].index}
+    dep, own_ref_ah = _window_depth_factors(depth, cell, currents)
+
+    def depth_at(v: float, i: Optional[float] = None) -> Optional[Tuple[float, float]]:
+        """Measured depth factors at cut-off v: from batteries run at current i when they reached v, else pooled."""
+        if dep is None:
+            return None
+        vs = sorted({k[0] for k in dep})
+        if not vs:
+            return None
+        vk = min(vs, key=lambda x: abs(x - v))
+        if abs(vk - v) > 0.051:
+            return None
+        if i is not None and (vk, float(i)) in dep:
+            return dep[(vk, float(i))]
+        return dep.get((vk, None))
+    own_depth = depth_at(own_c[2], own_c[1])
+    damage_now = max(0.0, (1.0 - float(soh_now)) / max(k, 1e-9))      # physics-equivalent damage today
+    rows, traj = [], {}
+    for T in T_values:
+        for I in I_values:
+            for V in V_values:
+                combo = (float(T), float(I), float(V))
+                dX = depth_at(V, I)
+                ah_f = (dX[0] / own_depth[0]) if (dX and own_depth) else 1.0
+                slope_x = slope * ah_f                                 # throughput per cycle under this operation
+                a_big = np.linspace(0.0, max(a_rec[-1], slope_x * max_cycles) * 1.05 + 1e-6, 6000)
+                cdx = _whatif_cd(cd, a_big, T_C=None if np.isclose(T, own_c[0]) else T,
+                                 I_dis=None if np.isclose(I, own_c[1]) else I, V_cut=None if np.isclose(V, own_c[2]) else V)
+                s, pl, m = mech(h["params"], cdx)
+                loss = 1.0 - (1 - np.asarray(s) - np.asarray(pl)) * (1 - np.asarray(m))     # physics capacity loss
+                loss = np.maximum.accumulate(np.asarray(loss, float))  # damage never decreases along the curve
+                if damage_now >= loss[-1]:
+                    a_eq = a_big[-1]
+                else:
+                    a_eq = float(np.interp(damage_now, loss, a_big))
+                j = np.arange(1, max_cycles + 1, dtype=float)
+                a_j = a_eq + j * slope_x
+                soh_j = 1.0 - k * np.interp(a_j, a_big, loss)
+                hit = np.nonzero(soh_j <= soh_eol)[0]
+                cyc = int(hit[0]) + 1 if len(hit) else max_cycles
+                wh_cycle = own_ref_ah * dX[1] if (dX and np.isfinite(own_ref_ah)) else float("nan")
+                energy = float(np.sum(soh_j[:cyc]) * wh_cycle) if np.isfinite(wh_cycle) else float("nan")
+                flags = []
+                if combo[0:3] not in {tuple(map(float, c_)) for c_ in tested["sets"]}:
+                    flags.append("combination not tested")
+                for key, val, own_v in (("T_C", T, own_c[0]), ("I_dis", I, own_c[1]), ("V_cut", V, own_c[2])):
+                    if np.isclose(val, own_v):
+                        continue
+                    stt = ident.loc[key, "status"] if key in ident.index else "unknown"
+                    if stt == "not identifiable":
+                        flags.append(f"{WHATIF_CONDITIONS[key]['label'].split(' (')[0]} not identifiable")
+                    elif stt == "limited":
+                        flags.append(f"{WHATIF_CONDITIONS[key]['label'].split(' (')[0]} effect limited")
+                    if not any(abs(val - v_) <= WHATIF_CONDITIONS[key]["round"] / 2 + 1e-9 for v_ in tested["values"][key]):
+                        flags.append(f"{key} value not tested")
+                if dX is None:
+                    flags.append("no measured energy at this cut-off")
+                rows.append({"T_C": combo[0], "I_dis": combo[1], "V_cut": combo[2], "own": combo == own_c,
+                             "remaining cycles": cyc, "reached EOL": bool(len(hit)), "Wh per cycle (new)": wh_cycle,
+                             "energy to EOL (Wh)": energy, "flags": "; ".join(flags)})
+                traj[combo] = (n_now + np.arange(0, cyc + 1), np.r_[soh_now, soh_j[:cyc]])
+    tab = pd.DataFrame(rows)
+    own_row = tab[tab["own"]]
+    if len(own_row):
+        tab["life vs own"] = tab["remaining cycles"] / float(own_row["remaining cycles"].iloc[0])
+        tab["energy vs own"] = tab["energy to EOL (Wh)"] / float(own_row["energy to EOL (Wh)"].iloc[0])
+    return {"table": tab, "traj": traj, "own": own_c, "fade scale k": k, "damage now": damage_now}
