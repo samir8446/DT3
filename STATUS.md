@@ -1623,6 +1623,27 @@ M3 · What benefit is expected? Reference: +40 % lifecycle profit per hour vs us
   GPR's LOBO RMSE); final GA-PINN and default PINN average 3 seeds; table with far-point-excluded scores; window
   start prefers GA-PINN + GPR. 46 tests, all pages, md_check 0.
 
+## 5dk. Platform 5.45.0 estimation results (RMSE SOH pts: GPR / GA-PINN / GA-PINN + GPR)
+- B0030 1.45 / 1.45 / 1.38 (GA-PINN was 3.89: clipping fixed the flat line); B0031 1.48 / 0.83 / 1.05; B0032 1.43 /
+  0.63 / 0.67; B0047 3.11 / 1.80 / 2.30; B0048 2.09 / 1.93 / 1.98; B0041 6.00 / 7.69 / 6.17 (data limit: first 45
+  cycles invalid, 4 A unlike its group -> report as excluded with reason).
+- GA winners mostly lambda 0 or 0.1 with the knee term (a1): light physics residual, physics-shaped structure.
+- GA-PINN best or equal on 5 of 6 in Hot / Cold (where the GPR won in the Colab batch before the fixes).
+- Cleaning: points > 3 SOH pts (and 4 robust std) from their neighbours are already removed for training batteries
+  and excluded from the target's score; remaining 1-5 pt scatter is mostly regeneration (real) -> no lower threshold
+  for the main score; the far-point-excluded column shows the stricter view.
+
+## 5dl. v5.45.1: clipping margin as a GA gene (B0006 regressed with hard clipping)
+- Platform 5.45.0: B0005 GA-PINN 0.86 (R^2 0.993; was 1.01), GPR 1.52, combined 0.96; B0006 GA-PINN 4.60 (R^2 0.863;
+  was 1.16 / 0.991 in 5.43), GPR 5.36, combined 4.66 -> hard clipping to the training range removed the extrapolation
+  B0006 needs (fades to 58 %, below its training batteries): flat near 70 % after cycle 110, like the GPR.
+- Fix (ESTIMATION_VERSION 4): gene "clip" in EST_GENES (0 = hard clip, 0.25, 1.0 x the training range allowed beyond
+  its edges), EST_START clip 0.25; est_key labels; GA winner read from run["best"] (the GA-PINN key has six tags).
+  Demo out-of-range case (training cut at cycle 60): late-life RMSE 6.17 (clip 0) -> 5.80 (0.25) / 5.77 (1.0).
+  Limitation: the GA chooses the margin from training-battery validation, which may not reveal how far a test
+  battery goes out of range.
+- Working folder rebuilt from the delivered files after an environment reset; 46 tests, all 8 pages, GA-PINN path.
+
 ## 6. Next steps
 1. Writing (all six plan questions answered, 5bg): Mission 2 chapter -> physics chapter -> Mission 3 chapter ->
    Mission 1 dataset report + literature survey -> final presentation (demonstration case: B0006).

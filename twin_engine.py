@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.45.0"
+ENGINE_VERSION = "5.45.1"
 CACHE_VERSION = "5.42.0"      # bump only when an EXISTING computation changes (5.43.0 only adds SOH estimation)
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
@@ -11820,13 +11820,20 @@ ESTIMATION_MODELS: Dict[str, str] = {
     "GPR": "GPR · Gaussian process on honest indicators (Matern 1.5, one length scale per input)",
     "PINN-est": "Estimation PINN · physics-informed, inputs = clock + conditions + the cycle's indicators"}
 EST_C_NOM = 2.0                                          # ageing clock uses the nominal capacity, never the measured one
-ESTIMATION_VERSION = "3"     # 2: network inputs = clock + measured indicators only (conditions only in the rate laws)
+ESTIMATION_VERSION = "4"     # 2: network inputs = clock + measured indicators only (conditions only in the rate laws)
                              # 3: inputs clipped to the training range, training-only scaling, cosine learning rate,
                              #    final estimate = mean of `seeds` trainings, wider genes (Colab study, STATUS 5dj)
 EST_GENES: Dict[str, Tuple[Any, ...]] = {
     "hidden": (16, 32, 48, 64), "learning_rate": (0.002, 0.005, 0.01), "physics_weight": (0.0, 0.1, 0.3, 1.0, 3.0),
-    "sei_p": (1.0, 0.5, 0.0), "accel": (0, 1), "iterations": (600, 1000, 1500)}
-EST_START = {"hidden": 32, "learning_rate": 0.005, "physics_weight": 0.3, "sei_p": 0.5, "accel": 0, "iterations": 1000}
+    "sei_p": (1.0, 0.5, 0.0), "accel": (0, 1), "iterations": (600, 1000, 1500),
+    "clip": (0.0, 0.25, 1.0)}      # v4: inputs may exceed the training range by clip x (its width); 0 = hard clip
+EST_START = {"hidden": 32, "learning_rate": 0.005, "physics_weight": 0.3, "sei_p": 0.5, "accel": 0, "iterations": 1000,
+             "clip": 0.25}
+
+
+def est_key(g: Dict[str, Any]) -> str:
+    """Readable label of an estimation genome (adds the clipping margin to the GA-PINN key)."""
+    return ga_pinn_key({k: g[k] for k, _ in _GA_TAGS}).split("|", 1)[1] + f"|c{float(g.get('clip', 0.0)):g}"
 
 
 def _est_hampel(s: pd.Series, window: int = 9, k: float = 4.0, min_abs: float = 0.0,
@@ -11918,6 +11925,8 @@ def _est_pinn(Xtr: np.ndarray, ytr: np.ndarray, Xall: np.ndarray, Xte: np.ndarra
     net_cols = [0] + list(range(5, Xall.shape[1]))       # clock + indicators
     mu, sd = Xtr[:, net_cols].mean(0), Xtr[:, net_cols].std(0) + 1e-9      # training batteries only (v3)
     lo, hi = Xtr[:, net_cols].min(0), Xtr[:, net_cols].max(0)               # range seen in training (v3)
+    margin = float(p.get("clip", 0.0)) * (hi - lo)                          # v4: allowed excursion beyond it
+    lo, hi = lo - margin, hi + margin
     H = int(p["hidden"])
     g_ = lambda *s_: Tensor(rng.normal(0, 1 / math.sqrt(s_[0]), size=s_))
     W1, b1 = g_(len(net_cols), H), Tensor(np.zeros((1, H)))
@@ -12027,9 +12036,9 @@ def ga_estimation(ct: pd.DataFrame, train_cells: Sequence[str], pop: int = 6, ge
             cache[k] = {"fitness": rmse + 0.5 * abs(lb), "RMSE": rmse, "late bias": lb}
         return cache[k]["fitness"]
     run = ga_pinn_run(evaluate, pop, gens, seed=seed, deadline=deadline, genes=EST_GENES, start=EST_START)
-    best = ga_pinn_genome(run["best_key"]) if run.get("best_key") else dict(EST_START)
+    best = dict(run["best"]) if run.get("best") else dict(EST_START)
     best["accel"] = int(bool(best.get("accel", 0)))
-    table = pd.DataFrame([{"settings": ga_pinn_key(dict(zip(names, k))).split("|", 1)[1], **v} for k, v in cache.items()])
+    table = pd.DataFrame([{"settings": est_key(dict(zip(names, k))), **v} for k, v in cache.items()])
     return {"best": best, "table": table.sort_values("fitness").reset_index(drop=True), "done": bool(run.get("done"))}
 
 

@@ -49,7 +49,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.45.0"
+REQUIRED_ENGINE = "5.45.1"
 if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
@@ -6548,7 +6548,7 @@ def ga_est_resumable(train_t: Tuple[str, ...], deadline: Optional[float], note: 
         run = te.ga_pinn_run(evaluate, 6, 4, seed=0, genes=getattr(te, "EST_GENES", None), start=getattr(te, "EST_START", None))
     except TimeoutError:
         return {"done": False}
-    best = te.ga_pinn_genome(run["best_key"]) if run.get("best_key") else dict(getattr(te, "EST_START", te.GA_PINN_START))
+    best = dict(run["best"]) if run.get("best") else dict(getattr(te, "EST_START", te.GA_PINN_START))
     best["accel"] = int(bool(best.get("accel", 0)))
     bj = json.dumps({k: (int(v) if k == "accel" else v) for k, v in best.items()}, sort_keys=True, default=float)
     return {"done": True, "best": best, "val_rmse": rmse_of.get(bj, float("nan"))}
@@ -6575,7 +6575,7 @@ def run_estimator(cell: str, train: Sequence[str], choice: str, deadline: Option
         g = ga["best"]
         r = dict(est_cached(CT_RAW, DATA_KEY, cell, train_t, "PINN-est",
                             json.dumps({**g, "seeds": EST_FINAL_SEEDS}, sort_keys=True, default=float)))
-        r["label"] = "Estimation GA-PINN · " + te.ga_pinn_key(g).split("|", 1)[1]
+        r["label"] = "Estimation GA-PINN · " + (te.est_key(g) if hasattr(te, "est_key") else te.ga_pinn_key(g).split("|", 1)[1])
         if choice == "GA-PINN-GPR":
             rg = est_cached(CT_RAW, DATA_KEY, cell, train_t, "GPR", "null")
             rm_p, rm_g = ga["val_rmse"], gpr_val_rmse(train_t)
