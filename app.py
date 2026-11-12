@@ -86,11 +86,15 @@ DATA_DIR = APP_DIR / "data"
 RESULTS_DIR = APP_DIR / "results"
 MASTER_NAME, IMP_NAME = "battery_master_data.parquet", "impedance_ground_truth.parquet"
 POLICIES = ["Twin-Aware", "Fixed 1 A", "Fixed 2 A", "Fixed 4 A"]
-V_HOME, V_DATA = ":material/home: Home", ":material/monitoring: Diagnostics"
-V_MODELS, V_UPDATE = ":material/psychology: Models & forecasting", ":material/update: Model updating"
-V_LIVE, V_OPS, V_STUDY = ":material/play_circle: Live twin", ":material/tune: Operations & control", ":material/fact_check: Study results"
-V_TWIN = ":material/hub: Integrated twin"
-VIEWS = [V_HOME, V_DATA, V_MODELS, V_UPDATE, V_LIVE, V_TWIN, V_OPS, V_STUDY]   # v5.30: integrated twin after the live twin
+V_HOME, V_DATA = ":material/home: Home", ":material/monitoring: 1 · Data & diagnostics"
+V_TWIN = ":material/hub: 2 · GA-PINN twin"
+V_MODELS = ":material/psychology: 3 · Model comparison"
+V_OPS = ":material/tune: 4 · Mission 3 · Operation & maintenance"
+V_STUDY = ":material/fact_check: 5 · Study results"
+V_LIVE, V_UPDATE = ":material/play_circle: Appendix · EKF live twin", ":material/update: Appendix · Model updating"
+# v5.46 (meeting build): one story, data -> diagnostics -> the GA-PINN twin -> model comparison -> Mission 3 ->
+# results; the EKF twin and the update studies are kept, in an appendix
+VIEWS = [V_HOME, V_DATA, V_TWIN, V_MODELS, V_OPS, V_STUDY, V_LIVE, V_UPDATE]
 SANS = "IBM Plex Sans, Segoe UI, Helvetica Neue, Arial, sans-serif"
 SERIF = "'STIX Two Text', 'Times New Roman', Times, serif"
 
@@ -3900,13 +3904,13 @@ def view_home() -> None:
     chips = "".join(f'<div class="bt-mchip bt-m-{v.split()[0]}"><b>{m}</b> {html.escape(v)}</div>' for m, v in status.items())
     st.markdown(f'<div class="bt-mstrip">{chips}</div>', unsafe_allow_html=True)
     section("Where to start")
-    cards = [("Diagnostics", V_DATA, "See one battery in 3D, its health, ageing, mechanisms and stress."),
-             ("Models & forecasting", V_MODELS, "Climb the learning ladder from baselines to first principles."),
-             ("Model updating", V_UPDATE, "How often the twin's models must update, and how."),
-             ("Live twin", V_LIVE, "Replay a battery cycle by cycle: the models learn, forecast and detect anomalies live."),
-             ("Integrated twin", V_TWIN, "One battery, one view: forecast, anomalies, why it ages, and what-if."),
-             ("Operations & control", V_OPS, "Anomalies, then Mission 3: best operation, when to replace, lifecycle benefit."),
-             ("Study results", V_STUDY, "Run the cohort study and get the answers to the three Missions.")]
+    cards = [("1 · Data & diagnostics", V_DATA, "Mission 1: one battery's health, ageing, mechanisms and operating stress."),
+             ("2 · GA-PINN twin", V_TWIN, "Mission 2: the twin. Its state today, its forecast with uncertainty, why it ages."),
+             ("3 · Model comparison", V_MODELS, "Mission 2: SOH estimation and forecasting, GA-PINN against the other models."),
+             ("4 · Mission 3", V_OPS, "Best operation, operating window, when to replace, lifecycle benefit, and a summary."),
+             ("5 · Study results", V_STUDY, "The answers to the three Missions, and the report export."),
+             ("Appendix · EKF live twin", V_LIVE, "The Kalman-filter twin on [SOH, R_int, R_ct], replayed cycle by cycle."),
+             ("Appendix · Model updating", V_UPDATE, "How often each twin must update, and how.")]
     cols = st.columns(len(cards))
     for c_, (t, v, d) in zip(cols, cards):
         with c_:
@@ -8702,8 +8706,197 @@ def m3_forecast_section(fleet: Dict[str, Any]) -> None:
                  "Diamonds: predicted end of life; dashed lines: threshold and real end of life.")
 
 
+def m3_intro() -> None:
+    """Mission 3 at a glance: the three questions, and where each is answered on this page."""
+    section("Mission 3 · Operation and maintenance")
+    st.markdown(
+        "Mission 3 turns the twin into decisions. **(1) How should a battery be operated?** The operation study "
+        "(1) compares the operations NASA tested; the operating window (1b) explores a grid of conditions for one "
+        "battery; the general window (1c) does it for every battery. **(2) When should it be replaced?** The "
+        "replacement study (2) compares the twin with a fixed age and run-to-failure. **(3) What is the benefit?** "
+        "The lifecycle study (3) combines operation and replacement. The **summary** at the end of the page collects "
+        "the answers for the meeting and the thesis.")
+
+
+def m3_general_window_section(fleet: Dict[str, Any]) -> None:
+    """Mission 3 · 1c. The operating window for EVERY battery, each simulated as new, over a grid inside NASA's tested
+    ranges; scenarios are scored relative to each battery's best, then averaged (the Colab study of 11 Nov 2026)."""
+    section("Mission 3 · 1c. General operating window: the best conditions for every battery")
+    st.markdown(
+        "Every battery of the shared physics is simulated **as a new battery** under every scenario of a grid inside "
+        "the ranges NASA tested. Each scenario's lifetime energy is expressed **relative to that battery's best** "
+        "(1 = its best), then averaged over the batteries: a scenario that is good for most batteries is a general "
+        "recommendation.")
+    st.warning("Not a validated prediction: the ageing of each battery is scaled to its own recorded fade (a fit to "
+               "its whole life), and the shared physics is fitted on all batteries. Use the RANKING of conditions; "
+               "the absolute cycle counts are indicative. The data cannot identify an effect of discharge current.",
+               icon=":material/warning:")
+    h = fleet.get("main")
+    if h is None:
+        placeholder("The general window needs the shared physics (fleet-wide parts).")
+        return
+    groups = te.condition_groups(CT_RAW)
+    tested = te.whatif_tested(h, groups)
+    v = tested["values"]
+    c1, c2, c3 = st.columns(3)
+    n_t = c1.select_slider("Temperatures", [3, 5, 7, 9], value=9, key="gen_nt")
+    n_i = c2.select_slider("Currents", [2, 3, 5, 7], value=7, key="gen_ni")
+    n_v = c3.select_slider("Cut-offs", [2, 4, 6, 8], value=8, key="gen_nv")
+    T_sc = np.round(np.linspace(min(v["T_C"]), max(v["T_C"]), n_t), 1)
+    I_sc = np.round(np.linspace(min(v["I_dis"]), max(v["I_dis"]), n_i), 2)
+    cells = sorted(h["data"])
+    gkey = (DATA_KEY, n_t, n_i, n_v)
+    if st.button(f"Simulate {n_t * n_i * n_v} scenarios x {len(cells)} batteries", key="gen_go", type="primary",
+                 icon=":material/grid_view:"):
+        try:
+            depth = m3_depth_cached(CT_RAW, DATA_KEY, tuple(cells)) if store is not None else None
+            dv = depth.reset_index(drop=("battery" in depth.columns)) if depth is not None and len(depth) else None
+            v_lo = max(2.0, float(dv["V"].min())) if dv is not None else 2.7
+            V_sc = np.round(np.linspace(v_lo, 2.7, n_v), 2)
+            rows, bar = [], st.progress(0.0, text="Simulating…")
+            for j, b in enumerate(cells):
+                try:
+                    W = te.m3_operating_window(h, b, 0, 1.0, m3_soh_eol_for(b, "nasa"), T_sc, I_sc, V_sc, depth=depth,
+                                               groups=groups)["table"]
+                    W = W.assign(battery=b, group=str(groups.loc[b, "Group"]) if b in groups.index else "")
+                    W["relative energy"] = W["energy to EOL (Wh)"] / W["energy to EOL (Wh)"].max()
+                    W["in top 10 %"] = W["relative energy"] >= W["relative energy"].quantile(0.9)
+                    rows.append(W)
+                except Exception:
+                    pass
+                bar.progress((j + 1) / len(cells), text=f"{b} done")
+            bar.empty()
+            st.session_state["m3_gen"] = {"key": gkey, "all": pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()}
+        except Exception as exc:
+            report_error("general operating window", exc, False)
+    R = st.session_state.get("m3_gen")
+    if not R or R["key"] != gkey or not len(R["all"]):
+        placeholder("Press the button (about 10 s per battery on Streamlit Cloud).")
+        return
+    A = R["all"]
+    G = (A.groupby(["T_C", "I_dis", "V_cut"])
+         .agg(**{"mean relative energy": ("relative energy", "mean"), "worst battery": ("relative energy", "min"),
+                 "share of batteries in their top 10 %": ("in top 10 %", "mean"),
+                 "median cycles to EOL": ("remaining cycles", "median"),
+                 "cycles, 10 % battery": ("remaining cycles", lambda x: x.quantile(0.1)),
+                 "cycles, 90 % battery": ("remaining cycles", lambda x: x.quantile(0.9)),
+                 "median energy to EOL (Wh)": ("energy to EOL (Wh)", "median")})
+         .reset_index().sort_values("mean relative energy", ascending=False).reset_index(drop=True))
+    st.session_state["m3_gen"]["summary"] = G
+    best = G.iloc[0]
+    k = st.columns(4)
+    k[0].metric("Best general operation", f"{best['T_C']:g} °C · {best['I_dis']:g} A · {best['V_cut']:g} V")
+    k[1].metric("Median cycles to EOL", f"{best['median cycles to EOL']:.0f}",
+                delta=f"{best['cycles, 10 % battery']:.0f}–{best['cycles, 90 % battery']:.0f} (10–90 %)", delta_color="off")
+    k[2].metric("Top-10 % choice for", f"{100 * best['share of batteries in their top 10 %']:.0f} % of batteries")
+    k[3].metric("Lives simulated", f"{len(A):,}")
+    show_table(G.head(5).style.format({"T_C": "{:g}", "I_dis": "{:g}", "V_cut": "{:g}", "mean relative energy": "{:.3f}",
+                                       "worst battery": "{:.3f}", "share of batteries in their top 10 %": "{:.0%}",
+                                       "median cycles to EOL": "{:.0f}", "cycles, 10 % battery": "{:.0f}",
+                                       "cycles, 90 % battery": "{:.0f}", "median energy to EOL (Wh)": "{:.0f}"}),
+               note="Top 5 scenarios by mean relative lifetime energy (1 = each battery's best).")
+    T_mid = sorted(G["T_C"].unique())[len(G["T_C"].unique()) // 2]
+    tsel = st.select_slider("Temperature of the maps (°C)", sorted(G["T_C"].unique()), value=T_mid, key="gen_tmap")
+    M1 = G[np.isclose(G["T_C"], tsel)].pivot_table(index="V_cut", columns="I_dis", values="mean relative energy")
+    M2 = G[np.isclose(G["T_C"], tsel)].pivot_table(index="V_cut", columns="I_dis", values="median cycles to EOL")
+    m1, m2 = st.columns(2)
+    for col_, M, title, cs, fmt_ in ((m1, M1, "Mean relative lifetime energy", "Viridis", ".2f"),
+                                     (m2, M2, "Median cycles to end of life", "Magma", ".0f")):
+        fig = go.Figure(go.Heatmap(z=M.to_numpy(), x=[f"{x:g} A" for x in M.columns], y=[f"{y:g} V" for y in M.index],
+                                   colorscale=cs, texttemplate=f"%{{z:{fmt_}}}", hovertemplate="%{y} · %{x}: %{z}<extra></extra>"))
+        fig.update_layout(title=f"{title} at {tsel:g} °C", height=360, margin=dict(l=10, r=10, t=40, b=10))
+        col_.plotly_chart(fig, width="stretch", key=f"gen_map_{title}")
+    sel = A[np.isclose(A["I_dis"], best["I_dis"]) & np.isclose(A["V_cut"], best["V_cut"])].groupby("T_C")["remaining cycles"]
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=list(sel.quantile(0.9).index) + list(sel.quantile(0.1).index[::-1]),
+                             y=list(sel.quantile(0.9).values) + list(sel.quantile(0.1).values[::-1]), fill="toself",
+                             line=dict(width=0), opacity=0.25, name="10–90 % of batteries", hoverinfo="skip"))
+    fig.add_trace(go.Scatter(x=sel.median().index, y=sel.median().values, mode="lines+markers", name="median"))
+    fig.update_layout(title=f"Temperature effect at {best['I_dis']:g} A · {best['V_cut']:g} V", height=330,
+                      xaxis_title="temperature (°C)", yaxis_title="cycles to end of life", margin=dict(l=10, r=10, t=40, b=10))
+    st.plotly_chart(fig, width="stretch", key="gen_temp")
+    download("Download all simulated lives (CSV)", A.to_csv(index=False).encode(), "general_operating_window.csv",
+             "text/csv", key="gen_dl")
+
+
+def m3_summary_section() -> None:
+    """Mission 3 · summary: the three answers and one decision per battery, from the studies above (same run)."""
+    section("Mission 3 · Summary: the answers, and one decision per battery")
+    ss = st.session_state
+    maint, life, ops, gen = ss.get("m3_maint"), ss.get("m3_life"), ss.get("m3_ops"), ss.get("m3_gen")
+    missing = [n for n, x in (("operation study (1)", ops), ("general window (1c)", gen), ("replacement study (2)", maint),
+                              ("lifecycle study (3)", life)) if x is None or (isinstance(x, pd.DataFrame) and not len(x))]
+    if missing:
+        st.info("Run these studies above to complete the summary: " + ", ".join(missing) + ".")
+    answers = []
+    if gen is not None and "summary" in gen:
+        b = gen["summary"].iloc[0]
+        answers.append(("How should a battery be operated?",
+                        f"In general: **{b['T_C']:g} °C, {b['V_cut']:g} V cut-off** (median {b['median cycles to EOL']:.0f} "
+                        f"cycles to end of life; a top-10 % choice for {100 * b['share of batteries in their top 10 %']:.0f} % "
+                        "of the batteries). A shallower cut-off helps; cold operation is very harmful. Current: not "
+                        "identifiable from the data."))
+    if maint is not None and "summary" in maint:
+        s = maint["summary"]
+        def share(pol):
+            return f"{100 * s.loc[pol, 'share of perfect-knowledge gain']:.0f} %" if pol in s.index else "–"
+        answers.append(("When should it be replaced?",
+                        f"With the **twin plus an age limit**: {share('twin + age limit')} of the possible gain, against "
+                        f"{share('best fixed age')} for the best fixed age and 0 % for run to failure (twin alone "
+                        f"{share('twin-informed')}). The age limit catches lives too short to forecast in time."))
+    if life is not None and "summary" in life:
+        summ = life["summary"]
+        gcol = "vs usual practice (% of operating profit per hour)"
+        parts = []
+        for gname in summ.index.get_level_values(0).unique():
+            if gname == "all":
+                continue
+            try:
+                parts.append(f"{gname} {summ.loc[(gname, 'twin strategy'), gcol]:+.0f} %")
+            except Exception:
+                pass
+        answers.append(("What is the benefit?", "Twin strategy (replacement + operation) against usual practice, profit "
+                        "per hour: **" + ", ".join(parts) + "**. Prices are assumptions: the ranking is meaningful, the "
+                        "absolute profits are not."))
+    for q, a in answers:
+        st.markdown(f"**{q}** {a}")
+    if maint is not None and "per" in maint:
+        per = maint["per"]
+        rows = []
+        for (bat, grp), g in per.groupby(["battery", "group"]):
+            pol = g.set_index("policy")
+            r = {"battery": bat, "group": grp,
+                 "end of life (cycle)": float(g["end of life"].iloc[0]) if "end of life" in g else np.nan}
+            for name, col in (("twin + age limit", "replace at (twin + age limit)"), ("best fixed age", "replace at (fixed age)")):
+                if name in pol.index:
+                    r[col] = float(pol.loc[name, "replace at"])
+                    r[f"failure before ({name})"] = bool(pol.loc[name, "unplanned"])
+            if ops is not None and len(ops) and "battery" in ops:
+                o = ops[ops["battery"] == bat]
+                if len(o):
+                    b_ = o.sort_values("profit rate (per hour)", ascending=False).iloc[0]
+                    r["best tested operation"] = f"{b_['I_dis']:g} A · {b_['V_cut']:g} V"
+            rows.append(r)
+        D = pd.DataFrame(rows).set_index(["group", "battery"]).sort_index()
+        show_table(D, note="One decision per battery: when the twin (with an age limit) replaces it against the fixed "
+                           "age, whether the battery failed first, and its most profitable tested operation.")
+        lines = [f"- **{q}** {a}" for q, a in answers]
+        Dr = D.reset_index().astype(str)
+        table_md = "| " + " | ".join(Dr.columns) + " |\n|" + "---|" * len(Dr.columns) + "\n" + \
+            "\n".join("| " + " | ".join(r) + " |" for r in Dr.to_numpy())
+        report = "# Mission 3 · summary\n\n" + "\n".join(lines) + "\n\n" + table_md + "\n"
+        cA, cB = st.columns(2)
+        with cA:
+            download("Download the decision table (CSV)", D.reset_index().to_csv(index=False).encode(),
+                     "mission3_decisions.csv", "text/csv", key="m3_sum_csv")
+        with cB:
+            download("Download the summary (Markdown)", report.encode(), "mission3_summary.md", "text/markdown",
+                     key="m3_sum_md")
+
+
 def view_ops() -> None:
     recommendations("ops")
+    m3_intro()
     anomaly_section()
     p = m3_prices()
     fleet = twin_fleet_parts(build=False)
@@ -8718,9 +8911,11 @@ def view_ops() -> None:
             return
     m3_operation_section(fleet, p)
     m3_window_section(fleet)
+    m3_general_window_section(fleet)
     m3_forecast_section(fleet)
     m3_maintenance_section(fleet, p)
     m3_lifecycle_section(fleet, p)
+    m3_summary_section()
 
 
 # =============================================================================
