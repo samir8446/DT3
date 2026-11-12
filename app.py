@@ -49,7 +49,7 @@ import twin_engine as te
 # ---- engine / app version handshake -------------------------------------------------------------
 # Streamlit can keep an old copy of twin_engine in memory after a redeploy (it reruns app.py but does
 # not always re-import changed modules), and app.py and twin_engine.py must come from the same release.
-REQUIRED_ENGINE = "5.45.1"
+REQUIRED_ENGINE = "5.45.2"
 if str(getattr(te, "ENGINE_VERSION", "0")) != REQUIRED_ENGINE:
     import importlib
     te = importlib.reload(te)
@@ -6920,9 +6920,11 @@ def anomaly_section() -> None:
         "capacity regeneration shifts the level but hardly the slope. An alarm is a prompt to inspect, not a diagnosis.")
     c1, c2 = st.columns(2)
     kappa_thr = c1.select_slider("FLEET threshold (κ)", [1.5, 1.8, 2.2], value=1.8, key="an2_k",
-                                 help="1.8: validated (fast batteries found at cycle 12, healthy ones 0.44-1.30).")
+                                 help="1.8: chosen on the simulated cohort below. On NASA, the injected-fault benchmark "
+                                      "(next section) found this detector misses most faults: see the residual CUSUM.")
     z_thr = c2.select_slider("OWN threshold (z)", [2.5, 3.0, 4.0], value=3.0, key="an2_z",
-                             help="3.0: validated (all knees found, no false alarm despite regeneration).")
+                             help="3.0: chosen on the simulated cohort below (knees found, no false alarm there). The "
+                                  "OWN indicator needs 60 cycles of history, so it cannot fire on short-lived batteries.")
     with st.expander("Check the detector on simulated batteries with known anomalies and regeneration (about 10 s)"):
         st.caption("11 batteries, all with NASA-like capacity regeneration every 18-25 cycles: three get a knee from "
                    "cycle 53 (R2, C2, H3), two age 2.5 times faster from the start (R3, C3), six are healthy with normal "
@@ -7640,7 +7642,8 @@ def m3_window_section(fleet: Dict[str, Any]) -> None:
         "Choose a battery and **today's cycle**. Its state today is either the **measured SOH** or the SOH **estimated "
         "from today's measurements** (run the estimation for this battery on the Models page first). Every candidate "
         "condition of the grid is then projected to end of life: ageing from the **shared physics** (identifiable "
-        "mechanism laws), scaled to this battery's measured fade; charge and energy per cycle at each cut-off from the "
+        "mechanism laws), scaled with the fade factor of the OTHER batteries of its group (leave-one-battery-out); charge "
+        "and energy per cycle at each cut-off from the "
         "**measured discharge traces**. Today's damage is placed on each candidate's ageing curve and ageing continues "
         "from there. Candidates outside what NASA tested, or using a condition the data cannot identify, are flagged.")
     h = fleet.get("main")
@@ -8706,6 +8709,81 @@ def m3_forecast_section(fleet: Dict[str, Any]) -> None:
                  "Diamonds: predicted end of life; dashed lines: threshold and real end of life.")
 
 
+def cusum_section() -> None:
+    """Mission 3 · fault detection with the residual CUSUM (engine section 61), and its injected-fault benchmark."""
+    section("Mission 3 · Fault detection with the residual CUSUM (validated on injected faults)")
+    st.markdown(
+        "A second detector, built for short lives. Each cycle, the battery's SOH is forecast from a robust straight "
+        "line through its **last 10 valid cycles**; the error (measured minus forecast) is scaled by the battery's own "
+        "past errors and accumulated in a **one-sided CUSUM**: only cycles **lower than expected** count, so capacity "
+        "regeneration (upward jumps) does not. One bad cycle can add only a bounded amount, so a single glitch cannot "
+        "raise an alarm. It needs about 15 cycles of history (the detector above needs 60 for its OWN indicator). "
+        "The **regeneration-aware** variant also pauses for 5 cycles after each regeneration event, so the relapse that "
+        "follows a rest is not mistaken for a fault. An alarm is a prompt to inspect, not a diagnosis.")
+    c1, c2 = st.columns(2)
+    k = c1.select_slider("Allowance k", [0.5, 1.0], value=te.CUSUM_K, key="cu_k",
+                         help="0.5 (default, fixed before the benchmark): more sensitive; 1.0: fewer alarms.")
+    h = c2.select_slider("Alarm threshold h", [3.0, 5.0, 8.0], value=te.CUSUM_H, key="cu_h",
+                         help="5 (default, fixed before the benchmark). Lower: earlier and more alarms.")
+    groups = te.condition_groups(CT_RAW)
+    cells = [c for g in ("Reference", "Hot", "Cold") for c in te.protocol_cells(CT_RAW, g)] or \
+        sorted(CT_RAW["Cell_ID"].unique())
+    rows, per = [], {}
+    for c in cells:
+        try:
+            r = te.cusum_battery(CT_RAW, c, k, h)
+        except Exception:
+            continue
+        per[c] = r
+        rows.append({"battery": c, "group": str(groups.loc[c, "Group"]) if c in groups.index else "",
+                     "first alarm (plain)": r["alarm plain"], "first alarm (regeneration-aware)": r["alarm aware"],
+                     "regeneration events": r["regeneration events"], "valid cycles": len(r["n"])})
+    if not rows:
+        placeholder("No battery with enough cycles.")
+        return
+    A = pd.DataFrame(rows).set_index(["group", "battery"]).sort_index()
+    show_table(A.style.format({"first alarm (plain)": lambda v: "quiet" if pd.isna(v) else f"cycle {v:.0f}",
+                               "first alarm (regeneration-aware)": lambda v: "quiet" if pd.isna(v) else f"cycle {v:.0f}"}),
+               note="Alarms on the measured data, with no injected fault. Some may be real anomalies, others the "
+                    "relapse after a regeneration event (the plain variant).")
+    cell = st.selectbox("Battery to plot", list(per), key="cu_cell")
+    r = per[cell]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, row_heights=[0.6, 0.4])
+    fig.add_trace(go.Scatter(x=r["n"], y=100 * r["soh"], mode="markers", marker=dict(size=4), name="measured SOH"), 1, 1)
+    rg = r["regen"]
+    fig.add_trace(go.Scatter(x=r["n"][rg], y=100 * r["soh"][rg], mode="markers", marker=dict(size=9, symbol="triangle-up"),
+                             name="regeneration event"), 1, 1)
+    fig.add_trace(go.Scatter(x=r["n"], y=r["S plain"], name="CUSUM, plain"), 2, 1)
+    fig.add_trace(go.Scatter(x=r["n"], y=r["S aware"], name="CUSUM, regeneration-aware", line=dict(dash="dot")), 2, 1)
+    fig.add_hline(y=h, line_dash="dash", row=2, col=1)
+    for a, lab in ((r["alarm plain"], "alarm (plain)"), (r["alarm aware"], "alarm (aware)")):
+        if a is not None:
+            fig.add_vline(x=a, line_dash="dot", annotation_text=lab)
+    fig.update_yaxes(title_text="SOH (%)", row=1, col=1); fig.update_yaxes(title_text="CUSUM", row=2, col=1)
+    fig.update_xaxes(title_text="cycle", row=2, col=1)
+    fig.update_layout(height=470, margin=dict(l=10, r=10, t=30, b=10), title=f"{cell}: residual CUSUM")
+    st.plotly_chart(fig, width="stretch", key="cu_plot")
+    with st.expander("Validation: inject known faults into every battery and score the detector (about 10-30 s)"):
+        st.caption("Faults added to each battery's measured SOH from 40 % of its record: fades at 2x and 3x its own "
+                   "earlier rate, a -5 point drop, a one-cycle -10 point glitch, and no fault. A fault counts as "
+                   "detected if the alarm comes after the onset and before any alarm the battery raises with no fault. "
+                   "The defaults (k 0.5, h 5) were fixed before this benchmark; the regeneration-aware rule was added "
+                   "after it, so confirm it on other data.")
+        if st.button("Run the benchmark", key="cu_bench"):
+            with st.spinner("Injecting faults and replaying every battery…"):
+                st.session_state["cu_bench_res"] = (k, h, DATA_KEY, te.cusum_benchmark(CT_RAW, cells, groups, k, h))
+        res = st.session_state.get("cu_bench_res")
+        if res and res[:3] == (k, h, DATA_KEY) and len(res[3]["summary"]):
+            B = res[3]
+            show_table(B["summary"].style.format({"faults detected": "{:.0%}", "batteries alarming with no fault": "{:.0%}",
+                                                  "median delay (cycles)": "{:.0f}"}),
+                       note="Share of injected faults detected, share of batteries alarming with no fault, alarms caused "
+                            "by a glitch, and the median delay after the fault's onset.")
+            show_table(B["by group"].style.format("{:.0%}"), note="Detection by group and fault.")
+            download("Download the benchmark (CSV)", B["per"].to_csv(index=False).encode(), "cusum_benchmark.csv",
+                     "text/csv", key="cu_bench_dl")
+
+
 def m3_intro() -> None:
     """Mission 3 at a glance: the three questions, and where each is answered on this page."""
     section("Mission 3 · Operation and maintenance")
@@ -8727,10 +8805,10 @@ def m3_general_window_section(fleet: Dict[str, Any]) -> None:
         "the ranges NASA tested. Each scenario's lifetime energy is expressed **relative to that battery's best** "
         "(1 = its best), then averaged over the batteries: a scenario that is good for most batteries is a general "
         "recommendation.")
-    st.warning("Not a validated prediction: the ageing of each battery is scaled to its own recorded fade (a fit to "
-               "its whole life), and the shared physics is fitted on all batteries. Use the RANKING of conditions; "
-               "the absolute cycle counts are indicative. The data cannot identify an effect of discharge current.",
-               icon=":material/warning:")
+    st.info("Each battery's ageing is scaled with the fade factor of the OTHER batteries of its group (leave-one-"
+            "battery-out, v5.45.2), so its own recorded life is not used; the shared physics is still fitted on all "
+            "batteries. How good the absolute lives are is measured in the validation below. The data cannot identify "
+            "an effect of discharge current.", icon=":material/info:")
     h = fleet.get("main")
     if h is None:
         placeholder("The general window needs the shared physics (fleet-wide parts).")
@@ -8784,12 +8862,24 @@ def m3_general_window_section(fleet: Dict[str, Any]) -> None:
          .reset_index().sort_values("mean relative energy", ascending=False).reset_index(drop=True))
     st.session_state["m3_gen"]["summary"] = G
     best = G.iloc[0]
+    # the plateau: temperatures within PLATEAU of the best score at the best cut-off (any current). Three search
+    # methods (grid, differential evolution, random search; Colab, 12 Nov 2026) agree on the cut-off and on this
+    # range, not on one temperature, and not on the current (the data cannot identify a current effect)
+    PLATEAU = 0.03
+    atv = G[np.isclose(G["V_cut"], best["V_cut"])]
+    plat = atv[atv["mean relative energy"] >= best["mean relative energy"] - PLATEAU]["T_C"]
+    t_lo, t_hi = float(plat.min()), float(plat.max())
+    st.session_state["m3_gen"]["plateau"] = (t_lo, t_hi, float(best["V_cut"]))
     k = st.columns(4)
-    k[0].metric("Best general operation", f"{best['T_C']:g} °C · {best['I_dis']:g} A · {best['V_cut']:g} V")
+    k[0].metric("Best general operation", f"{t_lo:g}–{t_hi:g} °C · {best['V_cut']:g} V" if t_hi > t_lo
+                else f"{t_lo:g} °C · {best['V_cut']:g} V", delta="current: not determined", delta_color="off")
     k[1].metric("Median cycles to EOL", f"{best['median cycles to EOL']:.0f}",
                 delta=f"{best['cycles, 10 % battery']:.0f}–{best['cycles, 90 % battery']:.0f} (10–90 %)", delta_color="off")
     k[2].metric("Top-10 % choice for", f"{100 * best['share of batteries in their top 10 %']:.0f} % of batteries")
     k[3].metric("Lives simulated", f"{len(A):,}")
+    st.caption(f"Temperature range: every temperature within {PLATEAU} of the best score at {best['V_cut']:g} V. "
+               "Scores inside it differ too little to name one best temperature; the current axis is flat (the "
+               "grid's best current is where NASA measured energy per cycle, not a real optimum).")
     show_table(G.head(5).style.format({"T_C": "{:g}", "I_dis": "{:g}", "V_cut": "{:g}", "mean relative energy": "{:.3f}",
                                        "worst battery": "{:.3f}", "share of batteries in their top 10 %": "{:.0%}",
                                        "median cycles to EOL": "{:.0f}", "cycles, 10 % battery": "{:.0f}",
@@ -8817,6 +8907,60 @@ def m3_general_window_section(fleet: Dict[str, Any]) -> None:
     st.plotly_chart(fig, width="stretch", key="gen_temp")
     download("Download all simulated lives (CSV)", A.to_csv(index=False).encode(), "general_operating_window.csv",
              "text/csv", key="gen_dl")
+    m3_window_validation(h, groups, tested)
+
+
+def m3_window_validation(h: Dict[str, Any], groups: pd.DataFrame, tested: Dict[str, Any]) -> None:
+    """Out-of-sample check of the window's absolute lives: every battery that reached end of life, simulated as new under
+    its OWN tested operation, with the fade factor of the other batteries (prediction) and with its own (fit)."""
+    st.markdown("**Validation: predicted against measured end of life (each battery under its own operation)**")
+    rows, excluded = [], []
+    for b in sorted(h["data"]):
+        d = CT_RAW[(CT_RAW["Cell_ID"] == b) & ~CT_RAW["outlier"]].sort_values("n")
+        if len(d) < 10:
+            continue
+        se = m3_soh_eol_for(b, "nasa")
+        eol, _ = te.eol_crossing(d["n"].to_numpy(), d["SOH"].to_numpy(), se, 3)
+        if eol is None:
+            continue
+        if eol < 10:                                     # end of life inside the first 10 cycles: a data problem
+            excluded.append(f"{b} (end of life at cycle {eol})")
+            continue
+        own = tested["by_battery"].loc[b]
+        oc = ([float(own["T_C tested"])], [float(own["I_dis tested"])], [float(own["V_cut tested"])])
+        try:
+            W = te.m3_operating_window(h, b, 0, 1.0, se, *oc, groups=groups)
+            pr = W["fade prior"]
+            pred = float(W["table"]["remaining cycles"].iloc[0])
+            fit = float(te.m3_operating_window(h, b, 0, 1.0, se, *oc, groups=groups,
+                                               k_scale=te.m3_fade_scale(h, b))["table"]["remaining cycles"].iloc[0])
+            band = [float(te.m3_operating_window(h, b, 0, 1.0, se, *oc, groups=groups, k_scale=kk)["table"]["remaining cycles"].iloc[0])
+                    for kk in (pr["max"], pr["min"])]
+        except Exception:
+            continue
+        rows.append({"battery": b, "group": str(groups.loc[b, "Group"]) if b in groups.index else "",
+                     "measured EOL (cycle)": int(eol), "predicted (other batteries)": pred,
+                     "band: fastest to slowest peer": f"{band[0]:.0f}–{band[1]:.0f}",
+                     "measured inside band": bool(min(band) <= eol <= max(band)),
+                     "error, predicted (cycles)": pred - eol, "fitted to its own life": fit, "error, fitted (cycles)": fit - eol})
+    if len(rows) < 2:
+        placeholder("Fewer than two batteries reached end of life: no validation possible.")
+        return
+    V = pd.DataFrame(rows).set_index(["group", "battery"]).sort_index()
+    st.session_state.setdefault("m3_gen", {})["validation"] = V
+    if excluded:
+        st.caption("Excluded as data problems (end of life inside the first 10 cycles): " + ", ".join(excluded) + ".")
+    k = st.columns(3)
+    k[0].metric("Out-of-sample mean |error|", f"{V['error, predicted (cycles)'].abs().mean():.0f} cycles",
+                delta=f"bias {V['error, predicted (cycles)'].mean():+.0f}", delta_color="off")
+    k[1].metric("In-sample fit, mean |error|", f"{V['error, fitted (cycles)'].abs().mean():.0f} cycles",
+                delta="for comparison: uses each battery's own life", delta_color="off")
+    k[2].metric("Measured inside the band", f"{int(V['measured inside band'].sum())} of {len(V)}")
+    show_table(V.style.format({"predicted (other batteries)": "{:.0f}", "error, predicted (cycles)": "{:+.0f}",
+                               "fitted to its own life": "{:.0f}", "error, fitted (cycles)": "{:+.0f}"}),
+               note="Prediction: the battery simulated as new with the median fade factor of the other batteries of its "
+                    "group; band: with their fastest and slowest. The in-sample fit (each battery's own fade) is shown only "
+                    "to measure what leave-one-battery-out costs. The shared physics is fitted on all batteries.")
 
 
 def m3_summary_section() -> None:
@@ -8831,11 +8975,14 @@ def m3_summary_section() -> None:
     answers = []
     if gen is not None and "summary" in gen:
         b = gen["summary"].iloc[0]
+        t_lo, t_hi, v_b = gen.get("plateau", (float(b["T_C"]), float(b["T_C"]), float(b["V_cut"])))
+        t_txt = f"{t_lo:g}–{t_hi:g} °C" if t_hi > t_lo else f"{t_lo:g} °C"
         answers.append(("How should a battery be operated?",
-                        f"In general: **{b['T_C']:g} °C, {b['V_cut']:g} V cut-off** (median {b['median cycles to EOL']:.0f} "
-                        f"cycles to end of life; a top-10 % choice for {100 * b['share of batteries in their top 10 %']:.0f} % "
-                        "of the batteries). A shallower cut-off helps; cold operation is very harmful. Current: not "
-                        "identifiable from the data."))
+                        f"In general: **a {v_b:g} V cut-off at moderate temperature ({t_txt})** (median "
+                        f"{b['median cycles to EOL']:.0f} cycles to end of life; a top-10 % choice for "
+                        f"{100 * b['share of batteries in their top 10 %']:.0f} % of the batteries). A shallower cut-off "
+                        "helps; cold operation is very harmful. The discharge current cannot be determined from the "
+                        "data. Model-based: the measured lives agree in the Reference group, not visibly in the cold."))
     if maint is not None and "summary" in maint:
         s = maint["summary"]
         def share(pol):
@@ -8858,6 +9005,34 @@ def m3_summary_section() -> None:
         answers.append(("What is the benefit?", "Twin strategy (replacement + operation) against usual practice, profit "
                         "per hour: **" + ", ".join(parts) + "**. Prices are assumptions: the ranking is meaningful, the "
                         "absolute profits are not."))
+    lv = ss.get("m3_lives")
+    if lv and lv.get("lives") and len(lv["lives"]) >= 3:
+        try:
+            pols = ["twin-informed", "twin + age limit", "best fixed age", "run to end of life"]
+            wins, beats = {}, 0
+            combos = list(itertools.product((30, 60, 120), (1.5, 3, 5), (5, 10, 20)))
+            for cost, kk, lead in combos:
+                _, s_ = te.m3_maintenance_study(lv["lives"], te.M3Economics(battery_cost_cycles=cost, unplanned_factor=kk,
+                                                                              lead_cycles=lead))
+                sh = s_["share of perfect-knowledge gain"].reindex(pols)
+                wins[sh.idxmax()] = wins.get(sh.idxmax(), 0) + 1
+                beats += int(sh.get("twin + age limit", np.nan) > sh.get("best fixed age", np.nan))
+            ss["m3_price_robust"] = {"wins": wins, "beats": beats, "n": len(combos)}
+            answers.append(("Does this depend on the assumed prices?",
+                            f"Over {len(combos)} price settings (battery cost 30–120 cycles of revenue, unplanned failure "
+                            f"1.5–5 times a planned one, lead time 5–20 cycles), the twin with an age limit beats the best "
+                            f"fixed age in **{beats} of {len(combos)}**; the best policy is "
+                            + ", ".join(f"{p_} in {n_}" for p_, n_ in sorted(wins.items(), key=lambda x: -x[1])) + ". "
+                            "Prices are assumptions (no real figures yet): this tells whether the ranking survives them."))
+        except Exception as exc:
+            report_error("price robustness", exc, False)
+    if gen is not None and "validation" in gen:
+        V = gen["validation"]
+        answers.append(("How accurate are the operating-window lives?",
+                        f"Out of sample, on {len(V)} batteries that reached end of life: mean error "
+                        f"{V['error, predicted (cycles)'].abs().mean():.0f} cycles (bias {V['error, predicted (cycles)'].mean():+.0f}); "
+                        f"measured inside the peer band for {int(V['measured inside band'].sum())} of {len(V)}. Use the "
+                        "ranking of conditions with confidence, the absolute lives with this error in mind."))
     for q, a in answers:
         st.markdown(f"**{q}** {a}")
     if maint is not None and "per" in maint:
@@ -8898,6 +9073,7 @@ def view_ops() -> None:
     recommendations("ops")
     m3_intro()
     anomaly_section()
+    cusum_section()
     p = m3_prices()
     fleet = twin_fleet_parts(build=False)
     if fleet is None:

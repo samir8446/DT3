@@ -53,7 +53,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 import pandas as pd
 
-ENGINE_VERSION = "5.45.1"
+ENGINE_VERSION = "5.45.2"
 CACHE_VERSION = "5.42.0"      # bump only when an EXISTING computation changes (5.43.0 only adds SOH estimation)
 R_GAS = 8.314462618          # J mol^-1 K^-1
 FARADAY = 96485.33212        # C mol^-1
@@ -11610,6 +11610,26 @@ def m3_fade_scale(h: Dict[str, Any], cell: str) -> float:
     return float(np.sum(lm[ok] * lp[ok]) / den) if den > 0 else 1.0
 
 
+def m3_fade_prior(h: Dict[str, Any], cell: str, groups: Optional[pd.DataFrame] = None) -> Dict[str, Any]:
+    """The fade factor to use when PREDICTING `cell` (v5.45.2): the median of the factors of the OTHER batteries of its
+    condition group (leave-one-battery-out), with their minimum and maximum as the uncertainty band. The battery's
+    own recorded life is not used. With fewer than two other batteries in the group, every other battery of the
+    physics is used. (m3_fade_scale fits a battery's WHOLE recorded life: use it only for other batteries.)"""
+    others = [c for c in h["data"] if c != cell]
+    scope = "all other batteries"
+    if groups is not None and cell in groups.index:
+        grp = str(groups.loc[cell, "Group"])
+        same = [c for c in others if c in groups.index and str(groups.loc[c, "Group"]) == grp]
+        if len(same) >= 2:
+            others, scope = same, f"other batteries of group {grp}"
+    ks = np.array([m3_fade_scale(h, c) for c in others], float)
+    ks = ks[np.isfinite(ks)]
+    if not len(ks):
+        return {"median": 1.0, "min": 1.0, "max": 1.0, "n": 0, "scope": "no other battery: physics unscaled", "cells": []}
+    return {"median": float(np.median(ks)), "min": float(ks.min()), "max": float(ks.max()), "n": int(len(ks)),
+            "scope": scope, "cells": list(others)}
+
+
 def m3_operation_life(h: Dict[str, Any], cell: str, opt: Dict[str, Any], e: M3OperationEconomics,
                       k_scale: Optional[float] = None) -> Dict[str, Any]:
     """Simulate one life of `cell` operated at option opt (I_dis, V_cut, Ah, Wh out, Wh in, hours) until SOH reaches
@@ -11653,7 +11673,8 @@ def m3_operation_study(h: Dict[str, Any], ct: pd.DataFrame, cell: str, e: M3Oper
     own = opts[opts["own"]]
     ref = own.iloc[0] if len(own) else opts.iloc[0]
     c_rep = e.battery_cost_cycles * e.sell_price_per_Wh * (ref["Wh out"] - e.buy_price_ratio * ref["Wh in"])
-    k = m3_fade_scale(h, cell)
+    k = m3_fade_prior(h, cell, groups)["median"]         # v5.45.2: from the other batteries (the operation is chosen
+                                                         # before this battery's life is known)
     rows = []
     for _, o in opts.iterrows():
         r = m3_operation_life(h, cell, o.to_dict(), e, k)
@@ -12083,7 +12104,7 @@ def _window_depth_factors(depth: Optional[pd.DataFrame], cell: str, currents: Op
 def m3_operating_window(h: Dict[str, Any], cell: str, n_now: float, soh_now: float, soh_eol: float,
                         T_values: Sequence[float], I_values: Sequence[float], V_values: Sequence[float],
                         depth: Optional[pd.DataFrame] = None, groups: Optional[pd.DataFrame] = None,
-                        max_cycles: int = 4000) -> Dict[str, Any]:
+                        max_cycles: int = 4000, k_scale: Optional[float] = None) -> Dict[str, Any]:
     """Score every (T, I, V_cut) candidate for `cell` from today (cycle n_now, SOH soh_now): remaining cycles to
     soh_eol, energy delivered until then, flags. Returns {"table": DataFrame, "traj": {(T, I, V): (cycles, SOH)},
     "own": (T, I, V)}."""
@@ -12095,8 +12116,12 @@ def m3_operating_window(h: Dict[str, Any], cell: str, n_now: float, soh_now: flo
     own = tested["by_battery"].loc[cell]
     own_c = (float(own["T_C tested"]), float(own["I_dis tested"]), float(own["V_cut tested"]))
     ident = whatif_identifiability(h, groups).set_index("key")
-    k = m3_fade_scale(h, cell)
+    prior = m3_fade_prior(h, cell, groups)               # v5.45.2: from the OTHER batteries, never this battery's life
+    k = prior["median"] if k_scale is None else float(k_scale)
     n_rec, a_rec = np.asarray(cd["n"], float), np.asarray(cd["a"], float)
+    known = n_rec <= max(float(n_now), 10.0)             # throughput per cycle from the cycles known today
+    if known.sum() >= 2:
+        n_rec, a_rec = n_rec[known], a_rec[known]
     slope = float(np.polyfit(n_rec, a_rec, 1)[0]) if len(n_rec) >= 2 else float(a_rec[-1] / max(n_rec[-1], 1))
     currents = {b: float(tested["by_battery"].loc[b, "I_dis tested"]) for b in tested["by_battery"].index}
     dep, own_ref_ah = _window_depth_factors(depth, cell, currents)
@@ -12165,4 +12190,123 @@ def m3_operating_window(h: Dict[str, Any], cell: str, n_now: float, soh_now: flo
     if len(own_row):
         tab["life vs own"] = tab["remaining cycles"] / float(own_row["remaining cycles"].iloc[0])
         tab["energy vs own"] = tab["energy to EOL (Wh)"] / float(own_row["energy to EOL (Wh)"].iloc[0])
-    return {"table": tab, "traj": traj, "own": own_c, "fade scale k": k, "damage now": damage_now}
+    return {"table": tab, "traj": traj, "own": own_c, "fade scale k": k, "damage now": damage_now, "fade prior": prior}
+
+
+# =====================================================================================================================
+# 61. Residual-CUSUM fault detector (v5.45.2, validated on injected faults, Colab benchmark of 12 Nov 2026)
+# =====================================================================================================================
+# Causal, per battery, no fleet physics. Each cycle: forecast its SOH from a robust line (Theil-Sen) through the last
+# CUSUM_L valid cycles; residual = measured - forecast, standardised by the spread (MAD) of the battery's own last
+# CUSUM_RES_WIN residuals, clipped at +-CUSUM_CLIP (one bad cycle adds at most CLIP - k); one-sided CUSUM of "lower
+# than expected": S = max(0, S + z - k), alarm when S > h. Defaults k 0.5, h 5 were fixed before the benchmark.
+# Regeneration-aware variant: after an upward jump above CUSUM_REGEN_JUMP over the median of the 3 preceding valid
+# cycles (the flag_regeneration rule), S resets and pauses CUSUM_PAUSE cycles. It was added AFTER the benchmark showed
+# that the plain detector's false alarms all followed regeneration events: a refinement, to confirm on other data.
+CUSUM_L, CUSUM_MIN_RES, CUSUM_RES_WIN, CUSUM_CLIP, CUSUM_S_FLOOR = 10, 5, 20, 3.0, 0.002
+CUSUM_K, CUSUM_H, CUSUM_REGEN_JUMP, CUSUM_PAUSE = 0.5, 5.0, 0.01, 5
+
+
+def cusum_scores(n: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Standardised, clipped 'lower than expected' residual of each valid cycle (NaN until enough history)."""
+    from scipy.stats import theilslopes
+    n, y = np.asarray(n, float), np.asarray(y, float)
+    z, res = np.full(len(n), np.nan), []
+    for i in range(CUSUM_L, len(n)):
+        sl, ic, _, _ = theilslopes(y[i - CUSUM_L:i], n[i - CUSUM_L:i])
+        r = y[i] - (ic + sl * n[i])
+        if len(res) >= CUSUM_MIN_RES:
+            past = np.asarray(res[-CUSUM_RES_WIN:])
+            s = max(1.4826 * float(np.median(np.abs(past - np.median(past)))), CUSUM_S_FLOOR)
+            z[i] = float(np.clip(-r / s, -CUSUM_CLIP, CUSUM_CLIP))
+        res.append(r)
+    return z
+
+
+def cusum_regen(y: np.ndarray) -> np.ndarray:
+    """Causal regeneration events: an upward jump above CUSUM_REGEN_JUMP over the median of the 3 preceding cycles."""
+    y = np.asarray(y, float)
+    f = np.zeros(len(y), bool)
+    for i in range(3, len(y)):
+        f[i] = y[i] - float(np.median(y[i - 3:i])) > CUSUM_REGEN_JUMP
+    return f
+
+
+def cusum_run(n: np.ndarray, z: np.ndarray, k: float = CUSUM_K, h: float = CUSUM_H,
+              regen: Optional[np.ndarray] = None) -> Tuple[np.ndarray, Optional[float]]:
+    """The CUSUM statistic per cycle and the first alarm cycle (None if quiet). With `regen`, the regeneration-aware
+    variant: reset and pause CUSUM_PAUSE cycles after each event."""
+    S_hist, S, pause, first = np.full(len(n), np.nan), 0.0, 0, None
+    for i, (nn, zz) in enumerate(zip(n, z)):
+        if regen is not None and regen[i]:
+            S, pause = 0.0, CUSUM_PAUSE
+        elif pause > 0:
+            pause -= 1
+        elif np.isfinite(zz):
+            S = max(0.0, S + zz - k)
+        S_hist[i] = S
+        if first is None and S > h:
+            first = float(nn)
+    return S_hist, first
+
+
+def cusum_battery(ct: pd.DataFrame, cell: str, k: float = CUSUM_K, h: float = CUSUM_H) -> Dict[str, Any]:
+    """Both variants on one battery's measured SOH (valid cycles)."""
+    d = ct[(ct["Cell_ID"] == cell) & ~ct["outlier"]].sort_values("n")
+    n, y = d["n"].to_numpy(float), d["SOH"].to_numpy(float)
+    z, rg = cusum_scores(n, y), cusum_regen(y)
+    S_p, a_p = cusum_run(n, z, k, h)
+    S_r, a_r = cusum_run(n, z, k, h, rg)
+    return {"n": n, "soh": y, "z": z, "regen": rg, "S plain": S_p, "S aware": S_r, "alarm plain": a_p,
+            "alarm aware": a_r, "regeneration events": int(rg.sum())}
+
+
+def cusum_benchmark(ct: pd.DataFrame, cells: Sequence[str], groups: pd.DataFrame, k: float = CUSUM_K,
+                    h: float = CUSUM_H, onset_frac: float = 0.40) -> Dict[str, pd.DataFrame]:
+    """The injected-fault benchmark: per battery, faults added to its measured SOH from `onset_frac` of its record
+    (fades at 2x and 3x its own pre-onset rate, a -5 point drop, a one-cycle -10 point glitch, and no fault). A fault is
+    detected if the first alarm comes after the onset and before any alarm the battery raises with no fault."""
+    from scipy.stats import theilslopes
+    sc = {"fade x2 (own rate)": True, "fade x3 (own rate)": True, "sudden drop -5 pts": True, "sensor glitch": False}
+    rows = []
+    for c in cells:
+        d = ct[(ct["Cell_ID"] == c) & ~ct["outlier"]].sort_values("n")
+        if len(d) < 2 * CUSUM_L:
+            continue
+        n, y0 = d["n"].to_numpy(float), d["SOH"].to_numpy(float)
+        onset = float(n[int(onset_frac * (len(n) - 1))])
+        pre = n < onset
+        rate = max(-float(theilslopes(y0[pre], n[pre])[0]), 1e-4) if pre.sum() >= 5 else 1e-3
+        k_after = np.where(n >= onset, np.cumsum(n >= onset) - 1, -1)
+        series = {"none": y0,
+                  "fade x2 (own rate)": y0 - np.where(k_after >= 0, 1.0 * rate * (k_after + 1), 0.0),
+                  "fade x3 (own rate)": y0 - np.where(k_after >= 0, 2.0 * rate * (k_after + 1), 0.0),
+                  "sudden drop -5 pts": y0 - np.where(k_after >= 0, 0.05, 0.0),
+                  "sensor glitch": y0 - np.where(k_after == 0, 0.10, 0.0)}
+        grp = str(groups.loc[c, "Group"]) if c in groups.index else ""
+        for variant in ("plain", "regeneration-aware"):
+            alarms = {}
+            for name, ys in series.items():
+                _, a = cusum_run(n, cusum_scores(n, ys), k, h, cusum_regen(ys) if variant != "plain" else None)
+                alarms[name] = a
+            base = alarms["none"]
+            for name, ys in series.items():
+                a = alarms[name]
+                fault = sc.get(name, False)
+                rows.append({"battery": c, "group": grp, "variant": variant, "scenario": name, "onset": onset,
+                             "first alarm": a, "fault": fault,
+                             "detected": bool(fault and a is not None and a >= onset and (base is None or a < base)),
+                             "false alarm": bool((name == "none" and a is not None) or
+                                                 (name == "sensor glitch" and a is not None and (base is None or a < base))),
+                             "delay": (a - onset) if (fault and a is not None and a >= onset and (base is None or a < base)) else np.nan})
+    R = pd.DataFrame(rows)
+    if not len(R):
+        return {"per": R, "summary": pd.DataFrame(), "by group": pd.DataFrame()}
+    summ = []
+    for v, g in R.groupby("variant"):
+        f, nf, gl = g[g["fault"]], g[g["scenario"] == "none"], g[g["scenario"] == "sensor glitch"]
+        summ.append({"variant": v, "batteries": int(nf["battery"].nunique()), "faults detected": float(f["detected"].mean()),
+                     "batteries alarming with no fault": float(nf["false alarm"].mean()),
+                     "new alarms from a glitch": int(gl["false alarm"].sum()), "median delay (cycles)": float(f["delay"].median())})
+    by = R[R["fault"]].pivot_table(index=["variant", "group"], columns="scenario", values="detected", aggfunc="mean")
+    return {"per": R, "summary": pd.DataFrame(summ).set_index("variant"), "by group": by}
